@@ -105,17 +105,17 @@
     </ProjectReference>
   </ItemGroup>
   <ItemGroup>
-    <EmbeddedResource Include="SupportDlls\dbghelp.dll">
+    <EmbeddedResource Include="..\TraceEvent\SupportDlls\dbghelp.dll">
       <Type>Non-Resx</Type>
       <WithCulture>false</WithCulture>
       <LogicalName>.\dbghelp.dll</LogicalName>
     </EmbeddedResource>
-    <EmbeddedResource Include="SupportDlls\symsrv.dll">
+    <EmbeddedResource Include="..\TraceEvent\SupportDlls\symsrv.dll">
       <Type>Non-Resx</Type>
       <WithCulture>false</WithCulture>
       <LogicalName>.\symsrv.dll</LogicalName>
     </EmbeddedResource>
-    <EmbeddedResource Include="SupportDlls\KernelTraceControl.dll">
+    <EmbeddedResource Include="..\TraceEvent\SupportDlls\KernelTraceControl.dll">
       <Type>Non-Resx</Type>
       <WithCulture>false</WithCulture>
       <LogicalName>.\KernelTraceControl.dll</LogicalName>

@@ -172,7 +172,9 @@ namespace PerfMonitor
             writer.Write(" Process="); GCEvent.QuotePadLeft(writer, ProcessName, 10);
             writer.Write(" ProcessID="); GCEvent.QuotePadLeft(writer, ProcessID.ToString(), 5);
             if (ProcessCpuTimeMsec != 0)
+            {
                 writer.Write(" ProcessCpuTimeMsec="); GCEvent.QuotePadLeft(writer, ProcessCpuTimeMsec.ToString(), 5);
+            }
             Total.ToXmlAttribs(writer);
             if (RuntimeVersion != null)
             {
