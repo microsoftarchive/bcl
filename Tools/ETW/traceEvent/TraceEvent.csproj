@@ -53,6 +53,7 @@
     <NoWarn>1591 0649</NoWarn>
     <UseVSHostingProcess>false</UseVSHostingProcess>
     <CodeAnalysisRuleSet>AllRules.ruleset</CodeAnalysisRuleSet>
+    <DocumentationFile>bin\Release\TraceEvent.XML</DocumentationFile>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="ClrTraceEventParser.cs" />
