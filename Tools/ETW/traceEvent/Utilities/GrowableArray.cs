@@ -179,11 +179,13 @@ namespace System.Collections.Generic
         public void Sort(int index, int length, System.Comparison<T> comparison)
         {
             Debug.Assert(index + length <= arrayLength);
-            Array.Sort<T>(array, index, length, new FunctorComparer<T>(comparison));
+            if (length > 0)
+                Array.Sort<T>(array, index, length, new FunctorComparer<T>(comparison));
         }
         public void Sort(System.Comparison<T> comparison)
         {
-            Array.Sort<T>(array, 0, arrayLength, new FunctorComparer<T>(comparison));
+            if (array != null)
+                Array.Sort<T>(array, 0, arrayLength, new FunctorComparer<T>(comparison));
         }
 
         /// <summary>

@@ -1,3 +1,4 @@
+//     Copyright (c) Microsoft Corporation.  All rights reserved.
 using System;
 using System.Text;      // For StringBuilder.
 using System.IO;

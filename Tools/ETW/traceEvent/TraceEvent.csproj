@@ -12,19 +12,6 @@
     <AssemblyName>TraceEvent</AssemblyName>
     <TargetFrameworkVersion>v3.5</TargetFrameworkVersion>
     <FileAlignment>512</FileAlignment>
-    <FileUpgradeFlags>
-    </FileUpgradeFlags>
-    <UpgradeBackupLocation>
-    </UpgradeBackupLocation>
-    <TargetFrameworkProfile />
-    <SccProjectName>
-    </SccProjectName>
-    <SccLocalPath>
-    </SccLocalPath>
-    <SccAuxPath>
-    </SccAuxPath>
-    <SccProvider>
-    </SccProvider>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <DebugSymbols>true</DebugSymbols>
@@ -39,7 +26,6 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <NoWarn>1591 0649</NoWarn>
     <UseVSHostingProcess>false</UseVSHostingProcess>
-    <CodeAnalysisRuleSet>AllRules.ruleset</CodeAnalysisRuleSet>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
     <DebugType>pdbonly</DebugType>
@@ -52,14 +38,15 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <NoWarn>1591 0649</NoWarn>
     <UseVSHostingProcess>false</UseVSHostingProcess>
-    <CodeAnalysisRuleSet>AllRules.ruleset</CodeAnalysisRuleSet>
     <DocumentationFile>bin\Release\TraceEvent.XML</DocumentationFile>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="ClrTraceEventParser.cs" />
     <Compile Include="DynamicTraceEventParser.cs" />
     <Compile Include="ETWTraceEventSource.cs" />
+    <Compile Include="Stacks\FilterStacks.cs" />
     <Compile Include="Manifest.cs" />
+    <Compile Include="Stacks\Stacks.cs" />
     <Compile Include="SymbolEventParser.cs" />
     <Compile Include="SymbolResolver.cs" />
     <Compile Include="KernelTraceEventParser.cs" />
@@ -67,6 +54,7 @@
     <Compile Include="TraceEvent.cs" />
     <Compile Include="TraceEventNativeMethods.cs" />
     <Compile Include="TraceEventSession.cs" />
+    <Compile Include="TraceEventStacks.cs" />
     <Compile Include="TraceLog.cs" />
     <Compile Include="Utilities\FastSerialization.cs">
       <SubType>Code</SubType>

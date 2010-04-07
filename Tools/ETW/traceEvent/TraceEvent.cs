@@ -142,9 +142,9 @@ namespace Diagnostics.Eventing
     /// 
     ///     * code:TraceEventDispatcher - is a subclass of code:TraceEventSource that supports the callback
     ///         model for accessing events. This interface can be used with 'real time' streams.
-    ///     * code:System.Diagnostics.Eventing.TraceLog.TraceLog - is also a subclass of
+    ///     * code:Diagnostics.Eventing.TraceLog.TraceLog - is also a subclass of
     ///         code:TraceEventSource that supports the iteration model (through its
-    ///         code:System.Diagnostics.Eventing.TraceLog.TraceLog.Events property. This mechanism can only
+    ///         code:Diagnostics.Eventing.TraceLog.TraceLog.Events property. This mechanism can only
     ///         be used on files, because it supports a much broader variety of access methods (eg moving
     ///         backwards, annotating events ...)
     /// 
@@ -2266,8 +2266,8 @@ namespace Diagnostics.Eventing
                 char c = str[i];
                 if ((c < ' ' || c > '~') && !char.IsWhiteSpace(c))
                 {
-                    str = str.Substring(0, i);
-                    Console.WriteLine("Warning: truncating " + (str.Length - i).ToString() + " non-ascii name characters: resulting string: " + str);
+                    string trunStr = str.Substring(0, i);
+                    Console.WriteLine("Warning: truncating " + (str.Length - i).ToString() + " non-ascii name characters: resulting string: " + trunStr);
                     break;
                 }
             }

@@ -187,7 +187,11 @@ namespace Diagnostics.Eventing
             processTraceCalled = true;
             stopProcessing = false;
             int dwErr = TraceEventNativeMethods.ProcessTrace(handles, (uint)handles.Length, (IntPtr)0, (IntPtr)0);
-            Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(dwErr));
+
+            // ETW returns 1223 when you stop processing explicitly 
+            if (dwErr != 1223 && stopProcessing)
+                Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(dwErr));
+
             return !stopProcessing;
         }
 

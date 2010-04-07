@@ -118,7 +118,7 @@ namespace Diagnostics.Eventing
         /// TraceEventSession might start up both a kernel and a user session.   When you want to 'attach'
         /// to such a combined session, the constructor needs to know if you want to control the kernel
         /// session or not.  If attachKernelSession is true, then it opens both sessions (and thus 'Close'
-        /// will operation on both sessions.
+        /// will operate on both sessions.
         /// </summary>
         public TraceEventSession(string sessionName, bool attachKernelSession)
         {
@@ -457,6 +457,26 @@ namespace Diagnostics.Eventing
             return activeTraceNames;
         }
 
+
+        /// <summary>
+        /// It is sometimes useful to merge the contents of several ETL files into a single 
+        /// output ETL file.   This routine does that.  It also will attach additional 
+        /// information that will allow correct file name and symbolic lookup if the 
+        /// ETL file is used on a machine other than the one that the data was collected on.
+        /// Thus it can be useful to do this to a single file.  
+        /// </summary>
+        /// <param name="inputETLFileNames"></param>
+        /// <param name="outputETLFileName"></param>
+        public static void Merge(string[] inputETLFileNames, string outputETLFileName)
+        {
+            int retValue = TraceEventNativeMethods.CreateMergedTraceFile(
+                outputETLFileName, inputETLFileNames, inputETLFileNames.Length,
+                    TraceEventNativeMethods.EVENT_TRACE_MERGE_EXTENDED_DATA.IMAGEID |
+                    TraceEventNativeMethods.EVENT_TRACE_MERGE_EXTENDED_DATA.VOLUME_MAPPING);
+            if (retValue != 0)
+                throw new ApplicationException("Merge operation failed.");
+        }
+
         #region Private
         private const int maxStackTraceProviders = 256;
 
@@ -494,8 +514,8 @@ namespace Diagnostics.Eventing
                 }
                 else
                 {
-                    // You should only get here if the constructor failed. 
-                    throw new Exception("Invalid TraceEventSession");
+                    // There is currently no way of adding providers on an existing session 
+                    throw new Exception("Cannot add new providers to session this process did not create.");
                 }
             }
             return ret;
