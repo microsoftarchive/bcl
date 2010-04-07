@@ -1624,13 +1624,12 @@ namespace PerfMonitor
                 "       PerfMonitor [options] start <file>        Starts a monitoring of a file.\r\n" +
                 "       PerfMonitor [options] list                Displays active sessions.\r\n" +
                 "       PerfMonitor [options] stop                Stops a monitoring session.\r\n" +
-                "       PerfMonitor [options] listSources <exe>   Lists eventSources in an exe.\r\n" +
                 "       PerfMonitor [options] print <fIn> [<fOut>] Print ETLX <fIn> to XML.\r\n" +
-                "       PerfMonitor [options] rawPrint <fIn> [<fOut>] Print ETL <fIn> to XML.\r\n" +
-                "       PerfMonitor [options] printCSV <fIn> [<fOut>] Prints ETLX to CSV file.\r\n" +
+                "       PerfMonitor [options] convert <fIn> [<fOut>] Converts an ETL to ETLX.\r\n" +
                 "       PerfMonitor [options] stats <fIn> [<fOut>] Computes counts for <fin>.\r\n" +
                 "       PerfMonitor [options] procs <fIn> [<fOut>] Shows processes for <fin>.\r\n" +
-                "       PerfMonitor [options] convert <fIn> [<fOut>] Converts an ETL to ETLX.\r\n" +
+                "       PerfMonitor [options] gcTime <fIn> [<fOut>] Shows the GC time for <fin>.\r\n" +
+                "       PerfMonitor [options] jitTime <fIn> [<fOut>] Shows the JIT time for <fin>.\r\n" +
                 "       PerfMonitor [/out:<file>] merge <files>   Merge etl files to a one file.\r\n" +
                 "\r\n" +
                 "       PerfMonitor usersGuide                    Show complete users guide.\r\n" +
@@ -1654,7 +1653,6 @@ namespace PerfMonitor
                 "    /noClr:         Don't monitor clr events.\r\n" +
                 "    /provider:<spec> Turn on an additiona provider.\r\n" +
                 "                    <spec> can be guid, name or @file#name.\r\n" +
-                "    /source:<name>  Turn on a managed event source.\r\n" +
                 "  Options that apply to the preceeding /provider qualifer\r\n" +
                 "  Those before any provider are a default for all providers\r\n" +
                 "    /level:<num>    Set provider verbosity: 0 = default 5 = verbose\r\n" +

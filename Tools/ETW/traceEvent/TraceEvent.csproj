@@ -93,7 +93,16 @@
     </Reference>
     <Reference Include="System.XML" />
   </ItemGroup>
+  <ItemGroup>
+    <Content Include="SupportDlls\dbghelp.dll" />
+    <Content Include="SupportDlls\KernelTraceControl.dll" />
+    <Content Include="SupportDlls\symsrv.dll" />
+  </ItemGroup>
   <Import Project="$(MSBuildBinPath)\Microsoft.CSharp.targets" />
+  <PropertyGroup>
+    <PostBuildEvent>%25windir%25\system32\xcopy.exe /y "$(ProjectDir)SupportDlls\*.dll" "$(TargetDir)"
+</PostBuildEvent>
+  </PropertyGroup>
   <!-- To modify your build process, add your task inside one of the targets below and uncomment it. 
        Other similar extension points exist, see Microsoft.Common.targets.
   <Target Name="BeforeBuild">
