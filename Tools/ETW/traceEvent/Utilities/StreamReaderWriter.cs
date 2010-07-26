@@ -17,7 +17,7 @@ namespace FastSerialization
     /// <summary>
     /// A MemoryStreamReader is an implementation of the IStreamReader interface that works over a given byte[] array.  
     /// </summary>
-    class MemoryStreamReader : IStreamReader
+    public class MemoryStreamReader : IStreamReader
     {
         public MemoryStreamReader(byte[] data) : this(data, 0, data.Length) { }
         public MemoryStreamReader(byte[] data, int start, int length)
@@ -90,6 +90,7 @@ namespace FastSerialization
         }
         public virtual void Goto(StreamLabel label)
         {
+            Debug.Assert(label != StreamLabel.Invalid);
             position = (int)label;
         }
         public virtual StreamLabel Current
@@ -116,11 +117,11 @@ namespace FastSerialization
     }
 
     // TODO is unsafe code worth it?
-#if true 
+#if true
     /// <summary>
     /// A StreamWriter is an implementation of the IStreamWriter interface that generates a byte[] array. 
     /// </summary>
-    class MemoryStreamWriter : IStreamWriter
+    public class MemoryStreamWriter : IStreamWriter
     {
         public MemoryStreamWriter() : this(64) { }
         public MemoryStreamWriter(int size)
@@ -204,7 +205,16 @@ namespace FastSerialization
             outputStream.Write(bytes, 0, (int)Length);
         }
         // Note that the returned MemoryStreamReader is not valid if more writes are done.  
-        public MemoryStreamReader GetReader() { return new MemoryStreamReader(bytes); }
+        public MemoryStreamReader GetReader()
+        {
+            var readerBytes = bytes;
+            if (bytes.Length - endPosition > 500000)
+            {
+                readerBytes = new byte[endPosition];
+                Array.Copy(bytes, readerBytes, endPosition);
+            }
+            return new MemoryStreamReader(readerBytes, 0, endPosition);
+        }
         public void Dispose() { }
 
         #region private
@@ -329,7 +339,7 @@ namespace FastSerialization
         public MemoryStreamReader GetReader() { return new MemoryStreamReader(bytes); }
         public void Dispose() { }
 
-        #region private
+    #region private
         protected virtual void MakeSpace()
         {
             byte[] newBytes = new byte[bytes.Length * 3 / 2];
@@ -349,14 +359,12 @@ namespace FastSerialization
         byte* bufferEnd;
         #endregion
     }
-#endif 
-
-
+#endif
 
     /// <summary>
     /// A IOStreamStreamWriter hooks a MemoryStreamWriter up to an output System.IO.Stream
     /// </summary>
-    class IOStreamStreamWriter : MemoryStreamWriter, IDisposable
+    public class IOStreamStreamWriter : MemoryStreamWriter, IDisposable
     {
         public IOStreamStreamWriter(string fileName) : this(new FileStream(fileName, FileMode.Create)) { }
         public IOStreamStreamWriter(Stream outputStream) : this(outputStream, defaultBufferSize + sizeof(long)) { }
@@ -416,7 +424,7 @@ namespace FastSerialization
     /// <summary>
     /// A IOStreamStreamReader hooks a MemoryStreamReader up to an input System.IO.Stream.  
     /// </summary>
-    class IOStreamStreamReader : MemoryStreamReader, IDisposable
+    public class IOStreamStreamReader : MemoryStreamReader, IDisposable
     {
         public IOStreamStreamReader(string fileName) : this(new FileStream(fileName, FileMode.Open)) { }
         public IOStreamStreamReader(Stream inputStream) : this(inputStream, defaultBufferSize) { }
@@ -473,7 +481,7 @@ namespace FastSerialization
             }
             else
             {
-                positionInStream += (uint) position;
+                positionInStream += (uint)position;
                 endPosition = 0;
                 position = 0;
                 // if you are within one read of the end of file, go backward to read the whole block.  
@@ -513,7 +521,7 @@ namespace FastSerialization
         #endregion
     }
 
-    unsafe sealed class PinnedStreamReader : IOStreamStreamReader
+    public unsafe sealed class PinnedStreamReader : IOStreamStreamReader
     {
         public PinnedStreamReader(string fileName) : this(new FileStream(fileName, FileMode.Open, FileAccess.Read)) { }
         public PinnedStreamReader(Stream inputStream) : this(inputStream, defaultBufferSize) { }
@@ -525,19 +533,18 @@ namespace FastSerialization
             fixed (byte* bytesAsPtr = &bytes[0])
                 bufferStart = bytesAsPtr;
         }
-
         public PinnedStreamReader Clone()
         {
             PinnedStreamReader ret = new PinnedStreamReader(inputStream, bytes.Length - align);
             return ret;
         }
 
-        public unsafe TraceEventNativeMethods.EVENT_RECORD* GetPointer(StreamLabel Position, int length)
+        public unsafe byte* GetPointer(StreamLabel Position, int length)
         {
             Goto(Position);
             return GetPointer(length);
         }
-        public unsafe TraceEventNativeMethods.EVENT_RECORD* GetPointer(int length)
+        public unsafe byte* GetPointer(int length)
         {
             if (position + length > endPosition)
                 Fill(length);
@@ -546,7 +553,7 @@ namespace FastSerialization
                 Debug.Assert(bytesAsPtr == bufferStart, "Error, buffer not pinnned");
             Debug.Assert(position < bytes.Length);
 #endif
-            return (TraceEventNativeMethods.EVENT_RECORD*)(&bufferStart[position]);
+            return (byte*)(&bufferStart[position]);
         }
 
         #region private

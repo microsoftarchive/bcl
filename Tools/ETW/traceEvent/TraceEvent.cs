@@ -758,15 +758,12 @@ namespace Diagnostics.Eventing
         /// Given an index from 0 to PayloadNames.Length-1, return the value for that payload item
         /// as an object (boxed if necessary).  
         /// </summary>
-        /// <param name="index"></param>
-        /// <returns></returns>
         public abstract object PayloadValue(int index);
 
         /// <summary>
         /// Only use this if you don't care about performance.  It fetches a field by name.  Will return
         /// null if the name is not found.
         /// </summary>
-        /// <param name="fieldName"></param>
         public object PayloadByName(string fieldName)
         {
             string[] fieldNames = PayloadNames;
@@ -911,12 +908,14 @@ namespace Diagnostics.Eventing
                 char c = (char)GetInt16At(offset + i * 2);
                 if (c == 0)
                     break;
+#if DEBUG
                 // TODO review. 
                 if ((c < ' ' || c > '~') && !char.IsWhiteSpace(c))
                 {
                     Console.WriteLine("Warning: Found unprintable chars in string truncating to " + sb.ToString());
                     break;
                 }
+#endif
                 sb.Append(c);
             }
             return sb.ToString();
@@ -1036,7 +1035,6 @@ namespace Diagnostics.Eventing
 
             if (myBuffer != IntPtr.Zero)
                 TraceEventNativeMethods.FreeHGlobal(myBuffer);
-
         }
         private static void DumpBytes(byte[] bytes, TextWriter output, string indent)
         {
@@ -2260,7 +2258,7 @@ namespace Diagnostics.Eventing
             string str = new string((char*)((byte*)pointer.ToPointer() + offset));
 
             // TODO investigate this why does this happen?
-#if true
+#if DEBUG
             for (int i = 0; i < str.Length; i++)
             {
                 char c = str[i];

@@ -1,6 +1,11 @@
 // Copyright (c) Microsoft Corporation.  All rights reserved
 /****************************************************************************/
-/*                                  Command.cs                                  */
+/*                                  Command.cs                              */
+/****************************************************************************/
+
+
+/* AUTHOR: Vance Morrison
+ * Date  : 11/3/2005  */
 /****************************************************************************/
 
 using System;
@@ -10,13 +15,14 @@ using System.Text.RegularExpressions;
 using System.IO;
 using System.Reflection;
 using System.Diagnostics;               // for StackTrace; Process
+using System.Threading;
 
 namespace Utilities
 {
 
     /// <summary>
     /// CommandOptions is a helper class for the Command class.  It stores options
-    /// that affect the behavior of the execution of Commands and is passes as a 
+    /// that affect the behavior of the execution of ETWCommands and is passes as a 
     /// parapeter to the constuctor of a Command.  
     /// 
     /// It is useful for these options be be on a separate class (rather than 
@@ -65,22 +71,76 @@ namespace Utilities
         }
 
         /// <summary>
-        /// Normally commands are launched with CreateProcess.  However it is
-        /// also possible use the Shell Start API.  This causes Command to look
-        /// up the executable differnetly as well as no wait for the command to 
-        /// compete before returning.
+        /// ShortHand for UseShellExecute and NoWait
         /// </summary>
-        public bool Start { get { return start; } set { start = value; } }
+        public bool Start { get { return useShellExecute; } set { useShellExecute = value; noWait = value; } }
 
         /// <summary>
         /// Updates the Start propery and returns the updated commandOptions.
         /// </summary>
         public CommandOptions AddStart()
         {
-            this.start = true;
+            this.Start = true;
             return this;
         }
 
+        /// <summary>
+        /// Normally commands are launched with CreateProcess.  However it is
+        /// also possible use the Shell Start API.  This causes Command to look
+        /// up the executable differently 
+        /// </summary>
+        public bool UseShellExecute { get { return useShellExecute; } set { useShellExecute = value; } }
+
+        /// <summary>
+        /// Updates the Start propery and returns the updated commandOptions.
+        /// </summary>
+        public CommandOptions AddUseShellExecute()
+        {
+            this.useShellExecute = true;
+            return this;
+        }
+
+        /// <summary>
+        /// Indicates that you want to hide any new window created.  
+        /// </summary>
+        public bool NoWindow { get { return noWindow; } set { noWindow = value; } }
+
+        /// <summary>
+        /// Updates the NoWindow propery and returns the updated commandOptions.
+        /// </summary>
+        public CommandOptions AddNoWindow()
+        {
+            this.noWindow = true;
+            return this;
+        }
+
+        /// <summary>
+        /// Indicates that you want don't want to wait for the command to complete.
+        /// </summary>
+        public bool NoWait { get { return noWait; } set { noWait = value; } }
+
+        /// <summary>
+        /// Updates the NoWait propery and returns the updated commandOptions.
+        /// </summary>
+        public CommandOptions AddNoWait()
+        {
+            this.noWait = true;
+            return this;
+        }
+
+        /// <summary>
+        /// Indicates that the command must run at elevated Windows privledges (causes a new command window)
+        /// </summary>
+        public bool Elevate { get { return elevate; } set { elevate = value; } }
+
+        /// <summary>
+        /// Updates the Elevate propery and returns the updated commandOptions.
+        /// </summary>
+        public CommandOptions AddElevate()
+        {
+            this.elevate = true;
+            return this;
+        }
         /// <summary>
         /// By default commands have a 10 minute timeout (600,000 msec), If this
         /// is inappropriate, the Timeout property can change this.  Like all
@@ -91,6 +151,7 @@ namespace Utilities
 
         /// <summary>
         /// Updates the Timeout propery and returns the updated commandOptions.
+        /// CommandOptions.Infinite can be used for infinite
         /// </summary>
         public CommandOptions AddTimeout(int milliseconds)
         {
@@ -215,7 +276,10 @@ namespace Utilities
         // internal bool showCommand;          // Show the command before running it. 
 
         internal bool noThrow;
-        internal bool start;
+        internal bool useShellExecute;
+        internal bool noWindow;
+        internal bool noWait;
+        internal bool elevate;
         internal int timeoutMSec;
         internal string input;
         internal string outputFile;
@@ -270,7 +334,7 @@ namespace Utilities
         /// is accumulated in real time so it can vary if the process is still running.
         /// 
         /// This property is NOT available if the CommandOptions.OutputFile or CommandOptions.OutputStream
-        /// is specified since the output is being redirected there.   If a large amoutn of output is 
+        /// is specified since the output is being redirected there.   If a large amount of output is 
         /// expected (> 1Meg), the Run.AddOutputStream(Stream) is recommended for retrieving it since
         /// the large string is never materialized at one time. 
         /// </summary>
@@ -348,9 +412,20 @@ namespace Utilities
             ProcessStartInfo startInfo = new ProcessStartInfo(m.Groups[1].Value, m.Groups[2].Value);
             process = new Process();
             process.StartInfo = startInfo;
-            if (options.start)
+            output = new StringBuilder();
+            if (options.elevate)
+            {
+                options.useShellExecute = true;
+                startInfo.Verb = "runas";
+                if (options.currentDirectory == null)
+                    options.currentDirectory = Environment.CurrentDirectory;
+            }
+            startInfo.CreateNoWindow = options.noWindow;
+            if (options.useShellExecute)
             {
                 startInfo.UseShellExecute = true;
+                if (options.noWindow)
+                    startInfo.WindowStyle = ProcessWindowStyle.Hidden;
             }
             else
             {
@@ -363,7 +438,6 @@ namespace Utilities
                 startInfo.WindowStyle = ProcessWindowStyle.Hidden;
                 startInfo.CreateNoWindow = true;
 
-                output = new StringBuilder();
                 process.OutputDataReceived += new DataReceivedEventHandler(OnProcessOutput);
                 process.ErrorDataReceived += new DataReceivedEventHandler(OnProcessOutput);
             }
@@ -411,6 +485,18 @@ namespace Utilities
                 outputStream = File.CreateText(options.outputFile);
             }
 
+#if false
+            if (options.showCommand && outputStream != null)
+            {
+                // TODO why only for output streams?
+                outputStream.WriteLine("RUN CMD: " + commandLine);
+            }
+#endif
+#if false
+            // Make sure we kill this task when Ctrl C or appdomain unloads
+            if (!options.noWait)
+                AddCommandToCleanupList(this);
+#endif
             try
             {
                 process.Start();
@@ -455,12 +541,12 @@ namespace Utilities
         /// <returns>Wait returns that 'this' pointer.</returns>
         public Command Wait()
         {
-            // shell execute threads you don't wait for
-            if (process.StartInfo.UseShellExecute)
+            // we where told not to wait
+            if (options.noWait)
                 return this;
 
             process.WaitForExit(options.timeoutMSec);
-            //  TODO : we seem to have a race in the async process stuff
+            //  TODO : HACK we see to have a race in the async process stuff
             //  If you do Run("cmd /c set") you get truncated output at the
             //  Looks like the problem in the framework.  
             for (int i = 0; i < 10; i++)
@@ -561,6 +647,80 @@ namespace Utilities
             outputStream = null;
         }
 
+        /// <summary>
+        /// Put double quotes around 'str' if necessary (handles quotes quotes.  
+        /// </summary>
+        static public string Quote(string str)
+        {
+            if (str.IndexOf('"') < 0)
+            {
+                // Replace any " with \"  (and any \" with \\" and and \\" with \\\"  ...)
+                str = Regex.Replace(str, "\\*\"", @"\$1");
+            }
+            return "\"" + str + "\"";
+        }
+
+        /// <summary>
+        /// Given a string 'commandExe' look for it on the path the way cmd.exe would.   
+        /// Returns null if it was not found.   
+        /// </summary>
+        public static string FindOnPath(string commandExe)
+        {
+            string ret = ProbeForExe(commandExe);
+            if (ret != null)
+                return ret;
+
+            if (!commandExe.Contains("\\"))
+            {
+                foreach (string path in Paths)
+                {
+                    string baseExe = Path.Combine(path, commandExe);
+                    ret = ProbeForExe(baseExe);
+                    if (ret != null)
+                        return ret;
+                }
+            }
+            return null;
+        }
+
+        #region private
+        private static string ProbeForExe(string path)
+        {
+            if (File.Exists(path))
+                return path;
+
+            foreach (string ext in PathExts)
+            {
+                string name = path + ext;
+                if (File.Exists(name))
+                    return name;
+            }
+            return null;
+        }
+
+        private static string[] PathExts
+        {
+            get
+            {
+                if (pathExts == null)
+                    pathExts = Environment.GetEnvironmentVariable("PATHEXT").Split(';');
+                return pathExts;
+            }
+        }
+        private static string[] pathExts;
+        private static string[] Paths
+        {
+            get
+            {
+                if (paths == null)
+                    paths = Environment.GetEnvironmentVariable("PATH").Split(';');
+                return paths;
+            }
+        }
+        private static string[] paths;
+        #endregion
+
+        #region private
         /* called data comes to either StdErr or Stdout */
         private void OnProcessOutput(object sender, DataReceivedEventArgs e)
         {
@@ -576,5 +736,58 @@ namespace Utilities
         private StringBuilder output;
         private CommandOptions options;
         private TextWriter outputStream;
+
+#if false 
+        // Control C support.  Kill any commands if control C is hit or process exits.  
+        private static List<WeakReference> s_commandsToCleanup = SetupControlC();
+        private static bool s_controlCProcessed;
+
+        private static List<WeakReference> SetupControlC()
+        {
+            Console.CancelKeyPress += OnControlC;
+            AppDomain.CurrentDomain.DomainUnload += OnControlC;
+            return new List<WeakReference>(); 
+        }
+        private static void OnControlC(object sender, EventArgs e)
+        {
+            lock (s_commandsToCleanup)
+            {
+                if (!s_controlCProcessed)
+                {
+                    Console.WriteLine("Command Cleanup");
+                    foreach (WeakReference commandToCleanupRef in s_commandsToCleanup)
+                    {
+                        var commandToCleanup = commandToCleanupRef.Target as Command;
+                        if (commandToCleanup != null && !commandToCleanup.HasExited)
+                        {
+                            Console.WriteLine("Killing {0}", commandToCleanup.commandLine);
+                            commandToCleanup.Kill();
+                        }
+                    }
+                    s_controlCProcessed = true;
+                    s_commandsToCleanup.Clear();
+                }
+            }
+        }
+
+        private void AddCommandToCleanupList(Command cmd)
+        {
+            lock (s_commandsToCleanup)
+            {
+                foreach (WeakReference cmdElemRef in s_commandsToCleanup)
+                {
+                    var cmdElem = cmdElemRef.Target as Command;
+                    if (cmdElem == null || cmdElem.HasExited)
+                    {
+                        cmdElemRef.Target = cmd;
+                        return;
+                    }
+                }
+                s_commandsToCleanup.Add(new WeakReference(cmd));
+            }
+        }
+#endif 
+    #endregion
     }
 }
+    

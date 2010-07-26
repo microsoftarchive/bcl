@@ -10,34 +10,36 @@ using System.Collections.Generic;
 using System.Text;
 using System.IO;
 using Diagnostics.Eventing;
-using Diagnostics.Eventing;
+using Stacks;
 
 /// <summary>
 /// This is the traditional grouping by method.
 /// 
 /// TraceEventStackSource create the folowing meaning for the code:StackSourceCallStackIndex
 /// 
-/// * If the number is less than 'Start' it is a speical pseudo-frame
-/// * after that the number (X - Start) encodes a StackIndex
-/// * If after that the number (X - MaxCallStackIndex) encodes the thread and process of the sample.  
-///     * (X - MaxCallStackIndex) % MaxProcessIndex  Indicates the process 
-///     * (X - MaxCallStackIndex) / MaxProcessIndex  Indicates the process thread or process
-///         * if 0 -> means the process
-///         * if non-zero means the thread index 
+/// * The call stacks ID consists of the following ranges concatinated together. 
+///     * a small set of fixed Pseuo stacks (Start marks the end of these)
+///     * CallStackIndex
+///     * ThreadIndex
+///     * ProcessIndex
+///     * BrokenStacks (One per thread)
 ///         
 /// TraceEventStackSource create the folowing meaning for the code:StackSourceFrameIndex
 /// 
 /// The frame ID consists of the following ranges concatinated together. 
-///     * a small fixed number of Pseudo m_frames (Broken, and Unknown)
-///     * MaxCodeAddressIndex - a method 
-///     * MaxFileModuleIndex - a module
-///     * (threadIndex+1) * MaxProcess + processIndex; 
+///     * a small fixed number of Pseudo frame (Broken, and Unknown)
+///     * MaxCodeAddressIndex - a known method (we can't use methodIndex because it does not know what DLL it comes from).  
+///         However we use the same CodeAddress for all samples within the method (thus it is effectivley a MethodIndex).  
+///     * MaxFileModuleIndex - an unknown method in a module.  
+///     * ThreadIndex
+///     * ProcessIndex
 ///     
 /// </summary>
 public class TraceEventStackSource : StackSource
 {
     public TraceEventStackSource() { }
-    public TraceEventStackSource(TraceEvents events) {
+    public TraceEventStackSource(TraceEvents events)
+    {
         SetEvents(events);
     }
     public void SetEvents(TraceEvents events)
@@ -51,39 +53,41 @@ public class TraceEventStackSource : StackSource
                 newArray[i] = -1;
             m_codeAddrForMethod = newArray;
             m_goodTopModuleIndex = ModuleFileIndex.Invalid;
-            m_curSample = new StackSourceSample();
+            m_curSample = new StackSourceSample(this);
             m_curSample.Metric = 1;
         }
-        m_curEventPos = ((IEnumerable<TraceEvent>)events).GetEnumerator();
+        m_events = events;
     }
 
-    public override StackSourceSample GetNextSample()
+    public override void ProduceSamples(Action<StackSourceSample> callback)
     {
-        if (!m_curEventPos.MoveNext())
-            return null;
-
-        m_curEvent = m_curEventPos.Current;
-        m_curSample.Stack = GetStack(m_curEvent);
-        m_curSample.TimeRelMSec = m_curEvent.TimeStampRelativeMSec;
-        m_curSample.ProcessID = m_curEvent.ProcessID;
-        m_curSample.ThreadID = m_curEvent.ThreadID;
-        m_curSample.ProcessName = m_curEvent.ProcessName;
-        return m_curSample;
+        // TODO use callback model rather than enumerator
+        foreach (var event_ in ((IEnumerable<TraceEvent>)m_events))
+        {
+            m_curSample.StackIndex = GetStack(event_);
+            m_curSample.TimeRelMSec = event_.TimeStampRelativeMSec;
+            Debug.Assert(event_.ProcessName != null);
+            callback(m_curSample);
+        }
+    }
+    public override double MaxSampleTimeRelMSec
+    {
+        get
+        {
+            return m_log.SessionEndTime100ns;
+        }
     }
 
     // see code:TraceEventStackSource for the encoding of StackSourceCallStackIndex and StackSourceFrameIndex
     public override StackSourceFrameIndex GetFrameIndex(StackSourceCallStackIndex callStackIndex)
     {
-        if (callStackIndex < StackSourceCallStackIndex.Start)
-        {
-            Debug.Assert(callStackIndex == StackSourceCallStackIndex.Broken);
-            return StackSourceFrameIndex.Broken;
-        }
+        Debug.Assert(callStackIndex >= 0);
+        Debug.Assert(StackSourceCallStackIndex.Start == 0);         // If there are any cases before start, we need to handle them here. 
 
-        int index = (int)callStackIndex - (int)StackSourceCallStackIndex.Start;
-        if (index < m_log.CallStacks.MaxCallStackIndex)
+        int stackIndex = (int)callStackIndex - (int)StackSourceCallStackIndex.Start;
+        if (stackIndex < m_log.CallStacks.MaxCallStackIndex)
         {
-            CodeAddressIndex codeAddressIndex = m_log.CallStacks.CodeAddressIndex((CallStackIndex)index);
+            CodeAddressIndex codeAddressIndex = m_log.CallStacks.CodeAddressIndex((CallStackIndex)stackIndex);
             MethodIndex methodIndex = m_log.CallStacks.CodeAddresses.MethodIndex(codeAddressIndex);
             if (methodIndex != MethodIndex.Invalid)
             {
@@ -104,46 +108,64 @@ public class TraceEventStackSource : StackSource
                     return StackSourceFrameIndex.Unknown;
             }
         }
-        index -= m_log.CallStacks.MaxCallStackIndex;
-        Debug.Assert(index < m_log.Processes.MaxProcessIndex * (MaxThreadsPerProc + 1));
+        stackIndex -= m_log.CallStacks.MaxCallStackIndex;
+        if (stackIndex < m_log.Threads.MaxThreadIndex + m_log.Processes.MaxProcessIndex)
+        {
+            // At this point this is the encoded thread/process index.   We use the same encoding for both stacks and for frame names
+            // so we just need to add back in the proper offset. 
+            return (StackSourceFrameIndex)(stackIndex + m_log.CodeAddresses.MaxCodeAddressIndex + m_log.CodeAddresses.ModuleFiles.MaxModuleFileIndex + (int)StackSourceFrameIndex.Start);
+        }
 
-        // At this point this is the encoded thread/process index.   We use the same encoding for both stacks and for frame names
-        // so we just need to add back in the proper offset. 
-        return (StackSourceFrameIndex)(index + m_log.CodeAddresses.MaxCodeAddressIndex + m_log.CodeAddresses.ModuleFiles.MaxModuleFileIndex + (int)StackSourceFrameIndex.Start);
+        Debug.Assert(stackIndex < 2 * m_log.Threads.MaxThreadIndex + m_log.Processes.MaxProcessIndex, "Illegal Frame Index");
+        return StackSourceFrameIndex.Broken;
     }
     // see code:TraceEventStackSource for the encoding of StackSourceCallStackIndex and StackSourceFrameIndex
     public override StackSourceCallStackIndex GetCallerIndex(StackSourceCallStackIndex callStackIndex)
     {
-        if (callStackIndex < StackSourceCallStackIndex.Start)
-        {
-            Debug.Assert(callStackIndex == StackSourceCallStackIndex.Broken);
-            return GetThreadCallStackIndex();
-        }
+        Debug.Assert(callStackIndex >= 0);
+        Debug.Assert(StackSourceCallStackIndex.Start == 0);         // If there are any cases before start, we need to handle them here. 
 
-        int index = (int)callStackIndex - (int)StackSourceCallStackIndex.Start;
-        if (index < m_log.CallStacks.MaxCallStackIndex)
+        int curIndex = (int)callStackIndex - (int)StackSourceCallStackIndex.Start;
+        int nextIndex = (int)StackSourceCallStackIndex.Start;
+        if (curIndex < m_log.CallStacks.MaxCallStackIndex)
         {
-            var nextCallStack = (StackSourceCallStackIndex)m_log.CallStacks.Caller((CallStackIndex)index);
-            if (nextCallStack == StackSourceCallStackIndex.Invalid)
+            var nextCallStackIndex = m_log.CallStacks.Caller((CallStackIndex)curIndex);
+            if (nextCallStackIndex == CallStackIndex.Invalid)
             {
+                nextIndex += m_log.CallStacks.MaxCallStackIndex;    // Now points at the threads region.  
+                var threadIndex = m_log.CallStacks.Thread((CallStackIndex)curIndex);
+                nextIndex += (int)threadIndex;
+
+                // Mark it as a broken stack, which come after all the indexes for normal threads and processes. 
                 if (!ReasonableTopFrame(callStackIndex))
-                    return StackSourceCallStackIndex.Broken;
-                return GetThreadCallStackIndex();
+                    nextIndex += m_log.Threads.MaxThreadIndex + m_log.Processes.MaxProcessIndex;
             }
-            return (StackSourceCallStackIndex)(nextCallStack + (int)StackSourceCallStackIndex.Start);
+            else
+                nextIndex += (int)nextCallStackIndex;
+            return (StackSourceCallStackIndex)nextIndex;
         }
-        index -= m_log.CallStacks.MaxCallStackIndex;
+        curIndex -= m_log.CallStacks.MaxCallStackIndex;                                 // Now is a thread index
+        nextIndex += m_log.CallStacks.MaxCallStackIndex;                                // Output index points to the thread region.          
 
-        int processIndex = index % m_log.Processes.MaxProcessIndex;
-        int threadIndex = index / m_log.Processes.MaxProcessIndex;
+        if (curIndex < m_log.Threads.MaxThreadIndex)
+        {
+            nextIndex += m_log.Threads.MaxThreadIndex;                                  // Output index point to process region.
+            nextIndex += (int)m_log.Threads[(ThreadIndex)curIndex].Process.ProcessIndex;
+            return (StackSourceCallStackIndex)nextIndex;
+        }
+        curIndex -= m_log.Threads.MaxThreadIndex;                                      // Now is a broken thread index
 
-        if (threadIndex == 0)                               // threadIndex of 0 is special, it means the process itself, 
-            return StackSourceCallStackIndex.Invalid;       // Process has no parent
-        --threadIndex;                                      // recover the true thread index from the one with the process in it.  
+        if (curIndex < m_log.Processes.MaxProcessIndex)
+            return StackSourceCallStackIndex.Invalid;                                   // Process has no parent
+        curIndex -= m_log.Processes.MaxProcessIndex;                                    // Now is a broken thread index
 
-        Debug.Assert(processIndex < m_log.Processes.MaxProcessIndex);
-        // The process is the parent of the thread.    
-        return (StackSourceCallStackIndex)(processIndex + m_log.CallStacks.MaxCallStackIndex + (int)StackSourceCallStackIndex.Start);
+        if (curIndex < m_log.Threads.MaxThreadIndex)                                    // It is a broken stack
+        {
+            nextIndex += curIndex;                                                      // Indicate the real thread.  
+            return (StackSourceCallStackIndex)nextIndex;
+        }
+        Debug.Assert(false, "Invalid CallStackIndex");
+        return StackSourceCallStackIndex.Invalid;
     }
     public override string GetFrameName(StackSourceFrameIndex frameIndex, bool fullModulePath)
     {
@@ -153,7 +175,11 @@ public class TraceEventStackSource : StackSource
         if (frameIndex < StackSourceFrameIndex.Start)
         {
             if (frameIndex == StackSourceFrameIndex.Broken)
-                return "Broken";
+                return "BROKEN";
+            else if (frameIndex == StackSourceFrameIndex.Overhead)
+                return "OVERHEAD";
+            else if (frameIndex == StackSourceFrameIndex.Root)
+                return "ROOT";
             else
                 return "?!?";
         }
@@ -175,21 +201,19 @@ public class TraceEventStackSource : StackSource
             {
                 index -= m_log.ModuleFiles.MaxModuleFileIndex;
 
-                int processIndex = index % m_log.Processes.MaxProcessIndex;
-                int threadIndex = index / m_log.Processes.MaxProcessIndex;
-
-                var process = m_log.Processes[(ProcessIndex)processIndex];
-                Debug.Assert(process.ProcessID == m_curEvent.ProcessID);
-
-                if (threadIndex == 0)
+                if (index < m_log.Threads.MaxThreadIndex)
+                {
+                    TraceThread thread = m_log.Threads[(ThreadIndex)index];
+                    return "Thread (" + thread.ThreadID + ")";
+                }
+                index -= m_log.Threads.MaxThreadIndex;
+                if (index < m_log.Processes.MaxProcessIndex)
+                {
+                    TraceProcess process = m_log.Processes[(ProcessIndex)index];
                     return "Process " + process.Name + " (" + process.ProcessID + ")";
-                --threadIndex;                                      // recover the true thread index from the one with the process in it.  
-
-                Debug.Assert(threadIndex < process.Threads.MaxThreadIndex);
-                TraceThread thread = process.Threads[(ThreadIndex)threadIndex];
-
-                Debug.Assert(thread.ThreadID == m_curEvent.ThreadID);
-                return "Thread (" + thread.ThreadID + ")";
+                }
+                Debug.Assert(false, "Illegal Frame index");
+                return "";
             }
         }
 
@@ -214,50 +238,36 @@ public class TraceEventStackSource : StackSource
     {
         get
         {
-            return m_log.CallStacks.MaxCallStackIndex + m_log.Processes.MaxProcessIndex * (MaxThreadsPerProc + 1) + (int)StackSourceCallStackIndex.Start;
+            return (int)StackSourceCallStackIndex.Start + m_log.CallStacks.MaxCallStackIndex +
+                2 * m_log.Threads.MaxThreadIndex + m_log.Processes.MaxProcessIndex;     // *2 one for normal threads, one for broken threads.  
         }
     }
     public override int MaxCallFrameIndex
     {
         get
         {
-            return m_log.CodeAddresses.MaxCodeAddressIndex + m_log.CodeAddresses.ModuleFiles.MaxModuleFileIndex + m_log.Processes.MaxProcessIndex * (MaxThreadsPerProc + 1) +
-               (int)StackSourceFrameIndex.Start;
+            return (int)StackSourceFrameIndex.Start + m_log.CodeAddresses.MaxCodeAddressIndex + m_log.CodeAddresses.ModuleFiles.MaxModuleFileIndex +
+                m_log.Threads.MaxThreadIndex + m_log.Processes.MaxProcessIndex;
         }
     }
 
     #region private
-    private int MaxThreadsPerProc
-    {
-        get
-        {
-            if (m_maxThreadsPerProc == 0)
-            {
-                foreach (var proc in m_log.Processes)
-                {
-                    if (m_maxThreadsPerProc < proc.Threads.MaxThreadIndex)
-                        m_maxThreadsPerProc = proc.Threads.MaxThreadIndex;
-                }
-            }
-            return m_maxThreadsPerProc;
-        }
-    }
 
     private StackSourceCallStackIndex GetStack(TraceEvent event_)
     {
-        m_curEvent = event_;      // TODO not pretty, can have only one sample 'in flight' at a time.  
-
         // Console.WriteLine("Getting Stack for sample at {0:f4}", sample.TimeStampRelativeMSec);
-        var ret = (StackSourceCallStackIndex)m_curEvent.CallStackIndex();
-        if (ret == StackSourceCallStackIndex.Invalid)
-            ret = GetThreadCallStackIndex();
-        else
-            ret = ret + (int)StackSourceCallStackIndex.Start;
-        return ret;
+        var ret = (int)event_.CallStackIndex();
+        if (ret == (int)CallStackIndex.Invalid)
+            ret = m_log.CallStacks.MaxCallStackIndex + (int)event_.Thread().ThreadIndex;
+        ret = ret + (int)StackSourceCallStackIndex.Start;
+        return (StackSourceCallStackIndex)ret;
     }
     private bool ReasonableTopFrame(StackSourceCallStackIndex callStackIndex)
     {
+
         uint index = (uint)callStackIndex - (uint)StackSourceCallStackIndex.Start;
+
+        var stack = m_log.CallStacks[(CallStackIndex)callStackIndex];
         if (index < (uint)m_log.CallStacks.MaxCallStackIndex)
         {
             CodeAddressIndex codeAddressIndex = m_log.CallStacks.CodeAddressIndex((CallStackIndex)index);
@@ -274,31 +284,9 @@ public class TraceEventStackSource : StackSource
         }
         return false;
     }
-    /// <summary>
-    /// Gets the node representing the thread as a whole.  
-    /// </summary>
-    /// <returns></returns>
-    private StackSourceCallStackIndex GetThreadCallStackIndex()
-    {
-        // We have run  out of true stack m_frames, we use the thread as the parent of the stack. 
-        TraceThread thread = m_curEvent.Thread();
-        if (thread == null)     // Should never happen
-            return StackSourceCallStackIndex.Invalid;
 
-        TraceProcess process = thread.Process;
-        if (process == null)    // Should never happen
-            return StackSourceCallStackIndex.Invalid;
-
-        var ret = (StackSourceCallStackIndex)((((int)thread.ThreadIndex + 1) * m_log.Processes.MaxProcessIndex) +
-            (int)process.ProcessIndex + m_log.CallStacks.MaxCallStackIndex) + (int)StackSourceCallStackIndex.Start;
-        Debug.Assert((int)ret < MaxCallStackIndex);
-        return ret;
-    }
-
-    TraceEvent m_curEvent;      // TODO remove
     StackSourceSample m_curSample;
-    IEnumerator<TraceEvent> m_curEventPos;
-    int m_maxThreadsPerProc;
+    TraceEvents m_events;
     ModuleFileIndex m_goodTopModuleIndex;       // This is a known good module index for a 'good' stack (probably ntDll!RtlUserStackStart
     // TODO currently method id don't encode their module, but we want them to.  As a result
     // we use the code address of any address in the method as the representation for the method

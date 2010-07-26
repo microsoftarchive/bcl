@@ -31,7 +31,7 @@ public class XmlUtilities
         return XmlEscape(obj, true);
     }
 
-    public static string XmlEscape(object obj, bool quote)
+    public static string XmlEscape(object obj, bool quote=false)
     {
         string str = obj.ToString();
         StringBuilder sb = null;

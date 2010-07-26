@@ -43,6 +43,8 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="ClrStats.cs" />
+    <Compile Include="EventStats.cs" />
+    <Compile Include="GroupOSStacks.cs" />
     <Compile Include="PerfMonitorNativeMethods.cs" />
     <Compile Include="utilities\CommandLine.cs" />
     <Compile Include="utilities\StreamUtilities.cs" />

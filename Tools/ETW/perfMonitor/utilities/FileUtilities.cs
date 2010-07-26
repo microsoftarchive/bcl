@@ -1,8 +1,11 @@
-// Copyright (c) Microsoft Corporation.  All rights reserved
 /****************************************************************************/
 /*                                  FileUtilities.cs                        */
 /****************************************************************************/
 
+/*  Copyright (c) Microsoft Corporation.  All rights reserved. */
+/* AUTHOR: Vance Morrison   
+ * Date  : 10/20/2007  */
+/****************************************************************************/
 using System;
 using System.Collections.Generic;
 using System.Text;

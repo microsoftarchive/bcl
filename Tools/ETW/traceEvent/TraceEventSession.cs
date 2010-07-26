@@ -12,22 +12,25 @@ using System.Text;
 using System.Threading;
 using System.Diagnostics;
 using Diagnostics.Eventing;
+using System.IO;
 
 // TraceEventSession defintions See code:#Introduction to get started.
 namespace Diagnostics.Eventing
 {
     /// <summary>
-    /// #Introduction A TraceEventSession represents a single ETW Tracing Session (something that logs a
+    /// #Introduction 
+    /// 
+    /// A TraceEventSession represents a single ETW Tracing Session (something that logs a
     /// single output moduleFile). Every ETL output moduleFile has exactly one session assoicated with it,
-    /// although you can have 'real time' sessions that have no output moduleFile and you can connect to
-    /// 'directly' to get events without ever creating a moduleFile. You signify this simply by passing
-    /// 'null' as the name of the moduleFile. You extract data from these 'real time' sources by specifying
+    /// although you can have 'real time' sessions that have no output file and you can connect to
+    /// 'directly' to get events without ever creating a file. You signify this simply by passing
+    /// 'null' as the name of the file. You extract data from these 'real time' sources by specifying
     /// the session name to the constructor of code:ETWTraceEventSource). Sessions are MACHINE WIDE and can
     /// OUTLIVE the process that creates them. This it takes some care to insure that sessions are cleaned up
     /// in all cases.
     /// 
     /// Code that generated ETW events are called Providers. The Kernel has a provider (and it is often the
-    /// most intersting) but other components are free to use public APIs (eg TraceEvent), to create
+    /// most intersting) but other components are free to use public OS APIs (eg WriteEvent), to create
     /// user-mode providers. Each Provider is given a GUID that is used to identify it. You can get a list of
     /// all providers on the system as well as their GUIDs by typing the command
     /// 
@@ -46,15 +49,11 @@ namespace Diagnostics.Eventing
     /// are of interest. Because of these restrictions, you often need two sessions, one for the kernel
     /// events and one for all user-mode events.
     /// 
-    /// TraceEventSession has suport for simulating being able to run user mode and kernel mode session as
-    /// one session. The support surfaces in the code:TraceEventSession.EnableKernelProvider. If this methodIndex
-    /// is called on a session that is not named 'NT Kernel Session', AND the session is logging to a
-    /// moduleFile, it will start up kernel session that logs to [basename].kernel.etl.
-    /// 
     /// Sample use. Enabling the Kernel's DLL image logging to the moduleFile output.etl
     /// 
-    ///  TraceEventSession session = new TraceEventSession("output.etl", KernelTraceEventParser.Keywords.ImageLoad); //
-    ///  Run you scenario session.Close(); // Flush and close the output.etl moduleFile
+    ///  * TraceEventSession session = new TraceEventSession(, KernelTraceEventParser.Keywords.ImageLoad); 
+    ///  * Run you scenario 
+    ///  * session.Close(); 
     /// 
     /// Once the scenario is complete, you use the code:TraceEventSession.Close methodIndex to shut down a
     /// session. You can also use the code:TraceEventSession.GetActiveSessionNames to get a list of all
@@ -65,7 +64,7 @@ namespace Diagnostics.Eventing
     /// Once it is an ETLX file you have a much richer set of processing options availabe from code:TraceLog. 
     /// </summary>
     [SecuritySafeCritical]
-    public sealed class TraceEventSession : IDisposable
+    unsafe public sealed class TraceEventSession : IDisposable
     {
         /// <summary>
         /// Create a new logging session.
@@ -78,165 +77,87 @@ namespace Diagnostics.Eventing
         /// The output moduleFile (by convention .ETL) to put the event data. If this parameter is null, it means
         /// that the data is 'real time' (stored in the session memory itself)
         /// </param>
-        
         public TraceEventSession(string sessionName, string fileName)
         {
-            Init(sessionName);
-            this.fileName = fileName;
-
-            properties.FlushTimer = 1;              // flush every second;
-            properties.BufferSize = 64;             // 64 KB buffer blockSize
-            properties.MinimumBuffers = 128;        // 64K * 128 = 8Meg minimum
-            properties.MaximumBuffers = properties.MinimumBuffers * 4;  // 32Meg maximum
-            if (fileName == null)
-            {
-                properties.LogFileMode = TraceEventNativeMethods.EVENT_TRACE_REAL_TIME_MODE;
-            }
-            else
-            {
-                if (fileName.Length > MaxNameSize - 1)
-                    throw new ArgumentException("File name too long", "fileName");
-                properties.LogFileMode = TraceEventNativeMethods.EVENT_TRACE_FILE_MODE_SEQUENTIAL;
-            }
-
-            properties.Wnode.ClientContext = 1;  // set Timer resolution to 100ns.  
-            this.create = true;
+            this.m_BufferSizeMB = 40;       // The default size.  
+            this.m_SessionHandle = TraceEventNativeMethods.INVALID_HANDLE_VALUE;
+            this.m_FileName = fileName;               // filename = null means real time session
+            this.m_SessionName = sessionName;
+            this.m_Create = true;
         }
         /// <summary>
         /// Open an existing Windows Event Tracing Session, with name 'sessionName'. To create a new session,
         /// use TraceEventSession(string, string)
         /// </summary>
         /// <param name="sessionName"> The name of the session to open (see GetActiveSessionNames)</param>
-        
-        public TraceEventSession(string sessionName) : this(sessionName, false) { }
-        /// <summary>
-        /// Open an existing Windows Event Tracing Session, with name 'sessionName'.
-        /// 
-        /// If you are opening a new session use TraceEventSession(string, string).
-        ///  
-        /// To support the illusion that you can have a session with both kernel and user events,
-        /// TraceEventSession might start up both a kernel and a user session.   When you want to 'attach'
-        /// to such a combined session, the constructor needs to know if you want to control the kernel
-        /// session or not.  If attachKernelSession is true, then it opens both sessions (and thus 'Close'
-        /// will operate on both sessions.
-        /// </summary>
-        public TraceEventSession(string sessionName, bool attachKernelSession)
+        public TraceEventSession(string sessionName)
         {
-            Init(sessionName);
-            int hr = TraceEventNativeMethods.ControlTrace(0UL, sessionName, ToUnmanagedBuffer(properties, null), TraceEventNativeMethods.EVENT_TRACE_CONTROL_QUERY);
+            this.m_SessionHandle = TraceEventNativeMethods.INVALID_HANDLE_VALUE;
+            this.m_SessionName = sessionName;
+
+            // Get the filename
+            var propertiesBuff = stackalloc byte[PropertiesSize];
+            var properties = GetProperties(propertiesBuff);
+            int hr = TraceEventNativeMethods.ControlTrace(0UL, sessionName, properties, TraceEventNativeMethods.EVENT_TRACE_CONTROL_QUERY);
+            if (hr == 4201)     // Instance name not found.  This means we did not start
+                throw new FileNotFoundException("The session " + sessionName + " is not active.");  // Not really a file, but not bad. 
             Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(hr));
-            isActive = true;
-            properties = (TraceEventNativeMethods.EVENT_TRACE_PROPERTIES)Marshal.PtrToStructure(unmanagedPropertiesBuffer, typeof(TraceEventNativeMethods.EVENT_TRACE_PROPERTIES));
-            if (properties.LogFileNameOffset != 0)
-                fileName = Marshal.PtrToStringUni((IntPtr)(unmanagedPropertiesBuffer.ToInt64() + properties.LogFileNameOffset));
-
-            if (attachKernelSession)
-            {
-                bool success = false;
-                try
-                {
-                    kernelSession = new TraceEventSession(KernelTraceEventParser.KernelSessionName);
-                    success = true;
-                }
-                finally
-                {
-                    if (!success)
-                        Stop();
-                }
-            }
+            this.m_FileName = new string((char*)(((byte*)properties) + properties->LogFileNameOffset));
+            this.m_BufferSizeMB = (int)properties->MinimumBuffers;
+            if ((properties->LogFileMode & TraceEventNativeMethods.EVENT_TRACE_FILE_MODE_CIRCULAR) != 0)
+                m_CircularBufferMB = (int) properties->MaximumFileSize;
         }
-
-        /// <summary>
-        /// Shortcut that enables the kernel provider with no eventToStack trace capturing. 
-        /// See code:#EnableKernelProvider (flags, stackCapture)
-        /// </summary>
         public bool EnableKernelProvider(KernelTraceEventParser.Keywords flags)
         {
             return EnableKernelProvider(flags, KernelTraceEventParser.Keywords.None);
         }
         /// <summary>
         /// #EnableKernelProvider
-        /// Enable the kernel provider for the session. If the session name is 'NT Kernel Session' then it
-        /// operates on that.   This can be used to manipuate the kernel session.   If the name is not 'NT
-        /// Kernel Session' AND it is a moduleFile based session, then it tries to approximate attaching the
-        /// kernel session by creating another session logs to [basename].kernel.etl.  There is support in
-        /// ETWTraceEventSource for looking for these files automatically, which give a good illusion that
-        /// you can have a session that has both kernel and user events turned on.  
+        /// Enable the kernel provider for the session. If the session must be called 'NT Kernel Session'.   
         /// <param name="flags">
         /// Specifies the particular kernel events of interest</param>
         /// <param name="stackCapture">
-        /// Specifies which events should have their eventToStack traces captured too (VISTA only)</param>
+        /// Specifies which events should have their eventToStack traces captured too (VISTA+ only)</param>
         /// <returns>Returns true if the session had existed before and is now restarted</returns>
         /// </summary>
         public unsafe bool EnableKernelProvider(KernelTraceEventParser.Keywords flags, KernelTraceEventParser.Keywords stackCapture)
         {
-            if (sessionName != KernelTraceEventParser.KernelSessionName)
-            {
-                if (kernelSession != null)
-                    throw new Exception("A kernel session is already active.");
-                if (string.IsNullOrEmpty(FileName))
-                    throw new Exception("Cannot enable kernel events to a real time session unless it is named " + KernelTraceEventParser.KernelSessionName);
-                string kernelFileName = System.IO.Path.ChangeExtension(FileName, ".kernel.etl");
-                kernelSession = new TraceEventSession(KernelTraceEventParser.KernelSessionName, kernelFileName);
-                return kernelSession.EnableKernelProvider(flags, stackCapture);
-            }
-            if (sessionHandle != TraceEventNativeMethods.INVALID_HANDLE_VALUE)
+            if (m_SessionName != KernelTraceEventParser.KernelSessionName)
+                throw new Exception("Cannot enable kernel events to a real time session unless it is named " + KernelTraceEventParser.KernelSessionName);
+            if (m_SessionHandle != TraceEventNativeMethods.INVALID_HANDLE_VALUE)
                 throw new Exception("The kernel provider must be enabled as the only provider.");
 
-            properties.Wnode.Guid = KernelTraceEventParser.ProviderGuid;
-            if (Environment.OSVersion.Version.Major <= 5)
-            {
-                // TODO should we fail, or should we silently ignore?
-                if (stackCapture != KernelTraceEventParser.Keywords.None)
-                    throw new Exception("Stack trace capture only available on Windows 6 (VISTA) and above.");
-
-                KernelTraceEventParser.Keywords vistaOnlyFlags =
-                    KernelTraceEventParser.Keywords.ProcessCounters |
-                    KernelTraceEventParser.Keywords.ContextSwitch |
-                    KernelTraceEventParser.Keywords.Interrupt |
-                    KernelTraceEventParser.Keywords.DiskIOInit |
-                    KernelTraceEventParser.Keywords.Driver |
-                    KernelTraceEventParser.Keywords.Profile |
-                    KernelTraceEventParser.Keywords.FileIO |
-                    KernelTraceEventParser.Keywords.FileIOInit |
-                    KernelTraceEventParser.Keywords.Dispatcher |
-                    KernelTraceEventParser.Keywords.VirtualAlloc;
-                KernelTraceEventParser.Keywords setVistaFlags = flags & vistaOnlyFlags;
-                if (setVistaFlags != KernelTraceEventParser.Keywords.None)
-                    throw new Exception("A Kernel Event Flags {" + setVistaFlags.ToString() + "} specified that is not supported on Pre-VISTA OSes.");
-
-                properties.EnableFlags = (uint) flags;
-                return StartTrace();
-            }
+            var propertiesBuff = stackalloc byte[PropertiesSize];
+            var properties = GetProperties(propertiesBuff);
+            properties->Wnode.Guid = KernelTraceEventParser.ProviderGuid;
 
             // Initialize the stack collecting information
             const int stackTracingIdsMax = 96;
-            int curID = 0;
+            int numIDs = 0;
             var stackTracingIds = stackalloc TraceEventNativeMethods.STACK_TRACING_EVENT_ID[stackTracingIdsMax];
 #if DEBUG
             // Try setting all flags, if we overflow an assert in SetStackTraceIds will fire.  
             SetStackTraceIds((KernelTraceEventParser.Keywords)(-1), stackTracingIds, stackTracingIdsMax);
 #endif
             if (stackCapture != KernelTraceEventParser.Keywords.None)
-                curID = SetStackTraceIds(stackCapture, stackTracingIds, stackTracingIdsMax);
+                numIDs = SetStackTraceIds(stackCapture, stackTracingIds, stackTracingIdsMax);
 
             // The Profile event requires the SeSystemProfilePrivilege to succeed, so set it.  
             if ((flags & KernelTraceEventParser.Keywords.Profile) != 0)
                 TraceEventNativeMethods.SetSystemProfilePrivilege();
 
             bool ret = false;
-            properties.EnableFlags = (uint)flags;
-
+            properties->EnableFlags = (uint)flags;
             int dwErr;
             try
             {
-                dwErr = TraceEventNativeMethods.StartKernelTrace(out sessionHandle, ToUnmanagedBuffer(properties, fileName), stackTracingIds, curID);
+                dwErr = TraceEventNativeMethods.StartKernelTrace(out m_SessionHandle, properties, stackTracingIds, numIDs);
                 if (dwErr == 0xB7) // STIERR_HANDLEEXISTS
                 {
                     ret = true;
                     Stop();
                     Thread.Sleep(100);  // Give it some time to stop. 
-                    dwErr = TraceEventNativeMethods.StartKernelTrace(out sessionHandle, ToUnmanagedBuffer(properties, fileName), stackTracingIds, curID);
+                    dwErr = TraceEventNativeMethods.StartKernelTrace(out m_SessionHandle, properties, stackTracingIds, numIDs);
                 }
             }
             catch (BadImageFormatException)
@@ -261,7 +182,6 @@ namespace Diagnostics.Eventing
             if (dwErr == 5 && Environment.OSVersion.Version.Major > 5)      // On Vista and we get a 'Accessed Denied' message
                 throw new UnauthorizedAccessException("Error Starting ETW:  Access Denied (Administrator rights required to start ETW)");
             Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(dwErr));
-
             return ret;
         }
         public bool EnableProvider(Guid providerGuid, TraceEventLevel providerLevel)
@@ -313,84 +233,82 @@ namespace Diagnostics.Eventing
             }
             return EnableProvider(providerGuid, providerLevel, matchAnyKeywords, matchAllKeywords, valueDataType, valueData, valueDataSize);
         }
-
         /// <summary>
         /// Once started, event sessions will persist even after the process that created them dies. They are
-        /// only stoped by this explicit Stop() API.  If you used both kernel and user events, consider
-        /// using the code:StopUserAndKernelSession API instead. 
+        /// only stoped by this explicit Stop() API. 
         /// </summary>
-        public void Stop()
+        public bool Stop(bool noThrow = false)
         {
-            if (stopped)
-                return;
-            stopped = true;
-            int hr = TraceEventNativeMethods.ControlTrace(0UL, sessionName,
-                ToUnmanagedBuffer(properties, null), TraceEventNativeMethods.EVENT_TRACE_CONTROL_STOP);
-
-            // TODO enumerate providers in session and turn them off
-#if false
-            string regKeyName = @"Software\Microsoft\Windows\CurrentVersion\Winevt\Publishers\{" + providerGuid + "}";
-            Microsoft.Win32.RegistryKey regKey = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(regKeyName, true);
-            regKey.DeleteValue("ControllerData", false);
-            regKey.Close();
-#endif
-
+            if (m_Stopped)
+                return true;
+            m_Stopped = true;
+            var propertiesBuff = stackalloc byte[PropertiesSize];
+            var properties = GetProperties(propertiesBuff);
+            int hr = TraceEventNativeMethods.ControlTrace(0UL, m_SessionName, properties, TraceEventNativeMethods.EVENT_TRACE_CONTROL_STOP);
             if (hr != 4201)     // Instance name not found.  This means we did not start
-                Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(hr));
-
-            if (kernelSession != null)
             {
-                kernelSession.Stop();
-                kernelSession = null;
+                if (!noThrow)
+                    Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(hr));
+                return false;   // Stop failed
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Cause the log to be a circular buffer.  The buffer size (in MegaBytes) is the value of this property.
+        /// Setting this to 0 will cause it to revert to non-circular mode.  This routine can only be called BEFORE
+        /// a provider is enabled.  
+        /// </summary>
+        public int CircularBufferMB
+        {
+            get { return m_CircularBufferMB; }
+            set
+            {
+                if (IsActive)
+                    throw new InvalidOperationException("Property can't be changed after A provider has started.");
+                if (m_FileName == null)
+                    throw new InvalidOperationException("Circular buffers only allowed on sessions with files.");
+                m_CircularBufferMB = value;
+            }
+
+        }
+        /// <summary>
+        /// Sets the size of the buffer the operating system should reserve to avoid lost packets.   Starts out 
+        /// as a very generous 32MB for files.  If events are lost, this can be increased.  
+        /// </summary>
+        public int BufferSizeMB
+        {
+            get { return m_BufferSizeMB; }
+            set
+            {
+                if (IsActive)
+                    throw new InvalidOperationException("Property can't be changed after A provider has started.");
+                m_BufferSizeMB = value;
             }
         }
         /// <summary>
-        /// TraceEventSessions may have both a kernel session and a user session turned on.  To simplify
-        /// error handling, call code:StopSession to stop both.  This is equivalent it attaching to the
-        /// combined session and calling Stop, but also works in all error cases (if it was possible to stop
-        /// the sessions they are stopped), and is silent if the sessions are already stopped.  
+        /// If set then Stop() will be called automatically when this object is Disposed or GCed (which
+        /// will happen on program exit unless a unhandled exception occurs.  
         /// </summary>
-        /// <param name="userSessionName">The name of the user session to stop</param>
-        public static void StopUserAndKernelSession(string userSessionName)
+        public bool StopOnDispose { get { return m_StopOnDispose; } set { m_StopOnDispose = value; } }
+        /// <summary>
+        /// Stop the user and kernel mode session, ignoring errors.
+        /// </summary>
+        /// <param name="userModeSessionName"></param>
+        [Obsolete("Use Stop(noThrow) on kernel and user mode session explicitly.")]
+        public static void StopUserAndKernelSession(string userModeSessionName)
         {
-            Exception eToThow = null;
-            try
-            {
-                TraceEventSession kernelSession = new TraceEventSession(KernelTraceEventParser.KernelSessionName);
-                kernelSession.Stop();
-            }
-            catch (COMException e)
-            {
-                if ((uint)e.ErrorCode != 0x80071069)        // Could not find provider, that is OK. 
-                    eToThow = e;
-            }
-            catch (Exception e)
-            {
-                eToThow = e;                                // we will throw this later.  
-            }
-
-            try
-            {
-                TraceEventSession userSession = new TraceEventSession(userSessionName);
-                userSession.Stop();
-            }
-            catch (COMException e)
-            {
-                if ((uint)e.ErrorCode != 0x80071069)      // Could not find provider, that is OK 
-                    throw;
-            }
-
-            // If we got an error closing down the kernel provider, throw it here.  
-            if (eToThow != null)
-                throw eToThow;
+            try { new TraceEventSession(userModeSessionName).Stop(true); }
+            catch (Exception) { }
+            try { new TraceEventSession(KernelTraceEventParser.KernelSessionName).Stop(true); }
+            catch (Exception) { }
         }
-
         /// <summary>
         /// The name of the session that can be used by other threads to attach to the session. 
         /// </summary>
         public string SessionName
         {
-            get { return sessionName; }
+            get { return m_SessionName; }
         }
         /// <summary>
         /// The name of the moduleFile that events are logged to.  Null means the session is real time. 
@@ -399,7 +317,7 @@ namespace Diagnostics.Eventing
         {
             get
             {
-                return fileName;
+                return m_FileName;
             }
         }
         /// <summary>
@@ -411,13 +329,9 @@ namespace Diagnostics.Eventing
         {
             get
             {
-                return isActive;
+                return m_IsActive;
             }
         }
-        /// <summary>
-        /// Returns true if the OS kernel provider is enabled.  
-        /// </summary>
-        public bool KernelProviderEnabled { get { return kernelSession != null; } }
 
         /// <summary>
         /// ETW trace sessions survive process shutdown. Thus you can attach to existing active sessions.
@@ -456,14 +370,12 @@ namespace Diagnostics.Eventing
             }
             return activeTraceNames;
         }
-
-
         /// <summary>
         /// It is sometimes useful to merge the contents of several ETL files into a single 
         /// output ETL file.   This routine does that.  It also will attach additional 
         /// information that will allow correct file name and symbolic lookup if the 
         /// ETL file is used on a machine other than the one that the data was collected on.
-        /// Thus it can be useful to do this to a single file.  
+        /// If you wish to transport the file to another machine you need to merge them.
         /// </summary>
         /// <param name="inputETLFileNames"></param>
         /// <param name="outputETLFileName"></param>
@@ -476,54 +388,76 @@ namespace Diagnostics.Eventing
             if (retValue != 0)
                 throw new ApplicationException("Merge operation failed.");
         }
+        /// <summary>
+        /// This variation of the Merge command takes the 'primary' etl file name (X.etl)
+        /// and will merge in any files of the form X.*.etl and update the X.etl file to
+        /// be the merged file (deleting the others)
+        /// </summary>
+        public static void MergeInPlace(string etlFileName)
+        {
+            string tempName = Path.ChangeExtension(etlFileName, ".etl.new");
+            try
+            {
+                string fileBaseName = Path.GetFileNameWithoutExtension(etlFileName);
+                string dir = Path.GetDirectoryName(etlFileName);
+                if (dir.Length == 0)
+                    dir = ".";
+                string[] additionalLogFiles = Directory.GetFiles(dir, fileBaseName + ".*.etl");
 
+                string[] mergeInputs = new string[additionalLogFiles.Length + 1];
+                mergeInputs[0] = etlFileName;
+                Array.Copy(additionalLogFiles, 0, mergeInputs, 1, additionalLogFiles.Length);
+
+                // Do the merge;
+                Merge(mergeInputs, tempName);
+
+                // Delete the originals.  
+                foreach (var additionalLogFile in additionalLogFiles)
+                    File.Delete(additionalLogFile);
+                File.Delete(etlFileName);
+
+                // Place the output in its final resting place.  
+                File.Move(tempName, etlFileName);
+            }
+            finally
+            {
+                // Insure we clean up.  
+                if (File.Exists(tempName))
+                    File.Delete(tempName);
+            }
+        }
+        /// <summary>
+        /// Is the current process Elevated (allowed to turn on a ETW provider
+        /// </summary>
+        /// <returns></returns>
+        public static bool? IsElevated() { return TraceEventNativeMethods.IsElevated(); }
         #region Private
         private const int maxStackTraceProviders = 256;
+        /// <summary>
+        /// The 'properties' field is only the header information.  There is 'tail' that is 
+        /// required.  'ToUnmangedBuffer' fills in this tail properly. 
+        /// </summary>
+        ~TraceEventSession()
+        {
+            Dispose();
+        }
+        public void Dispose()
+        {
+            if (m_StopOnDispose)
+                Stop(true);
 
+            if (m_SessionHandle != TraceEventNativeMethods.INVALID_HANDLE_VALUE)
+                TraceEventNativeMethods.CloseTrace(m_SessionHandle);
+            m_SessionHandle = TraceEventNativeMethods.INVALID_HANDLE_VALUE;
+
+            GC.SuppressFinalize(this);
+        }
         /// <summary>
         /// Do intialization common to the contructors.  
         /// </summary>
-        
-        private void Init(string sessionName)
+        private bool EnableProvider(Guid providerGuid, TraceEventLevel providerLevel, ulong matchAnyKeywords, ulong matchAllKeywords, int providerDataType, byte[] providerData, int providerDataSize)
         {
-            this.sessionHandle = TraceEventNativeMethods.INVALID_HANDLE_VALUE;
-            if (sessionName.Length > MaxNameSize - 1)
-                throw new ArgumentException("File name too long", "sessionName");
-
-            this.sessionName = sessionName;
-            properties = new TraceEventNativeMethods.EVENT_TRACE_PROPERTIES();
-            properties.Wnode.Flags = TraceEventNativeMethods.WNODE_FLAG_TRACED_GUID;
-            properties.LoggerNameOffset = (uint)Marshal.SizeOf(typeof(TraceEventNativeMethods.EVENT_TRACE_PROPERTIES));
-            properties.LogFileNameOffset = properties.LoggerNameOffset + MaxNameSize * sizeof(char);
-            extentionSpaceOffset = properties.LogFileNameOffset + MaxNameSize * sizeof(char);
-            // #sizeCalculation
-            properties.Wnode.BufferSize = extentionSpaceOffset + 8 + 8 * 4 + 4 + maxStackTraceProviders * 4;
-            unmanagedPropertiesBuffer = TraceEventNativeMethods.AllocHGlobal((int) properties.Wnode.BufferSize);
-            TraceEventNativeMethods.ZeroMemory(unmanagedPropertiesBuffer, properties.Wnode.BufferSize);
-        }
-
-        private bool InsureSession()
-        {
-            bool ret = false;
-            if (sessionHandle == TraceEventNativeMethods.INVALID_HANDLE_VALUE)
-            {
-                if (create)
-                {
-                    properties.Wnode.Guid = new Guid();
-                    ret = StartTrace();
-                }
-                else
-                {
-                    // There is currently no way of adding providers on an existing session 
-                    throw new Exception("Cannot add new providers to session this process did not create.");
-                }
-            }
-            return ret;
-        }
-
-        private unsafe bool EnableProvider(Guid providerGuid, TraceEventLevel providerLevel, ulong matchAnyKeywords, ulong matchAllKeywords, int providerDataType, byte[] providerData, int providerDataSize)
-        {
-            bool ret = InsureSession();
+            bool ret = InsureStarted();
             TraceEventNativeMethods.EVENT_FILTER_DESCRIPTOR* dataDescrPtr = null;
             fixed (byte* providerDataPtr = providerData)
             {
@@ -554,23 +488,22 @@ namespace Diagnostics.Eventing
                 int hr;
                 try
                 {
-                    hr = TraceEventNativeMethods.EnableTraceEx(ref providerGuid, null, sessionHandle,
+                    hr = TraceEventNativeMethods.EnableTraceEx(ref providerGuid, null, m_SessionHandle,
                     1, (byte)providerLevel, matchAnyKeywords, matchAllKeywords, 0, dataDescrPtr);
                 }
                 catch (EntryPointNotFoundException)
                 {
                     // Try with the old pre-vista API
-                    hr = TraceEventNativeMethods.EnableTrace(1, (int)matchAnyKeywords, (int)providerLevel, ref providerGuid, sessionHandle);
+                    hr = TraceEventNativeMethods.EnableTrace(1, (int)matchAnyKeywords, (int)providerLevel, ref providerGuid, m_SessionHandle);
                 }
                 Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(hr));
-                }
-            isActive = true;
+            }
+            m_IsActive = true;
             return ret;
         }
-
         private void SetOrDelete(string regKeyName, string valueName, byte[] data)
         {
-#if !Silverlight 
+#if !Silverlight
             if (System.Runtime.InteropServices.Marshal.SizeOf(typeof(IntPtr)) == 8 &&
                 regKeyName.StartsWith(@"Software\", StringComparison.OrdinalIgnoreCase))
                 regKeyName = @"Software\Wow6432Node" + regKeyName.Substring(8);
@@ -592,7 +525,6 @@ namespace Diagnostics.Eventing
             }
 #endif
         }
-
         /// <summary>
         /// Given a mask of kernel flags, set the array stackTracingIds of size stackTracingIdsMax to match.
         /// It returns the number of entries in stackTracingIds that were filled in.
@@ -615,8 +547,6 @@ namespace Diagnostics.Eventing
                 stackTracingIds[curID].Type = 0x33;     // SysCall
                 curID++;
             }
-            // TODO SysCall?
-
             // Thread
             if ((stackCapture & KernelTraceEventParser.Keywords.Thread) != 0)
             {
@@ -626,10 +556,9 @@ namespace Diagnostics.Eventing
             }
 
             if ((stackCapture & KernelTraceEventParser.Keywords.ContextSwitch) != 0)
-                {
+            {
                 stackTracingIds[curID].EventGuid = KernelTraceEventParser.ThreadTaskGuid;
-                if ((stackCapture & KernelTraceEventParser.Keywords.Thread) != 0)
-                    stackTracingIds[curID].Type = 0x24;     // Context Switch
+                stackTracingIds[curID].Type = 0x24;     // Context Switch
                 curID++;
             }
 
@@ -712,6 +641,7 @@ namespace Diagnostics.Eventing
                 stackTracingIds[curID].Type = 0x0E;     // Hard Page Fault
                 curID++;
 
+                // TODO these look interesting.  
                 // ! %02 49 ! Pagefile Mapped Section Create
                 // ! %02 69 ! Pagefile Backed Image Mapping
                 // ! %02 71 ! Contiguous Memory Generation
@@ -740,7 +670,7 @@ namespace Diagnostics.Eventing
                 stackTracingIds[curID].Type = 0x44;     // Write
                 curID++;
 
-#if false
+#if false       // TODO  (as I recall they caused failures
                 stackTracingIds[curID].EventGuid = KernelTraceEventParser.FileIoTaskGuid;
                 stackTracingIds[curID].Type = 0x45;     // SetInformation
                 curID++;
@@ -784,7 +714,7 @@ namespace Diagnostics.Eventing
                 stackTracingIds[curID].EventGuid = KernelTraceEventParser.RegistryTaskGuid;
                 stackTracingIds[curID].Type = 0x0B;     // NtOpenKey
                 curID++;
-#if false
+#if false       // TODO enable (as I recall they caused failures)
                 stackTracingIds[curID].EventGuid = KernelTraceEventParser.RegistryTaskGuid;
                 stackTracingIds[curID].Type = 0x0C;     // NtDeleteKey
                 curID++;
@@ -840,92 +770,128 @@ namespace Diagnostics.Eventing
 #endif
             }
 
+            // TODO put these in for advanced procedure calls.  
+            //! %1A 21 ! ALPC: SendMessage
+            //! %1A 22 ! ALPC: ReceiveMessage
+            //! %1A 23 ! ALPC: WaitForReply
+            //! %1A 24 ! ALPC: WaitForNewMessage
+            //! %1A 25 ! ALPC: UnWait
+
+            // I don't have heap or threadpool.  
+
             // Confirm we did not overflow.  
             Debug.Assert(curID <= stackTracingIdsMax);
             return curID;
         }
-
-        /// <summary>
-        /// The 'properties' field is only the header information.  There is 'tail' that is 
-        /// required.  'ToUnmangedBuffer' fills in this tail properly. 
-        /// </summary>
-        ~TraceEventSession()
+        private bool InsureStarted()
         {
-            Dispose();
-        }
-        
-        [SecuritySafeCritical]
-        public void Dispose()
-        {
-            if (unmanagedPropertiesBuffer != IntPtr.Zero)
-                TraceEventNativeMethods.FreeHGlobal(unmanagedPropertiesBuffer);                
-            unmanagedPropertiesBuffer = IntPtr.Zero;
+            if (!m_Create)
+                throw new NotSupportedException("Can not enable providers on a session you don't create directly");
+            if (m_SessionName == KernelTraceEventParser.KernelSessionName)
+                throw new NotSupportedException("Can only enable kernel providers on a kernel session");
 
-            if (sessionHandle != TraceEventNativeMethods.INVALID_HANDLE_VALUE)
-                TraceEventNativeMethods.CloseTrace(sessionHandle);
-            sessionHandle = TraceEventNativeMethods.INVALID_HANDLE_VALUE;
+            // Already initialized, nothing to do.  
+            if (m_SessionHandle != TraceEventNativeMethods.INVALID_HANDLE_VALUE)
+                return false;
 
-            GC.SuppressFinalize(this);
-        }
-
-        private IntPtr ToUnmanagedBuffer(TraceEventNativeMethods.EVENT_TRACE_PROPERTIES properties, string fileName)
-        {
-
-            if (fileName == null)
-                properties.LogFileNameOffset = 0;
-            else
-                properties.LogFileNameOffset = properties.LoggerNameOffset + MaxNameSize * 2;
-
-            Marshal.StructureToPtr(properties, unmanagedPropertiesBuffer, false);
-            byte[] buffer = Encoding.Unicode.GetBytes(sessionName);
-            Marshal.Copy(buffer, 0, (IntPtr)(unmanagedPropertiesBuffer.ToInt64() + properties.LoggerNameOffset), buffer.Length);
-            Marshal.WriteInt16(unmanagedPropertiesBuffer, (int)properties.LoggerNameOffset + buffer.Length, 0);
-
-            if (fileName != null)
-            {
-                buffer = Encoding.Unicode.GetBytes(fileName);
-                Marshal.Copy(buffer, 0, (IntPtr)(unmanagedPropertiesBuffer.ToInt64() + properties.LogFileNameOffset), buffer.Length);
-                Marshal.WriteInt16(unmanagedPropertiesBuffer, (int)properties.LogFileNameOffset + buffer.Length, 0);
-            }
-            return unmanagedPropertiesBuffer;
-        }
-
-        /// <summary>
-        /// Actually starts the trace, with added logic to retry if the session already exists.  
-        /// </summary>
-        private bool StartTrace()
-        {
+            var propertiesBuff = stackalloc byte[PropertiesSize];
+            var properties = GetProperties(propertiesBuff);
             bool ret = false;
-            int dwErr = TraceEventNativeMethods.StartTrace(out sessionHandle, sessionName, ToUnmanagedBuffer(properties, fileName));
-            if (dwErr == 0xB7) // STIERR_HANDLEEXISTS
+
+            int retCode = TraceEventNativeMethods.StartTrace(out m_SessionHandle, m_SessionName, properties);
+            if (retCode == 0xB7)      // STIERR_HANDLEEXISTS
             {
                 ret = true;
                 Stop();
                 Thread.Sleep(100);  // Give it some time to stop. 
-                dwErr = TraceEventNativeMethods.StartTrace(out sessionHandle, sessionName, ToUnmanagedBuffer(properties, fileName));
+                retCode = TraceEventNativeMethods.StartTrace(out m_SessionHandle, m_SessionName, properties);
             }
-            if (dwErr == 5 && Environment.OSVersion.Version.Major > 5)      // On Vista and we get a 'Accessed Denied' message
+            if (retCode == 5 && Environment.OSVersion.Version.Major > 5)      // On Vista and we get a 'Accessed Denied' message
                 throw new UnauthorizedAccessException("Error Starting ETW:  Access Denied (Administrator rights required to start ETW)");
-
-            Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(dwErr));
+            Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(retCode));
             return ret;
+        }
+        private TraceEventNativeMethods.EVENT_TRACE_PROPERTIES* GetProperties(byte* buffer)
+        {
+            TraceEventNativeMethods.ZeroMemory((IntPtr)buffer, (uint)PropertiesSize);
+            var properties = (TraceEventNativeMethods.EVENT_TRACE_PROPERTIES*)buffer;
+
+            properties->LoggerNameOffset = (uint)sizeof(TraceEventNativeMethods.EVENT_TRACE_PROPERTIES);
+            properties->LogFileNameOffset = properties->LoggerNameOffset + MaxNameSize * sizeof(char);
+
+            // Copy in the session name
+            if (m_SessionName.Length > MaxNameSize - 1)
+                throw new ArgumentException("File name too long", "sessionName");
+            char* sessionNamePtr = (char*)(((byte*)properties) + properties->LoggerNameOffset);
+            CopyStringToPtr(sessionNamePtr, m_SessionName);
+
+            properties->Wnode.BufferSize = (uint) PropertiesSize;
+            properties->Wnode.Flags = TraceEventNativeMethods.WNODE_FLAG_TRACED_GUID;
+            properties->LoggerNameOffset = (uint)sizeof(TraceEventNativeMethods.EVENT_TRACE_PROPERTIES);
+            properties->LogFileNameOffset = properties->LoggerNameOffset + MaxNameSize * sizeof(char);
+
+            properties->FlushTimer = 1;              // flush every second;
+            properties->BufferSize = 1024;           // 1Mb buffer blockSize
+            if (m_FileName == null)
+            {
+                properties->LogFileMode = TraceEventNativeMethods.EVENT_TRACE_REAL_TIME_MODE;
+                properties->LogFileNameOffset = 0;
+            }
+            else
+            {
+                if (m_FileName.Length > MaxNameSize - 1)
+                    throw new ArgumentException("File name too long", "fileName");
+                char* fileNamePtr = (char*)(((byte*)properties) + properties->LogFileNameOffset);
+                CopyStringToPtr(fileNamePtr, m_FileName);
+                properties->LogFileMode = TraceEventNativeMethods.EVENT_TRACE_FILE_MODE_SEQUENTIAL;
+            }
+
+            if (m_CircularBufferMB == 0)
+            {
+                properties->LogFileMode = TraceEventNativeMethods.EVENT_TRACE_FILE_MODE_SEQUENTIAL;
+                properties->MaximumFileSize = 0;     // This means infinite size. 
+            }
+            else
+            {
+                properties->LogFileMode = TraceEventNativeMethods.EVENT_TRACE_FILE_MODE_CIRCULAR;
+                properties->MaximumFileSize = (uint)m_CircularBufferMB;
+            }
+            properties->MinimumBuffers = (uint)m_BufferSizeMB;
+            properties->MaximumBuffers = (uint)(m_BufferSizeMB * 4);
+
+            properties->Wnode.ClientContext = 1;    // set Timer resolution to 100ns.  
+            return properties;
+        }
+
+        private unsafe void CopyStringToPtr(char* toPtr, string str)
+        {
+            fixed (char* fromPtr = str)
+            {
+                int i = 0;
+                while(i < str.Length)
+                {
+                    toPtr[i] = fromPtr[i];
+                     i++;
+                }
+                toPtr[i] = '\0';   // Null terminate
+            }
         }
 
         private const int MaxNameSize = 1024;
+        private int PropertiesSize = sizeof(TraceEventNativeMethods.EVENT_TRACE_PROPERTIES) + 2 * MaxNameSize * sizeof(char);
 
         // Data that is exposed through properties.  
-        private string sessionName;
-        private string fileName;
+        private string m_SessionName;             // Session name (identifies it uniquely on the machine)
+        private string m_FileName;                // Where to log (null means real time session)
+        private int m_BufferSizeMB;
+        private int m_CircularBufferMB;
 
-        // Things TraceEventSession generates
-        private bool create;                    // Should create if it does not exist.
-        private bool isActive;
-        private bool stopped;
-        private UInt64 sessionHandle;
-        TraceEventNativeMethods.EVENT_TRACE_PROPERTIES properties;
-        IntPtr unmanagedPropertiesBuffer;
-        uint extentionSpaceOffset;
-        private TraceEventSession kernelSession;        // Support to do a user and kernel session together. 
+        // Internal state
+        private bool m_Create;                    // Should create if it does not exist.
+        private bool m_IsActive;                  // Session is active (InsureSession has been called)
+        private bool m_Stopped;                   // The Stop() method was called (avoids reentrancy)
+        private bool m_StopOnDispose;             // Should we Stop() when the object is destroyed?
+        private ulong m_SessionHandle;            // OS handle
         #endregion
     }
 

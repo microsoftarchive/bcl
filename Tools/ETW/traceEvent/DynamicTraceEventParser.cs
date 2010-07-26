@@ -272,7 +272,7 @@ class DynamicTraceEventData : TraceEvent
             default:
                 if (type == typeof(Guid))
                     return 16;
-                throw new Exception("Unsupported type " + type.Name); // TODO FIX NOW;
+                throw new Exception("Unsupported type " + type.Name); // TODO 
         }
     }
 
@@ -314,7 +314,7 @@ class DynamicTraceEventParserState : IFastSerializable
         {
             ProviderManifest provider;
             deserializer.Read(out provider);
-            providers.Add(provider.Guid, provider);
+            providers.Add(provider.Guid, provider); 
         }
     }
 
@@ -423,7 +423,9 @@ class ProviderManifest : IFastSerializable
                             }
                             catch (Exception e)
                             {
+#if DEBUG
                                 Console.WriteLine("Error: Exception during processing template {0}: {1}", templateName, e.ToString());
+#endif 
                                 throw;
                             }
                             source.RegisterEventTemplate(eventTemplate);

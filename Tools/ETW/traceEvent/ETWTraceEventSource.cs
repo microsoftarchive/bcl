@@ -27,7 +27,7 @@ namespace Diagnostics.Eventing
     /// * See also code:#ETWTraceEventSourceInternals
     /// * See also code:#ETWTraceEventSourceFields
     /// </summary>    
-    
+
     public unsafe sealed class ETWTraceEventSource : TraceEventDispatcher, IDisposable
     {
         /// <summary>
@@ -35,7 +35,7 @@ namespace Diagnostics.Eventing
         /// </summary>
         /// <param name="fileName">The ETL data moduleFile to open</param>
         public ETWTraceEventSource(string fileName)
-            : this(fileName, TraceEventSourceType.UserAndKernelFile)
+            : this(fileName, TraceEventSourceType.MergeAll)
         {
         }
         /// <summary>
@@ -48,115 +48,108 @@ namespace Diagnostics.Eventing
         [SecuritySafeCritical]
         public ETWTraceEventSource(string fileOrSessionName, TraceEventSourceType type)
         {
-            long now = DateTime.Now.ToFileTime() - 100000;     // subtract 10ms to avoid negative times. 
+            long now = DateTime.Now.ToFileTime() - 100000;     // used as the start time for real time sessions (sub 10msec to avoid negative times)
 
-            primaryLogFile = new TraceEventNativeMethods.EVENT_TRACE_LOGFILEW();
-            primaryLogFile.BufferCallback = this.TraceEventBufferCallback;
-
-            useClassicETW = Environment.OSVersion.Version.Major < 6;
-            if (useClassicETW)
+            // Allocate the LOGFILE and structures and arrays that hold them  
+            // Figure out how many log files we have
+            if (type == TraceEventSourceType.MergeAll)
             {
-                IntPtr mem = TraceEventNativeMethods.AllocHGlobal(sizeof(TraceEventNativeMethods.EVENT_RECORD));      
-                TraceEventNativeMethods.ZeroMemory(mem, (uint)sizeof(TraceEventNativeMethods.EVENT_RECORD));
-                convertedHeader = (TraceEventNativeMethods.EVENT_RECORD*)mem;
-                primaryLogFile.EventCallback = RawDispatchClassic;
-
-            }
-            else 
-            {
-                primaryLogFile.LogFileMode = TraceEventNativeMethods.PROCESS_TRACE_MODE_EVENT_RECORD;
-                primaryLogFile.EventCallback = RawDispatch;
-            }
-
-            if (type == TraceEventSourceType.Session)
-            {
-                primaryLogFile.LoggerName = fileOrSessionName;
-                primaryLogFile.LogFileMode |= TraceEventNativeMethods.EVENT_TRACE_REAL_TIME_MODE;
+                string fileBaseName = Path.GetFileNameWithoutExtension(fileOrSessionName);
+                string dir = Path.GetDirectoryName(fileOrSessionName);
+                if (dir.Length == 0)
+                    dir = ".";
+                string[] additionalLogFiles = Directory.GetFiles(dir, fileBaseName + ".*.etl");
+                logFiles = new TraceEventNativeMethods.EVENT_TRACE_LOGFILEW[1 + additionalLogFiles.Length];
+                logFiles[0].LogFileName = fileOrSessionName;
+                for (int i = 0; i < additionalLogFiles.Length; i++)
+                    logFiles[i + 1].LogFileName = additionalLogFiles[i];
             }
             else
             {
-                if (type == TraceEventSourceType.UserAndKernelFile)
+                logFiles = new TraceEventNativeMethods.EVENT_TRACE_LOGFILEW[1];
+                if (type == TraceEventSourceType.FileOnly)
+                    logFiles[0].LogFileName = fileOrSessionName;
+                else
                 {
-                    // See if we have also have kernel log moduleFile. 
-                    if (fileOrSessionName.Length > 4 && string.Compare(fileOrSessionName, fileOrSessionName.Length - 4, ".etl", 0, 4, StringComparison.OrdinalIgnoreCase) == 0)
-                    {
-                        string kernelFileName = fileOrSessionName.Substring(0, fileOrSessionName.Length - 4) + ".kernel.etl";
-                        if (File.Exists(kernelFileName))
-                        {
-                            if (File.Exists(fileOrSessionName))
-                            {
-                                handles = new ulong[2];
-                                handles[0] = TraceEventNativeMethods.INVALID_HANDLE_VALUE;
-
-                                kernelModeLogFile = new TraceEventNativeMethods.EVENT_TRACE_LOGFILEW();
-                                kernelModeLogFile.BufferCallback = primaryLogFile.BufferCallback;
-                                kernelModeLogFile.EventCallback = primaryLogFile.EventCallback;
-                                kernelModeLogFile.LogFileName = kernelFileName;
-                                kernelModeLogFile.LogFileMode = primaryLogFile.LogFileMode;
-
-                                handles[1] = TraceEventNativeMethods.OpenTrace(ref kernelModeLogFile);
-
-                                if (TraceEventNativeMethods.INVALID_HANDLE_VALUE == handles[1])
-                                    Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRForLastWin32Error());
-
-                            }
-                            else
-                            {
-                                // we have ONLY a *.kernel.etl moduleFile, treat it as the primary moduleFile. 
-                                fileOrSessionName = kernelFileName;
-                            }
-                        }
-                    }
-                    if (!File.Exists(fileOrSessionName))
-                        throw new FileNotFoundException("Unable to find the file " + fileOrSessionName);
+                    Debug.Assert(type == TraceEventSourceType.Session);
+                    logFiles[0].LoggerName = fileOrSessionName;
+                    logFiles[0].LogFileMode |= TraceEventNativeMethods.EVENT_TRACE_REAL_TIME_MODE;
                 }
-                primaryLogFile.LogFileName = fileOrSessionName;
+            }
+            handles = new ulong[logFiles.Length];
+
+            // Fill  out the first log file information (we will clone it later if we have mulitple files). 
+            logFiles[0].BufferCallback = this.TraceEventBufferCallback;
+            handles[0] = TraceEventNativeMethods.INVALID_HANDLE_VALUE;
+            useClassicETW = Environment.OSVersion.Version.Major < 6;
+            if (useClassicETW)
+            {
+                IntPtr mem = TraceEventNativeMethods.AllocHGlobal(sizeof(TraceEventNativeMethods.EVENT_RECORD));
+                TraceEventNativeMethods.ZeroMemory(mem, (uint)sizeof(TraceEventNativeMethods.EVENT_RECORD));
+                convertedHeader = (TraceEventNativeMethods.EVENT_RECORD*)mem;
+                logFiles[0].EventCallback = RawDispatchClassic;
+            }
+            else
+            {
+                logFiles[0].LogFileMode |= TraceEventNativeMethods.PROCESS_TRACE_MODE_EVENT_RECORD;
+                logFiles[0].EventCallback = RawDispatch;
             }
 
-            // Open the main data source
-            if (handles == null)
-                handles = new ulong[1];
-            
-            handles[0] = TraceEventNativeMethods.OpenTrace(ref primaryLogFile);
+            // Copy the information to any additional log files 
+            for (int i = 1; i < logFiles.Length; i++)
+            {
+                logFiles[i].BufferCallback = logFiles[0].BufferCallback;
+                logFiles[i].EventCallback = logFiles[0].EventCallback;
+                logFiles[i].LogFileMode = logFiles[0].LogFileMode;
+                handles[i] = handles[0];
+            }
 
-            if (TraceEventNativeMethods.INVALID_HANDLE_VALUE == handles[0])
-                Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRForLastWin32Error());
+            sessionStartTime100ns = long.MaxValue;
+            sessionEndTime100ns = long.MinValue;
+            eventsLost = 0;
 
-            // Session offset time is the minimum of all times.  
-            sessionStartTime100ns = primaryLogFile.LogfileHeader.StartTime;
-            if (handles.Length == 2 && kernelModeLogFile.LogfileHeader.StartTime < sessionStartTime100ns)
-                sessionStartTime100ns = kernelModeLogFile.LogfileHeader.StartTime;
+            // Open all the traces
+            for (int i = 0; i < handles.Length; i++)
+            {
+                handles[i] = TraceEventNativeMethods.OpenTrace(ref logFiles[i]);
+                if (handles[i] == TraceEventNativeMethods.INVALID_HANDLE_VALUE)
+                    Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRForLastWin32Error());
+
+                // Start time is minimum of all start times
+                if (logFiles[i].LogfileHeader.StartTime < sessionStartTime100ns)
+                    sessionStartTime100ns = logFiles[i].LogfileHeader.StartTime;
+                // End time is maximum of all start times
+                if (logFiles[i].LogfileHeader.EndTime > sessionEndTime100ns)
+                    sessionEndTime100ns = logFiles[i].LogfileHeader.EndTime;
+
+                // TODO do we even need log pointer size anymore?   
+                // We take the max pointer size.  
+                if ((int)logFiles[i].LogfileHeader.PointerSize > pointerSize)
+                    pointerSize = (int)logFiles[i].LogfileHeader.PointerSize;
+
+                eventsLost += (int)logFiles[i].LogfileHeader.EventsLost;
+            }
 
             // Real time providers don't set this to something useful
             if (sessionStartTime100ns == 0)
                 sessionStartTime100ns = now;
-
-            sessionEndTime100ns = primaryLogFile.LogfileHeader.EndTime;
-            if (handles.Length == 2 && sessionEndTime100ns < kernelModeLogFile.LogfileHeader.EndTime)
-                sessionEndTime100ns = kernelModeLogFile.LogfileHeader.EndTime;
-
             if (sessionEndTime100ns == 0)
-                sessionEndTime100ns = sessionStartTime100ns;
+                sessionEndTime100ns = long.MaxValue;
 
-            // TODO remove when we do per-event stuff.  
-            pointerSize = (int)primaryLogFile.LogfileHeader.PointerSize;
-            if (handles.Length == 2)
-                pointerSize = (int) kernelModeLogFile.LogfileHeader.PointerSize;
-
-            if (pointerSize == 0)
+            if (pointerSize == 0)       // Real time does not set this (grrr). 
             {
                 pointerSize = sizeof(IntPtr);
-                Debug.Assert((primaryLogFile.LogFileMode & TraceEventNativeMethods.EVENT_TRACE_REAL_TIME_MODE) != 0);
+                Debug.Assert((logFiles[0].LogFileMode & TraceEventNativeMethods.EVENT_TRACE_REAL_TIME_MODE) != 0);
             }
             Debug.Assert(pointerSize == 4 || pointerSize == 8);
 
-            eventsLost = (int)primaryLogFile.LogfileHeader.EventsLost; 
-            cpuSpeedMHz = (int)primaryLogFile.LogfileHeader.CpuSpeedInMHz;
-            numberOfProcessors = (int)primaryLogFile.LogfileHeader.NumberOfProcessors;
+            cpuSpeedMHz = (int)logFiles[0].LogfileHeader.CpuSpeedInMHz;
+            numberOfProcessors = (int)logFiles[0].LogfileHeader.NumberOfProcessors;
 
             // Logic for looking up process names
             processNameForID = new Dictionary<int, string>();
-            Kernel.ProcessStartGroup += delegate(ProcessTraceData data) {
+            Kernel.ProcessStartGroup += delegate(ProcessTraceData data)
+            {
                 // Get just the file name without the extension.  Can't use the 'Path' class because
                 // it tests to make certain it does not have illegal chars etc.  Since KernelImageFileName
                 // is not a true user mode path, we can get failures. 
@@ -166,13 +159,13 @@ namespace Diagnostics.Eventing
                     startIdx++;
                 else
                     startIdx = 0;
-                int endIdx = path.LastIndexOf('.', startIdx);
-                if (endIdx < 0)
+                int endIdx = path.LastIndexOf('.');
+                if (endIdx <= startIdx) 
                     endIdx = path.Length;
                 processNameForID[data.ProcessID] = path.Substring(startIdx, endIdx - startIdx);
             };
         }
-        
+
         // Process is called after all desired subscriptions have been registered.  
         /// <summary>
         /// Processes all the events in the data soruce, issuing callbacks that were subscribed to.  See
@@ -198,7 +191,7 @@ namespace Diagnostics.Eventing
         /// <summary>
         /// Closes the ETL moduleFile or detaches from the session.  
         /// </summary>  
-        
+
         public void Close()
         {
             Dispose(true);
@@ -207,17 +200,17 @@ namespace Diagnostics.Eventing
         /// The log moduleFile that is being processed (if present)
         /// TODO: what does this do for Real time sessions?
         /// </summary>
-        public string LogFileName { get { return primaryLogFile.LogFileName; } }
+        public string LogFileName { get { return logFiles[0].LogFileName; } }
         /// <summary>
         /// The name of the session that generated the data. 
         /// </summary>
-        public string SessionName { get { return primaryLogFile.LoggerName; } }
+        public string SessionName { get { return logFiles[0].LoggerName; } }
         /// <summary>
         /// Returns true if the code:Process can be called mulitple times (if the Data source is from a
         /// moduleFile, not a real time stream.
         /// </summary>
-        public bool CanReset { get { return (primaryLogFile.LogFileMode & TraceEventNativeMethods.EVENT_TRACE_REAL_TIME_MODE) == 0; } }
-        
+        public bool CanReset { get { return (logFiles[0].LogFileMode & TraceEventNativeMethods.EVENT_TRACE_REAL_TIME_MODE) == 0; } }
+
         [SecuritySafeCritical]
         public override void Dispose()
         {
@@ -225,7 +218,6 @@ namespace Diagnostics.Eventing
         }
 
         #region Private
-        internal bool HasKernelEvents { get { return kernelModeLogFile.LogFileName != null; } }
 
         // #ETWTraceEventSourceInternals
         // 
@@ -237,10 +229,10 @@ namespace Diagnostics.Eventing
         private void RawDispatchClassic(TraceEventNativeMethods.EVENT_RECORD* eventData)
         {
             // TODO not really a EVENT_RECORD on input, but it is a pain to be type-correct.  
-            TraceEventNativeMethods.EVENT_TRACE* oldStyleHeader = (TraceEventNativeMethods.EVENT_TRACE*) eventData;
+            TraceEventNativeMethods.EVENT_TRACE* oldStyleHeader = (TraceEventNativeMethods.EVENT_TRACE*)eventData;
             eventData = convertedHeader;
 
-            eventData->EventHeader.Size = (ushort) sizeof(TraceEventNativeMethods.EVENT_TRACE_HEADER);
+            eventData->EventHeader.Size = (ushort)sizeof(TraceEventNativeMethods.EVENT_TRACE_HEADER);
             // HeaderType
             eventData->EventHeader.Flags = TraceEventNativeMethods.EVENT_HEADER_FLAG_CLASSIC_HEADER;
 
@@ -257,7 +249,7 @@ namespace Diagnostics.Eventing
             eventData->EventHeader.TimeStamp = oldStyleHeader->Header.TimeStamp;
             eventData->EventHeader.ProviderId = oldStyleHeader->Header.Guid;            // ProviderId = TaskId
             // ID left 0
-            eventData->EventHeader.Version = (byte) oldStyleHeader->Header.Version;  
+            eventData->EventHeader.Version = (byte)oldStyleHeader->Header.Version;
             // Channel
             eventData->EventHeader.Level = oldStyleHeader->Header.Level;
             eventData->EventHeader.Opcode = oldStyleHeader->Header.Type;
@@ -266,17 +258,17 @@ namespace Diagnostics.Eventing
             eventData->EventHeader.KernelTime = oldStyleHeader->Header.KernelTime;
             eventData->EventHeader.UserTime = oldStyleHeader->Header.UserTime;
             // ActivityID
-            
+
             eventData->BufferContext = oldStyleHeader->BufferContext;
             // ExtendedDataCount
-            eventData->UserDataLength = (ushort) oldStyleHeader->MofLength;
+            eventData->UserDataLength = (ushort)oldStyleHeader->MofLength;
             // ExtendedData
             eventData->UserData = oldStyleHeader->MofData;
             // UserContext 
 
             RawDispatch(eventData);
         }
-        
+
         [SecuritySafeCritical]
         [AllowReversePInvokeCalls]
         private void RawDispatch(TraceEventNativeMethods.EVENT_RECORD* rawData)
@@ -308,41 +300,32 @@ namespace Diagnostics.Eventing
             GC.SuppressFinalize(this);
         }
 
-        
         ~ETWTraceEventSource()
         {
             Dispose(false);
         }
-        
-        
+
         private void Reset()
         {
             if (!CanReset)
-                throw new InvalidOperationException("Event stream is not resetable (eg Real time)");
+                throw new InvalidOperationException("Event stream is not resetable (e.g. real time).");
 
-            // Annoying.  The OS resets the LogFileMode field, so I have to set it up again.   
-            if (!useClassicETW)
-                primaryLogFile.LogFileMode = TraceEventNativeMethods.PROCESS_TRACE_MODE_EVENT_RECORD;
-
-            if (handles.Length > 1)
+            for (int i = 0; i < handles.Length; i++)
             {
-                if (handles[1] != TraceEventNativeMethods.INVALID_HANDLE_VALUE)
-                    TraceEventNativeMethods.CloseTrace(handles[1]);
-                kernelModeLogFile.LogFileMode = primaryLogFile.LogFileMode;
-                handles[1] = TraceEventNativeMethods.OpenTrace(ref kernelModeLogFile);
+                if (handles[i] != TraceEventNativeMethods.INVALID_HANDLE_VALUE)
+                {
+                    TraceEventNativeMethods.CloseTrace(handles[i]);
+                    handles[i] = TraceEventNativeMethods.INVALID_HANDLE_VALUE;
+                }
+                // Annoying.  The OS resets the LogFileMode field, so I have to set it up again.   
+                if (!useClassicETW)
+                    logFiles[i].LogFileMode = TraceEventNativeMethods.PROCESS_TRACE_MODE_EVENT_RECORD;
 
-                if (TraceEventNativeMethods.INVALID_HANDLE_VALUE == handles[1])
+                handles[i] = TraceEventNativeMethods.OpenTrace(ref logFiles[i]);
+
+                if (handles[i] == TraceEventNativeMethods.INVALID_HANDLE_VALUE)
                     Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRForLastWin32Error());
-
             }
-
-            if (handles[0] != TraceEventNativeMethods.INVALID_HANDLE_VALUE)
-                TraceEventNativeMethods.CloseTrace(handles[0]);
-            handles[0] = TraceEventNativeMethods.OpenTrace(ref primaryLogFile);
-
-            if (TraceEventNativeMethods.INVALID_HANDLE_VALUE == handles[0])
-                Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRForLastWin32Error());
-    
         }
 
         // Private data / methods 
@@ -355,14 +338,15 @@ namespace Diagnostics.Eventing
 
         // #ETWTraceEventSourceFields
         private bool processTraceCalled;
-        private TraceEventNativeMethods.EVENT_TRACE_LOGFILEW primaryLogFile;
-        private TraceEventNativeMethods.EVENT_TRACE_LOGFILEW kernelModeLogFile;
         private TraceEventNativeMethods.EVENT_RECORD* convertedHeader;
+
+        // Returned from OpenTrace
+        private TraceEventNativeMethods.EVENT_TRACE_LOGFILEW[] logFiles;
         private UInt64[] handles;
 
         // We do minimal processing to keep track of process names (since they are REALLY handy). 
         private Dictionary<int, string> processNameForID;
-        
+
         protected internal override string ProcessName(int processID, long time100ns)
         {
             string ret;
@@ -379,10 +363,9 @@ namespace Diagnostics.Eventing
     public enum TraceEventSourceType
     {
         /// <summary>
-        /// Look for a ModuleFile *.etl (for user events) and a moduleFile *.kernel.etl (for kernel events) as the event
-        /// data source
+        /// Look for any files like *.etl or *.*.etl (the later holds things like *.kernel.etl or *.clrRundown.etl ...)
         /// </summary>
-        UserAndKernelFile,
+        MergeAll,
         /// <summary>
         /// Look for a ETL moduleFile *.etl as the event data source 
         /// </summary>

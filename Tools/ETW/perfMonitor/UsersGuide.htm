@@ -1,33 +1,58 @@
 <html>
 <head>
-    <style type="text/css">
-        .style1
-        {
-            color: #660033;
-        }
-    </style>
-</head>
-<body lang=EN-US>
+    <title>PerfMonitor Users Guide</title>
+    </head>
+<body lang="en-us">
 
-<h2>PerfMonitor User Guide </h2>
+<h2><a id="UsersGuide">PerfMonitor Users Guide </a> </h2>
 
-<h3>What is PerfMonitor? </h3>
-
-    <p>PerfMonitor is a tool for collecting and accessing windows tracing 
-        information (also known as 
-        <a href="http://msdn2.microsoft.com/en-us/library/aa363787.aspx">Event Tracing for Windows
-        </a>or ETW). Built into many parts of 
-        windows including the kernel and the .NET Common Language Runtime (CLR) are logging routines that will 
-        generate very detailed information about what the computer is doing. PerfMonitor 
-        is a tool that allows you to turn this logging on (on a machine wide basis) and collect the 
-        data into Event Trace Log (ETL) files. PerfMonitor also allows you to convert 
-        the binary ETL files to an XML file.</p>
+    <p>
+        <strong>PerfMonitor</strong> is a tool for quickly and easily collecting ETW performance data and 
+        generating useful reports.&nbsp;&nbsp; It is based on the
+        <a href="http://msdn.microsoft.com/en-us/library/bb968803(v=VS.85).aspx">Event 
+        Tracing for Windows (ETW) </a>feature of the operating system which can collect 
+        information machine wide a a variety of useful events (see
+        <a href="#AdvancedDataCollection">advanced data collection</a> on what data is 
+        alread built into the OS and CLR).&nbsp;&nbsp;&nbsp; 
+        It is the powerful technology the the <strong>windows performance group uses 
+        almost exclusively</strong> to track and understand the performance of windows, 
+        and the basis for their
+        <a href="http://msdn.microsoft.com/en-us/performance/default.aspx">XPerf</a> 
+        tool.&nbsp;&nbsp; The data collected by PerfMonitor is the same data that XPerf 
+        uses, so PerfMonitor can be used to simplify data collection and simple 
+        reporting and XPerf can be used for more advanced analysis on the same data.&nbsp;&nbsp;&nbsp; 
+        PerfMonitor also has the ability to decode symbolic information associated with .NET 
+        Runtime code, making PerfMonitor<strong> </strong>more valuable for .NET 
+        investigations.&nbsp;&nbsp; The
+        <a href="http://bcl.codeplex.com/wikipage?title=PerfMonitor&amp;referringTitle=Home">
+        source code for PerfMonitor</a> as well as the
+        <a href="http://bcl.codeplex.com/wikipage?title=TraceEvent&amp;referringTitle=Home">
+        TraceEvent</a> data parsing library on which is based are availalble at 
+        bcl.codeplex.com, so user-defined data analysis is also relatively easy.&nbsp;
+    </p>
+    <p>
+        See also <a href="#FAQ">FAQ</a>, <a href="#TroubleShooting">TroubleShooting</a>,<a 
+            href="#ETWBackground"> ETW Background,</a>
+        <a href="#UnderstandingTheAnalysisReport">Understanding the Analysis Report</a>.&nbsp;
+    </p>
+    <h3>
+        Getting PerfMonitor</h3>
+    <p>
+        PerfMonitor was designed to be easy to deploy and use.&nbsp;&nbsp; To deploy 
+        PerfMonitor simply copy the PerfMonitor.exe to the computer you wish to use it 
+        on.&nbsp;&nbsp;&nbsp; No additional files or installation step is needed.&nbsp;&nbsp; 
+        You can get the latest copy of PerfMonitor.exe from the
+        <a href="http://bcl.codeplex.com/releases/view/42784">PerfMonitor download page</a>.&nbsp;&nbsp; 
+        Simply click in the PerfMonitor.bin.zip file to download it,&nbsp; click through 
+        the dialog boxes, and then copy the exe to your hard drive.&nbsp;&nbsp; You are 
+        then ready to go!</p>
     <h3>Quick Start</h3>
-    <p>Perhaps the fastest way to get a sence of the kind of data that is available 
-        using PerfMonitor is to quickly collect some.&nbsp;&nbsp; Try the command</p>
+    <p>Open an Administrator command window (Start-&gt;All Programs -&gt;Accessories -&gt; Command 
+        Prompt -&gt; Right Click -&gt; Run as Administrator), change your directory to where 
+        you placed the perfMonitor.exe and then type the command</p>
     <dl>
         <dd>
-            perfMonitor runPrint <span class="style1">perfMonitor list</span></dd>
+            perfMonitor&nbsp; runAnalyze perfMonitor CpuTest</dd>
     </dl>
     <p>
         This command tells perfMonitor to</p>
@@ -36,141 +61,39 @@
             Runtime (CLR)).&nbsp; By default this goes to two files call 
             perfMonitorOutput.etl and perfMonitorOutput.kernel.etl.&nbsp; </li>
         <li>Run a command for which you want to collect data.&nbsp; In this case we use the 
-            command &#39;perfMonitor list&#39;.&nbsp; </li>
+            command &#39;perfMonitor CpuTest&#39;, which is a example program built into 
+            PerfMonitor.&nbsp; </li>
         <li>Turn off event monitoring.</li>
-        <li>&#39;Print&#39; the data from the binary *.etl files in a way that can be read by 
-            humans.&nbsp; By default this goes into a file called perfMonitorOutput.xml.</li>
+        <li>&#39;Analyze&#39; the performance data.&nbsp;&nbsp; This generates a set of HTML reports 
+            including CPU Time, behavior of the .NET Garbage collector, and the .NET Just in 
+            time (JIT) compiler.&nbsp; </li>
+        <li>Launches Internet Explorer on the master report.&nbsp; </li>
     </ul>
     <p>
-        You can then browse the data using a text editor, or an XML viewer.&nbsp; 
-        Because the XML files tend to be very large, a viewer like XMLView.exe which can 
-        handle very large files with ease.&nbsp;&nbsp; By browsing the file you will see 
-        the wealth of detailed information that was collected including</p>
-    <ul>
-        <li>Every process active or was created in the system (including those started 
-            before logging began!), including the command line (VISTA only) which started it 
-            and the exit code (if it ended). </li>
-        <li>Every thread that was active or created in the system.&nbsp; </li>
-        <li>Every DLL or EXE that was loaded into some process, and where it lives in the 
-            address space of the process that loaded it. </li>
-        <li>Every Disk read or write that happened, including its size the the file name 
-            associated with it.</li>
-        <li>Every page fault in the system, </li>
-        <li>A sample of the instruction pointer (IP) every millisecond.&nbsp; Coupled with 
-            the DLL load information this tells you where the CPU is spending its time.&nbsp;
-        </li>
-        <li>Every Garbage Colleciton the CLR performed, when it started and ended, and 
-            statistics about how much memory was reclaimed.</li>
-        <li>The memory extent of the native code generated by the CLR.&nbsp; This allows the 
-            instruction pointers samples to be mapped to the symbolic name of the method 
-            that was running (CLR V2.0 SP2 
-            only).</li>
-    </ul>
-    <p>
-        In short, if you want detailed data on what your computer is doing, ETW can give 
-        it to you.&nbsp;
+        You can then browse the resulting report.&nbsp;&nbsp; 
+        The
+        <a href="#CpuTestSource">source code for CpuTest</a> is useful when analyzing this 
+        data.&nbsp; See
+        <a href="#UnderstandingTheAnalysisReport">Understanding the Analysis Report</a> 
+        for more on the report.
+        <br />
     </p>
-<h3>
-    What is Event Tracing for Windows (ETW)?</h3>
-<p>
-    <a href="http://msdn2.microsoft.com/en-us/library/aa363787.aspx">Event Tracing for Windows</a> 
-    (ETW) is a machine wide, light weight, general purpose, extensible logging 
-    mechanism built into the Windows operating system since Windows 2000.&nbsp;&nbsp; 
-    The basic architecture defines the following components </p>
-<ul>
-    <li><b>Providers</b>.&nbsp;&nbsp; A provider is a component that wishes to log data.&nbsp;&nbsp; 
-        Each provider defines for itself a <a href="http://it.wikipedia.org/wiki/GUID">
-        GUID</a> which uniquely identifies itself to the ETW system.&nbsp; Two very 
-        important providers are the OS Kernel, and the .NET CLR, however there are 
-        literally hundreds of providers already defined in windows, and applications are 
-        free to create their own (In managed code you do so through 
-        System.Diagnostics.Eventing.EventProvider)&nbsp; When a 
-        provider starts up, it registers its GUID with the ETW system to indicate that 
-        it is available.&nbsp;&nbsp; A provider will not actually log data yet, but the 
-        registration includes a callback that allows the ETW system to turn the provider 
-        on and off (selectively).</li>
-    <li>&nbsp; <b>Controlers</b>.&nbsp; A controler is an application that wishes to 
-        collect ETW data.&nbsp; PerfMonitor is an example of a&nbsp; ETW controller.&nbsp;&nbsp;
-    </li>
-    <li><b>Sessions</b>.&nbsp; A session represents a set of &#39;turne.&nbsp; A session represents a set of &#39;turned on&#39; providers.&nbsp;&nbsp; 
-            To turn on a provider, a controller must first create a session, and then enable 
-            providers (identified by their GUID) in that session.&nbsp;&nbsp; This allows 
-            the controller to pick and choose the information that is colleced.&nbsp; In 
-            adidtion to selecting which providers to turn on, it also allows a set of flags 
-            to be passed that will tell the provider which subsystems the controler is 
-            interested in as well as well as the verbosity level.&nbsp;&nbsp; When a 
-            provider is added to a session, the ETW system issues a callback to the provider 
-            with this information and the provider starts logging messags.&nbsp;&nbsp; 
-            Sessions are machine wide, and outlive the process that created them.&nbsp;&nbsp; 
-            When providers are turned on they are also turned on machine wide.&nbsp; For 
-            example Common Language Runtime (CLR) is a provider that may exist in many 
-            processes (and have registered themselves with the ETW system.&nbsp; When an ETW 
-            controller enables the CLR providers in all existing processes, and will enable 
-            any new processes that start up a CLR (when the CLR registers itself).&nbsp; It 
-            is currently&nbsp; not possible to scope logging to a particular process 
-            instance.&nbsp; The session will remain on even if the controller&#39;s process 
-            dies.&nbsp; Only by explictly disabling a provider or closing the session (or 
-            machine reboot) will stop the logging.&nbsp;&nbsp; Thus it is important that 
-            controllers take extra care to insure that they to no leave sessions running 
-            inadvertantly.&nbsp; </li>
-        <li><b>Events</b>..&nbsp; When providers get the callback to enable them, they 
-            activate the requested logging events (taking into account the subsystem flags 
-            and verbosity level).&nbsp;&nbsp; These events are sent to the Session, which is 
-            responsible for either forwarding them to the Controler (a so call &#39;real time&#39; 
-            session), or logging them to a file (typically called a Event Trace Log or .ETL 
-            file).&nbsp;&nbsp; Each event has the following items
-            <ul><li>A high resolution (100ns) timestamp.&nbsp;&nbsp; Because 
-                it is sometimes important to know the exact ordering of events from different 
-                subsystems (being logged by different processors) some trouble has been taken to 
-                synchronize the clocks used by different processors so that events can be 
-                correctly ordered even if the time interval between events is very small. </li>
-            <li>The process and thread ID where the event was logged.&nbsp;&nbsp; Note that some 
-                OS kernel events leave these fields undefined because there is no obvious 
-                process and thread to associate with the event being logged. /li>
-            <li>An <a href="http://it.wikipedia.org/wiki/GUID">
-        GUID</a>  that identifies the logical system the event is associated with.&nbsp;&nbsp; 
-                For example the CLR has an event GUID that is used for all events associatd with 
-                the garbage collector (GC), and another for events associated with its thread 
-                pool.&nbsp; </li>
-            <li>An small number called an opcode which represents a specific type of messaged 
-                being logged.&nbsp; 
-                For example, the CLR has opcode for when a garbage collection starts, and  another when it ends, one when it enlarges the heap, and one that fires every 
-                time approximately 100K of object have been allocated.&nbsp;&nbsp; All of these 
-                mesages sare the same event GUID (indicating the GC subsystem), but have 
-                different opcodes.&nbsp; 
-                </li>
-            <li>Event specific data.&nbsp;&nbsp; The event GUID coupled with the opcode define 
-                structure of the rest of the data.&nbsp;&nbsp; For example, a GC Start event 
-                gives the number of GCs that have happened previously, as well as an enumeration 
-                that indicates why this GC happened (need memory, explict call ...). A GC End 
-                event has numerous statistics about what happened during the GC.&nbsp;&nbsp; The 
-                fact that events can have strongly typed, event-specific data, is a key feature 
-                of the ETW architecture that makes it exceptionally valuable.&nbsp;&nbsp;&nbsp; 
-                </li>
-        </ul>
-            </li>
-    </ul>
-
-
-<p>
-    For more information there is a good
-    <a href="http://msdn.microsoft.com/msdnmag/issues/07/04/ETW/">MSDN article</a> 
-    that talks more about Event Tracing for Windows.&nbsp;
-</p>
-
-
-<h3>
-    Using PerfMonitor to colUsing PerfMonitor to collect data</h3>
-<p>
-    As mentioned previously, one of major functions of PerfMonitor is to provide a 
-    mechanism for users to conrol the collection of ETW data by acting as an ETW 
-    Controller.&nbsp;&nbsp; This is exposed in the following PerfMonitor commands</p>
+    <hr />
+    <h3>
+        PerfMonitor Step By Step: Collecting ETW Data</h3>
+    <p>
+      The &#39;runAnalyze&#39; command used in the quick start was designed to make doing a 
+        common set of operations easy.&nbsp; However it is just one possible &#39;path&#39; from 
+        data collection to analysis.&nbsp; PerfMonitor allows these steps to be done 
+        individually, which allows for more advanced scenarios.&nbsp;&nbsp;&nbsp;&nbsp; 
+        The first step in most profiling scenario is simply to turn on and off data 
+        collection.&nbsp; These are what the &#39;start&#39; and &#39;stop&#39; operations doo</p>
 <ul>
     <li>perfMonitor [<i>options</i>] start [<i>&lt;fileName&gt;</i>]</li>
     <li>perfMonitor [<i>options</i>] stop</li>
-</ul>
-<p>
-&nbsp;The start command turns on (machine wide) logging, and the stop command turns 
+    </ul>
+    <p>
+The start command turns on (machine wide) logging, and the stop command turns 
     logging off.&nbsp;&nbsp;&nbsp; Only one session can be on simultaneously.&nbsp; 
     If you try to start a session when one is already started, it closes the 
     existing session and opens an new one.&nbsp;&nbsp; The effect of turning on a 
@@ -183,84 +106,983 @@
     expensive to collect.&nbsp;&nbsp; This includes OS kernel operations associated 
     with processes, threads, DLLs, page faults, diskIO, and CPU sampling as well as 
     CLR events associted with Garbage Collections, the CLR Thread pool, lock 
-    contention, exceptions, and compilation of managed code to native code.&nbsp;&nbsp;
-</p>
+    contention, exceptions, and compilation of managed code to native code.&nbsp;&nbsp;&nbsp; 
+    While PerfMonitor chooses a good set of default events to collect, though 
+    various options it gives you full control over what events are collected see
+        <a href="#AdvancedDataCollection">Advanced Data Collection</a> for more.&nbsp;
+    </p>
+    <p>
+        Once logging has been started, it will continue until it is explicitly stopped.&nbsp;&nbsp; 
+        Thus scripts that uses &#39;start&#39; should be very robust to error handling to insure 
+        that the &#39;stop&#39; command is exectuted under all cases (inlcuding a user hitting 
+        Ctrl-C).&nbsp;&nbsp; For this reason you should try to use the &#39;run&#39; or 
+        &#39;collect&#39; commands 
+        instead of &#39;start&#39; and &#39;stop&#39; whenever possible.&nbsp;
+    </p>
 <p>
-    Due to a limitation in implementation, kernel event can not be collected into 
-    the same ETL file as all other events.&nbsp;&nbsp; PerfMonitor works around this 
-    by making two separate files (eg *.etl and *.kernel.etl).&nbsp;&nbsp; Whenver it 
-    is manipuating etl files, it looks for the *.kernel.etl &#39;shadow&#39; file and 
-    combines the two files into one when doing its processing.&nbsp;&nbsp;&nbsp; 
-    Thus typically perfMonitor generates two files.&nbsp;&nbsp; </p>
-<p>
-    PerfMonitor supports the following options for fine tuning the data collected</p>
+    Due to a limitation in ETW implementation, kernel event can not be collected 
+    into the same ETL file as all other events.&nbsp;&nbsp; PerfMonitor works around 
+    this by making two separate files (eg *.etl and *.kernel.etl).&nbsp;&nbsp; Thus 
+    typically perfMonitor generates two files.&nbsp; Whenver PerfMonitor is 
+    manipuating and ETL file called X.etl, looks fvor any &#39;shadow&#39; file like X.*.etl 
+    and combines the files into one when doing its processing .&nbsp;&nbsp;&nbsp;Thus in many 
+    scenarios you can ignore the fact that PerfMonitor generates mulitple files.&nbsp; 
+    You can also merge these files into a single file (see <a href="#merging">
+    perfMonitor merge</a> command below).</p>
+    <h4>
+        The Run command</h4>
+    <p>
+        The combination of starting ETW logging, running a command, and then stopping, 
+        is so common the &#39;run&#39; command was created to do precisely this.&nbsp;&nbsp; 
+        Thus the command</p>
+    <ul>
+        <li>perfMonitor run Foo.exe FooArg</li>
+    </ul>
+    <p>
+        Is equivalent to</p>
 <ul>
-    <li>/noKernel - Don&#39;t collect OS kernel events (just the CLR events).&nbsp; For 
-        example if you were only interested in GC statistics you might use this option</li>
-    <li>/noCLR - Don&#39;t collect .NET CLR Runtime events.&nbsp;&nbsp; If the process you 
-        are interested in is not managed, but there are other managed processes running, 
-        you can use this to avoid collecting events from uninteresting processes.&nbsp;
-    </li>
-    <li>/provider:<b><i>guid</i></b>:<b><i>flags</i></b>:<b><i>level</i></b> this option 
-        allows you to turn on any arbitrary event provider by specifying its GUID, and 
-        pass that provider a set of flags and the logging level.&nbsp;
-        <ul>
-        <li>The GUID can be any string that can be passed to the System.<a 
-                href="http://msdn2.microsoft.com/en-us/library/aa328604(VS.71).aspx">Guid 
-            constructor</a>.&nbsp; It can also be the following speciallly recognised GUIDs
-            <ul><li>Clr - This represents the CLR provider.&nbsp; Normally the CLR provider 
-                (with good default flags and level settings), is on by default, but by 
-                specifying&nbsp; /noClr and explicitly setting /provider:CLR:<b><i>flags</i></b>:<b><i>level</i></b> 
-                the user has complete control over the settings.&nbsp; </li>
-                        <li>ClrStress - This represents the built in CLR Stress log.&nbsp; This facility 
-                            causes text messages to be logged when significant &#39;rare&#39; events happen.&nbsp; 
-                            It is intended for debugging failures in the runtime in the field.&nbsp; The 
-                            flags field represents the sub-facilities of the CLR (see StressLogFacilities 
-                            for defintions). </li></ul></li>
-                <li>The flags is an integer value expressed as a hexidecimal number (without any 0x 
-                    qualifications).&nbsp; The interpretation of these bits is up to the provider, 
-                    however typically it is a bit vector that indicates what facilities within the 
-                    provider should be turned on.&nbsp; </li>
-                <li>The level is an integer that specifies the verbosity of the logging.&nbsp; 0 = 
-                    off, 1 = Fatal, 2 = Error, 3 = Warning, 4 =&nbsp; Information, 5 = Verbose.&nbsp; </li>
-        </ul>
-    </li>
+    <li>perfMonitor start</li>
+    <li>Foo.exe FooArg</li>
+    <li>perfMonitor stop</li>
 </ul>
-<p>
-    These options only have an effect if the Kernel provider is turned on (that is 
-    /noKernel was NOT specified);</p>
-<ul>
-    <li>/noProfile - The sample based profiling every 1msec is one of the more common 
-        events in the log.&nbsp; You can reduce the log size significantly by turning 
-        off this profiling if you are not interested in it.</li>
-    <li>/cswitch - The kernel and fire an event every time one thread loses the CPU to 
-        another thread (a context switch or cswitch).&nbsp; These events are VERY 
-        valuable to understand what is causing delays (because whenever a thread waits, 
-        it context switches), but are also quite volumnous (3X more common than sample 
-        profile), so they are off by default. </li>
-    <li>/stacks&nbsp; - (VISTA only)&nbsp; For kernel OS events, it is possible to ask 
-        the kernel to crawl the stack and log that stack trace on every event that it 
-        logs.&nbsp; This gives a very useful hierarchical view of where an event occurs.&nbsp;&nbsp; 
-        It generally increases the log size by a factor of 5 or more because every event 
-        has another stack trace event associated with it (which has up to 96 call frames 
-        in it)</li>
-</ul>
-<p>
-    Once started, the ETW session created by &#39;perfMonitor start&#39; will live until it 
-    is explictly stopped with &#39;perfMontior stop&#39;.&nbsp; It is relatively easy for a 
-    session to be left running accidentially (eg when a script fails and does not 
-    call &#39;perfMonitor stop&#39;), so perfmonitor provide the following command</p>
-<ul>
-    <li>perfMonitor run <i>&lt;command&gt;</i>&nbsp; </li>
-</ul>
-<p>
-    This command starts monitoring, runs a command, and stops monitoring.&nbsp; It 
-    has error handling so that in most cases it will not leave monitoring on (eg if 
-    you hit Ctrl-C it will stop monitoring before exiting).&nbsp; However if 
-    perfMonitor is terminated by an external agent (eg from Task manager), it won&#39;t 
-    be able to do this cleanup.&nbsp;&nbsp; Generally it is safer and more 
-    convinient to use the run command when you can do so.
-</p>
+    <p>
+        Note that data collection is still machine wide, so you will get information 
+        about the entire machine at the time that Foo.exe was also running.&nbsp;&nbsp; 
+        One important value to the &#39;run&#39; command is that it tries pretty hard to insure 
+        tha the &#39;stop&#39; command is issued under any error condition or if the user 
+        interrupts the command (Ctrl-C).&nbsp;&nbsp;
+    </p>
+    <h4>
+        The Collect command</h4>
+    <p>
+        When you wish to profile a process which is already running or can&#39;t be started 
+        &#39;by hand&#39;, you can&#39;t use the &#39;run&#39; command.&nbsp;&nbsp; While you could use the 
+        &#39;start&#39; and &#39;stop&#39;, we wish to discource that (too easy to leave ETW on),&nbsp;&nbsp; 
+        Instead there is a &#39;collect&#39; command which turns on logging, and waits for the 
+        user to type a &#39;S&#39; to stop collection.&nbsp;&nbsp; Thus </p>
+    <ul>
+        <li>perfMonitor colllect</li>
+    </ul>
+    <p>
+        Will start logging and wait for the user to type &#39;S&#39; and the enter key.&nbsp;&nbsp; 
+        You can abort the collection with Ctrl-C.&nbsp;&nbsp; </p>
+    <p>
+        When data is collected with &#39;collect&#39; (or when perfMonitor &#39;stop&#39; is used), by 
+        default PerfMonitor does a &#39;ClrRundown&#39;.&nbsp;&nbsp; A &#39;ClrRundown&#39; makes a 
+        request to every process running the .NET Runtime to dump symbolic information 
+        so that stack traces involving managed code can be decoded.&nbsp;&nbsp; This is 
+        only needed if the process of interested is managed AND it has not exited.&nbsp;&nbsp; 
+        This is why it is not necessary to do a rundown when you use the &#39;run&#39; command 
+        (since the process already did a rundown when it died).&nbsp; </p>
+    <p>
+        Rundown does take time and file space, so if you know that the process of 
+        interest is either not a .NET program or will have died before collection has 
+        ended you can specify the /noRundown flag to &#39;collect&#39; to avoid this overhead.&nbsp; </p>
+    <h4>
+        <a id="merging">Doing analysis on a different machine (or using XPerf)</a>: 
+        Merging</h4>
+    <p>
+        As 
+        already mentioned, due to limitations in ETW, data from PerfMonitor typically consists of two files: an .ETL file 
+        and a .Kernel.ETL file.&nbsp;&nbsp; In addition, these files do not contain all the 
+        information necessary to decode the events on another machine (information 
+        missing are the EXACT version of exectuable files, as well as the mappings of 
+        hard drives to drive letters).&nbsp;&nbsp;Thus the raw information is not well 
+        suited to being transered to another maching for analysis.&nbsp;&nbsp; &nbsp; The perfmonitor &#39;merge&#39; command 
+        is designed to fix this.&nbsp;&nbsp; By typing By typing</p>
+    <ul>
+        <li>perfMonitor merge <em>[fileName.ETL]</em></li>
+    </ul>
+    <p>
+        PerfMonitor will combine <em>filename</em>.ETL (defaults to perfmonitor.etl) and
+        <em>fileName</em>.kernel.ETL into just <em>fileName</em>.ETL (deleting the 
+        originals if successful)&nbsp; 
+        Moreover it will include all information needed to decode the ETL file on 
+        another machine.&nbsp;&nbsp; Thus after merging the single file can now be 
+        transfered to another machine for off-line analysis.&nbsp; It also works equally 
+        well on the machine where the data was collected (it just takes an extra step to 
+        create).&nbsp; </p>
+    <p>
+        The ETL files created by PerfMonitor are identical to files that would be 
+        created by the windows
+        <a href="http://msdn.microsoft.com/en-us/performance/default.aspx">XPerf</a>
+        tool.&nbsp;&nbsp; Thus a useful scenario is to use PerfMonitor to collect 
+        information on a remote machine (because it is one EXE that is easy to deploy 
+        anywhere), and then use XPerf to analyze the resulting data on another machine.&nbsp;&nbsp; </p>
+
+    <h4>
+        Long running scenarios:
+        Circular Buffering</h4>
+    <p>
+        Typically ETW will generate 2-4 Meg of data for every second of collection 
+        (although this can vary widely depending on the events being logged, and what 
+        applications are doing during the log).&nbsp;&nbsp;&nbsp; It is also true that 
+        log files larger than 500 Meg or so are quite unwieldly.&nbsp;&nbsp; Thus it is 
+        best if data is collected for less than 100 seconds.&nbsp;&nbsp; This can be a 
+        problem if you are trying to understand a performance problem that is 
+        intermittant.&nbsp;&nbsp;&nbsp; This is where the /Circular:<em>sizeMB</em> 
+        option is useful.&nbsp;&nbsp; By specifying /Circular:100 it caps the file size 
+        at 100 meg (probably enough for 25-50 seconds of trace), so logging can be left 
+        on indefinately.&nbsp;&nbsp; When the problem occurs, as long as you can stop 
+        the logging within about 25 seconds, you should have data on the performance 
+        anomoly.&nbsp; </p>
+       <hr />
+        <h3>
+        PerfMonitor Step By Step: 
+        Analyzing ETW Data</h3>
+    <p>
+        Once you have ETL files created by PerfMonitor, you can run a variety of 
+        analyses on them by using the &#39;analyze&#39; command</p>
+    <ul>
+        <li>&nbsp; perfMonitor [/process:<em>nameOrPID</em>] analyze&nbsp;<em>[fileName.ETL]</em></li>
+    </ul>
+    <p>
+        Will perform a set of useful performance evaluations on the data in <em>
+        filename.ETL</em> (defauts to perfMonitor.etl) for the process designated by 
+        <em>nameOrPID</em>.&nbsp;&nbsp; <em>NameOrPID</em> is either the process name (defined to 
+        be the name of the EXE without path or extension), or the (decimal) process ID.&nbsp;&nbsp;&nbsp; 
+        The &#39;analyze&#39; will work if you don&#39;t specify a process to focus on, but 
+        typically is not what you want.&nbsp;&nbsp; You can discover what processes were 
+        started in a given ETL file by doing</p>
+    <ul>
+        <li>perfMontior procs <em>[fileName.ETL]</em></li>
+    </ul>
+    <p>Which gives a list of process that started while data was being collected.&nbsp;&nbsp;&nbsp; 
+        This can then be used to determine the correct /process: qualifer to use.&nbsp; </p>
+    <p>
+        As a convenience, the command the command</p>
+    <ul>
+        <li>perfMonitor runAnalyze <em>command</em></li>
+    </ul>
+    <p>
+        Will perform the run command (start data collection, run the command, stop), and 
+        then do an &#39;analyze&#39; command, using the process name from the command as the 
+        focus process.&nbsp;&nbsp; This was the command used in the QuickStart, and is 
+        quite common.&nbsp;&nbsp;
+    bsp;
+    </p>
+
+    <h2>
+        <a name="UnderstandingTheAnalysisReport">Understanding the Analysis Report</a></h2>
+    <p>
+        The report that is generated by the &#39;analyze&#39; command is meant to be 
+        self-explainitory, however a certain amount of performance background is 
+        valuable in interpreting the data.&nbsp; This is what is presented here.&nbsp;&nbsp; 
+        This section assumes some familiarity with ETW,&nbsp; Please see
+        <a href="#ETWBackground">ETW Background</a> if you are new to ETW.&nbsp; </p>
+    <p>
+        The main report has three sections</p>
+    <ol>
+        <li>CPU - A breakdown of CPU used.&nbsp; If a large amount of the clock time is CPU 
+            time, this is the place to start.&nbsp;&nbsp; </li>
+        <li>Garbage Collection (GC) - Shows the total memory used, as well as how much of 
+            this is used by the garbage collected heap.&nbsp;&nbsp;&nbsp; </li>
+        <li>Just In Time (JIT) compilation - Shows the costs associated with compiling IL to 
+            native code.&nbsp;&nbsp; This mostly happens on startup, and thus is only 
+            interesting for startup scenarios.&nbsp;&nbsp; If there is too much JIT 
+            compilation going on, 
+            <a href="\%22http:/msdn.microsoft.com/en-us/magazine/cc163808.aspx\%22">NGen 
+            Tool</a> can be used to avoid the issue.&nbsp; </li>
+    </ol>
+    <p>
+        See also <a href="#UnderstandingCPUPerf">Understanding CPU Performance Data</a>,
+        <a href="#UnderstandingGCPerf">Understanding GC Performance Data</a>,
+        <a href="#UnderstandingJITPerf">Understanding Just In Time Compiler Data</a>,
+        <a href="#FAQ">FAQ</a>, <a href="#TroubleShooting">TroubleShooting</a>,<a 
+            href="#ETWBackground"> ETW Background</a>, <a href="#UsersGuide">Home</a>.</p>
+    <h3>
+        <a id="UnderstandingCPUPerf">Understanding CPU Performance Data</a>
+    </h3>
+    <p>The data shown by default in the PerfMonitor stack viewer are stack traces taken 
+        every millisecond on each processor on the system.&nbsp;&nbsp; Every 
+        millisecond, on every CPU whatever process is running on that CPU is stopped and the operating system 
+        &#39;walks the stack&#39; associated with the running code collecting the return address of every method on the 
+        stack.&nbsp;&nbsp; Stackwalking may not be perfect.&nbsp;&nbsp; It is possible 
+        that the OS can&#39;t find the next frame (leading to <a href="#BrokenStacks">broken 
+        stacks    stacks</a>) or that an optimizing compiler has removed a method call (see
+        <a href="#MissingFrames">missing frames</a>), which can make analysis more 
+        difficult.&nbsp;&nbsp; However for the most part the scheme works well, and has 
+        low overhead (typically less than 5% slowdown), so monitoring can be done on &#39;production&#39; 
+        systems.&nbsp;
+    </p>
+    <h4>
+        <a id="HowManySamples">How many samples do you need? you need?</a></h4>
+    <p>
+        Because the samples are taken every millisecond per processor, each sample 
+        represents 1 millisecond of CPU time.&nbsp;&nbsp; However exactly where the 
+        sample is taken is effectively &#39;random&#39;, and so it is really &#39;unfair&#39; to 
+        &#39;charge&#39; the full millisecond to the routine that happened to be running at the 
+        time the sample was taken.&nbsp;&nbsp; While this is true, it is also true that 
+        as more samples are taken this &#39;unfairness&#39; decreases as the square root of the 
+        number of samples.&nbsp;&nbsp; If a method has just 1 or 2 samples is could be 
+        just random chance that it happened in that particular method, but methods with 
+        10 samples are likely to have truly used between 7 and 13 samples (30% error).&nbsp; 
+        Routines with 100 samples are likely to be within 90 and 110 (10% error).&nbsp;&nbsp;&nbsp; 
+        For &#39;typical&#39; analysis this means you want at least 1000 and preferablly more 
+        like 5000 samples (there is diminishing routines after 10K).&nbsp;&nbsp; By 
+        collecting a few thousand samples you insure that even moderatly &#39;warm&#39; methods 
+        will have at least 10 samples, and &#39;hot&#39; methods will have at least 100s, which 
+        keep the error acceptably small.&nbsp;&nbsp; Because PerfMonitor does not allow you 
+        to vary the sampling frequency, this means that you need to run the scenario for 
+        at least several seconds (for CPU bound tasks), and 10-20 seconds for less CPU 
+        bound activities.&nbsp;&nbsp;
+    </p>
+    <p>
+        Even with 1000s of samples,&nbsp; there is still &#39;noise&#39; that 
+        is typically at 
+        least 3%.&nbsp;&nbsp; This error gets larger as the methods&nbsp; being 
+        investigated have fewer samples.&nbsp;&nbsp; This makes it problematic to use 
+        sample based profiling to compare two traces to track down small regressions 
+        (say 3%).&nbsp;&nbsp; Noise is likely to be at least as large as the &#39;signal&#39; 
+        (diff) you are trying to track down.&nbsp;&nbsp; Increasing the number of 
+        samples will help, however you should always keep in mind the sampling error 
+        when comparing small differences between two traces.&nbsp;
+    </p>
+    <h4>
+        <a id="TopDownBottomUpAnalysis0">I</a>s your problem even CPU?</h4>
+    <p>
+        Before doing a detailed CPU analysis, it is important to insure that optimizing 
+        CPU will have an effect.&nbsp;&nbsp; If your program is Disk or Network bound, 
+        then optimizing CPU will have little effect.&nbsp; This is why the top level 
+        &#39;rollups&#39; of CPU consumption are an important to look at first.&nbsp;&nbsp; If 
+        the total CPU samples add up to 400 msec, than that is an upper bound on what 
+        CPU optimization can have.&nbsp; You should spend your time only of costs that 
+        are large enough to justify optimization.&nbsp;
+    </p>
+    <h4>
+        Exclusive and Inclusive Metrics</h4>
+    <p>
+        Because a stack trace is collected for each sample, every node has both an 
+        exclusive metric (the number of samples that were collected in that particular 
+        method) and an inclusive metric (the number of samples that collected in that 
+        method or any method that that method called).&nbsp;&nbsp;&nbsp;&nbsp; Exclusive 
+        times are useful in the bottom up view to quickly determine the &#39;hot&#39; methods 
+        that are the most important to optimize.&nbsp;&nbsp;&nbsp; Inclusive times are 
+        useful in the top-down and caller-calle views to understand how time is spent in 
+        methods that are not in the bottom-up view.&nbsp; </p>
+    <h4>
+        <a name="GroupingOSMethods">Grouping of OS methods</a></h4>
+    <p>
+        All programs call into operating system functions to do &#39;primitive&#39; operations 
+        (e.g. read from a file, update the screen ...).&nbsp;&nbsp; However these 
+        functions are typically have a large number of private internal methods to 
+        implement the functionality.&nbsp;&nbsp; This detail is typically not useful to 
+        an application developer trying to optimize HIS code, and only serves to make 
+        the report hard to read.&nbsp;&nbsp; PerfMonitor avoids this problem by grouping all functions 
+        that are part of the operating system.&nbsp;&nbsp; A method is defined to be 
+        part of the operating system if it is implemented in a DLL that is under the
+        c:\windows directory.&nbsp;&nbsp; Once a call is 
+        made into an OS function, any further calls are grouped into the existing 
+        frame until a method outside the OS is called.&nbsp; &nbsp;&nbsp; This feature 
+        can be turned off with the /noOSGrouping qualifer if desired.&nbsp; </p>
+    <p>
+        This grouping greatly simplifies the CPU reports PerfMonitor generates.&nbsp;&nbsp; 
+        It does however mean that the meaning of &#39;Exclusive&#39; time for OS functions is 
+        different from user functions.&nbsp; For OS functions, exclusive time means the 
+        sample might have been in the function itself but it might also mean that it 
+        occurs in any OS function that function called.&nbsp; </p>
+    <h4>
+        Getting Stacks for Unmanaged Methods</h4>
+    <p>
+        By default PerfMonitor collects all the information needed to map the 
+        information collected at runtime (return addresses) into names of methods.&nbsp;&nbsp; 
+        However unmanaged code relies on information stored in program database file 
+        (PDBs) to provide this mapping.&nbsp;&nbsp; By default PerfMonitor does not try 
+        to map return addresses of unmanaged code to symbolic names.&nbsp; Typically 
+        PerfMonitor can determine the module of the return address, but needs the PDB to 
+        resolve the function name, resulting in a name like module!?.&nbsp; If even the 
+        module cannot be determined the address is displayed as ?!?)&nbsp; </p>
+    <p style="height: 19px">
+        PerfMonitor can be made to look up return addresses in unmanaged code using the 
+        /SymbolsForDlls:<em>dllList</em>, where <em>dllList</em> is a comma separated 
+        list of DLL names (without path or extension).&nbsp;&nbsp; For this to work the 
+        _NT_SYMBOL_PATH variable must be set so that the necessary PDB files can be 
+        found.&nbsp;&nbsp; See <a href="#SymbolResolution">Symbol Resolution</a> for 
+        complete details.&nbsp;&nbsp; You may also use the /NoOSGrouping qualifier if 
+        you are interested in the detailed stacks associated with DLLs under c:\windows.</p>
+    <h4>
+        <a id="TopDownBottomUpAnalysis">Top-down and Bottom-up Analysis</a></h4>
+    <p>
+        Performance investigations can either 
+        be &#39;top-down&#39; (starting with the Main program and how the time spent there is 
+        divided into methods it calls), or &#39;bottom-up&#39; (starting with methods at &#39;leaf&#39; 
+        methods where samples were actually taken, and look for methods that used a lot 
+        of time).&nbsp;&nbsp; Both techniques are useful, however &#39;bottom-up&#39; is usually 
+        a better way to start because methods at the bottom tend to be simpler and thus 
+        easier to understand and have intuition about how much CPU they should be using.&nbsp;&nbsp; 
+        Top-down analysis will tell you how the &#39;large&#39; components of your program use 
+        CPU.&nbsp;&nbsp; This can be useful to find large structural problems (a phase 
+        of your program is taking much longer than expected).
+    </p>
+    <h3>
+        <a id="UnderstandingGCPerf"Understanding Garbage Collection (GC) 
+        Performance Data</a></h3>
+    <p>
+        By default PerfMonitor causes the Runtime to log an event at the begining and 
+        end of each <a href="http://msdn.microsoft.com/en-us/library/0xy59wtx.aspx">.NET 
+        Garbage Collection</a> as well as every time 100K of objects are allocated.&nbsp;&nbsp; 
+        As with all events the precise time is logged, so the amount of time spent in 
+        the GC can be known.&nbsp;&nbsp;&nbsp; Most applications spend less than 10% of 
+        the total CPU time in the GC itself.&nbsp;&nbsp; If your appliation is over this 
+        %, it usually means that your allocation pattern is such that you are causing 
+        many expensive Gen 2 GCs to occur.&nbsp;&nbsp;&nbsp; </p>
+    <p>
+        If the GC heap is a large percentage of the total memory used then GC heap 
+        optimization using a profile like
+        <a href="http://msdn.microsoft.com/en-us/library/ms979205.aspx">ClrProfiler</a>.&nbsp;&nbsp; 
+        See <a href="http://msdn.microsoft.com/en-us/magazine/dd882521.aspx">Memory 
+        Usage Auditing For .NET Applications</a> for&nbsp; more on memory optimization.&nbsp; 
+        .</p>
+    <p>
+        During SOME&nbsp;GCs 
+        the application itself has to be suspended so the&nbsp; GC can update object 
+        references.&nbsp;&nbsp; Thus the application will pause when a GC happens.&nbsp;&nbsp; 
+        If these pause times are larger than 100ms or so, it can impact the user 
+        experience.&nbsp;&nbsp; The GC statistics will track the maximum and average 
+        pause time to allow you to confirm that this bad GC behavior is not happening.&nbsp;&nbsp;&nbsp; </p>
+    <h3>
+        <a id="UnderstandingJITPerf">Understanding Just In Time 
+        Compiler Performance Data</a></h3>
+    <p>
+        PerfMonitior tracks detailed information of what methods 
+        were Just In Time compiled.&nbsp;&nbsp; This data is mostly useful for 
+        optimizing startup (because that is when most methods get JIT compiled).&nbsp; 
+        If large numbers of methods are being compiled it can noticably affect startup 
+        time.&nbsp; This report tells you exactly how much time is being spent (in fact 
+        exactly which methods and exactly when they were compiled).&nbsp;&nbsp; If JIT 
+        time is high, the
+        <a href="\%22http:/msdn.microsoft.com/en-us/magazine/cc163808.aspx\%22">NGen 
+        Tool</a> can be used to precompile the code, and thus eliminate most of this 
+        overhead at startup.&nbsp; </p>
+<hr />
+    <h2 style="margin-top: 19px">
+        <a name="ETWBackground">ETW Backgroundd</a></h2>
+    <p>
+        <a href="http://msdn.microsoft.com/en-us/library/bb968803(v=VS.85).aspx">Event 
+        Tracing for Windows (ETW) </a>is a general purpose, efficient, scalable event 
+        logging service built into the windows operating system.&nbsp;&nbsp; Effectively 
+        all Windows components as well as user defined componts can define logging 
+        &#39;Providers&#39; that can be turned on and off selectively at any time to provide 
+        interesting information about what that component is doing.&nbsp;&nbsp; Each 
+        event is automatically tagged with the provider it came from and the exact (too 
+        100ns) time it happened, what process and thread generated it, as well as event 
+        specific information.&nbsp;&nbsp; Events can also be optionally tagged with the 
+        exact stack trace.&nbsp;&nbsp; Much of the power of ETW comes from the fact that 
+        the operating system provider come built in with a variety of useful events 
+        including process and thread creation, 1 msec CPU sampling (with stack trace), 
+        context switches, disk I/O (including file name), DLL loading, virutal memory 
+        allocation, and network I/O.&nbsp;&nbsp; On top of these other windows 
+        components such as the .NET Runtime add their own providers that add 
+        component-specific information such as garbage collection events and Just in 
+        Time compilation (see
+        <a href="#AdvancedDataCollection">advanced data collection</a> for more).&nbsp;&nbsp; 
+        The result is very detailed view of the system as a whole, which is sufficient 
+        to diagnose most performance issues.&nbsp; </p>
+    <p>The data collection is machine wide (you automatically get events from every 
+        process in the system), which, among other things, means that data collection 
+        logistics are simpler (you don&#39;t need to know which process is important).&nbsp;&nbsp; 
+        The overhead associated with collection varies depending on the kind of events 
+        logged and what the appliation does.&nbsp;&nbsp;&nbsp; The default events turned 
+        on by PerfMonitor will slow the application down by less than 10% (more 
+        typically less than 5%).&nbsp;&nbsp;&nbsp;&nbsp; In addition, the Windows 
+        development group uses ETW logging extensively, so these logging paths are well 
+        tested (you are not running in a unusual mode).&nbsp;&nbsp;&nbsp;&nbsp; These 
+        characteristics make it reasonable to leave event collection on &#39;in production&#39; 
+        to &#39;catch&#39; unusal performance events.&nbsp;&nbsp; The &#39;/Circular&#39; option 
+        is particularly valuable </p>
+    <p>
+        The size of the data files again depend on the events that were turned 
+        on and what the applications is doing.&nbsp;&nbsp;For the default events perfMonitor will 
+        typically generate between 2 and 4Meg of log per second.&nbsp;&nbsp; Thus data 
+        collection times less than 100 seconds are reasonable.&nbsp;&nbsp; If your 
+        scenario is larger then that, you should consider using a circular buffer to 
+        limit the amount of data collected.&nbsp;&nbsp; </p>
+     <hr />
+    <h2>
+        <a id="AdvancedDataCollection">Advanced Data Collection</a></h2>
+    <p>
+        PerfMonitor data collection is based on
+        <a href="http://msdn.microsoft.com/en-us/library/bb968803(v=VS.85).aspx">Event 
+        Tracing for Windows (ETW)</a>.&nbsp;&nbsp; This is a general facility for 
+        logging information in a low overhead way.&nbsp; It is useful extensively 
+        throughout the Windows OS and in particular is used by both the Windows OS 
+        Kernel and the .NET CLR Runtime.&nbsp;&nbsp;&nbsp;&nbsp; By default PerfMonitor 
+        picks a default set of these events that have high value for the kinds of 
+        analysis PerfMonitor can visualize.&nbsp;&nbsp; Howevever PerfMonitor can also be used 
+        as simply a data-collector, at which point it can be useful to turn on other 
+        events.&nbsp;&nbsp; This is what the /KerneEvents: /ClrEvents: and /Provider: 
+        qualifiers do</p>
+    <p>
+        All ETW events log the following information</p>
+    <ol>
+        <li>The time (to 100ns resolution) when the event happened </li>
+        <li>The provider that logged the event (eg the Kernel, CLR or some user provider).
+        </li>
+        <li>The event number (which indicates how to decode the payload) </li>
+        <li>The process and thread associated with the event (some events however there is 
+            no useful process or thread ID, but most do) </li>
+    </ol>
+    <h4>
+        Kernel Events</h4>
+    <p>
+        By far, the ETW events built into the Windows Kernel are the most fundamental 
+        and useful.&nbsp;&nbsp; Almost any data collection will want to turn at least 
+        some of these on.&nbsp;&nbsp;&nbsp;&nbsp; See
+        <a href="http://msdn.microsoft.com/en-us/library/aa363784(v=VS.85).aspx">Kernel 
+        ETW Event</a> for more information on particular events.&nbsp;&nbsp;&nbsp; Here 
+        we will only provide an overview.&nbsp;&nbsp; It is useful to break kernel 
+        events into three groups:
+    </p>
+    <ol>
+        <li>&nbsp;tDefault group (so useful you should have them on all the time.</li>
+        <li>High Volume (useful but you only should turn them on when you need them)</li>
+        <li>Advanced (typically you don&#39;t turn these unless you are writing a device 
+            driver).&nbsp; </li>
+    </ol>
+    <h5>
+        The Default Kernel Group</h5>
+    <p>
+        The default group is the group that PerfMonitor turns on by default.&nbsp;&nbsp; 
+        The most verbose of these events is the &#39;Profile&#39; event that is trigger a stack 
+        trace every millisecond for each CPU on the machine (so you know what youre CPU 
+        is doing).&nbsp;&nbsp;&nbsp; Thus on a 4 processor machine you will get 4000 
+        samples (with stack traces) every second of trace time.&nbsp;&nbsp; This can add 
+        up.&nbsp;&nbsp; Assume you will get at least 1 Meg of file size per second of 
+        trace.&nbsp;&nbsp; If you need to run very long traces (100s of seconds), you 
+        should strongly consider using the circular buffer mode to keep the logs under 
+        control.&nbsp;
+    </p>
+    <ol>
+        <li>Default = DiskIO | DiskFileIO | ImageLoad | MemoryHardFaults | NetworkTCPIP | 
+            Process | ProcessCounters | Profile | Thread </li>
+        <li>DiskIO - Fires every time a physical disk read is COMPLETE, indicates the size, 
+            and how long the operation took.&nbsp; No stack trace. </li>
+        <li>DiskFileIO - Logs the mapping between OS file object handles and the name of the 
+            file.&nbsp; Without this many kernel events are not useful because you can&#39;t relate 
+            the operation to a meaninful name.&nbsp;&nbsp;&nbsp; You almost always want this event.&nbsp; No 
+            stack trace.</li>
+        <li>ImageLoad - Fires when a DLL or EXE is loaded into memory for execution 
+            (LoadLibaryEx is called).&nbsp; Needed if you wan to map memory addresse back to 
+            symbolic names.&nbsp; Logs a stack trace.&nbsp; </li>
+        <li>MemoryHardFaults - Fires when the OS had to cause a physical disk read in 
+            responce to mapping virtual memory.&nbsp;&nbsp; Logs a stack trace. </li>
+        <li>NetworkTCPIP - Fires when TCP&nbsp; or UDP packets are sent or recieved.&nbsp;&nbsp; Logs the 
+            two end points and the size.&nbsp; No stack trace. </li>
+        <li>Process - Fires when a process is created or destroyed.&nbsp; Indicates the command 
+            line (on start) or exit code (on end).&nbsp; Logs a stack trace. </li>
+        <li>ProcessCounters - Logs process memory statistics before a process dies or the 
+            trace ends. &nbsp; No stack trace. </li>
+        <li>Profile&nbsp; - Fires every 1 msec per processor and indicates where the instruction 
+            pointer current list and takes a stack trace. </li>
+        <li>Thread - Fires every time a thread is created or destoyed.&nbsp;&nbsp; Logs a stack 
+            trace.&nbsp; </li>
+    </ol>
+    <h5>
+        The High Volume Group</h5>
+    <p>
+        The following Kernel events are not on by default because they can be relatively 
+        verbose or are for more specialized performance investigations.&nbsp;
+    </p>
+    <ol>
+        <li>Verbose = Default | ContextSwitch | DiskIOInit | Dispatcher | FileIO | 
+            FileIOInit | MemoryPageFaults | Registry | VirtualAlloc </li>
+        <li>ContextSwitch - Fires each time OS stops running switches to another.&nbsp; It 
+            indicates loosing processor and the thread getting it.&nbsp; This event fire &gt; 10K 
+            second depending on scenario, but can be VERY useful for determing why some 
+            process is waiting.&nbsp; Logs a stack trace.</li>
+        <li>DiskIOInit - Fires each time Disk I/O operation begins (where DiskIO fires when 
+            it ends).&nbsp; Unlike DiskIO this logs a stack trace.&nbsp; </li>
+        <li>Dispatcher - Fires when a thread goes from waiting to ready (note that the 
+            thread may not actually run if there is no CPU available).&nbsp; This can also fire &gt; 
+            10K / sec, but is very useful in understanding why waits are happening.&nbsp;
+        </li>
+        <li>FileIO - Fires when a file operation completes (even if the operation does not 
+            cause a disk read (because it was in the file system cache).&nbsp; Does not log a 
+            stack trace.&nbsp; </li>
+        <li>FileIOInit - Fires when a file operation starts.&nbsp; Unlike FileIO this will log a 
+            stack trace.&nbsp; </li>
+        <li>MemoryPageFaults - Fires when a virtual memory page is make accessible (backed 
+            by physical memory).&nbsp;&nbsp; This fires not only when the page needed to be fetched 
+            from disk, but also if it was already in the file system cache, or only needed 
+            to be zeroed.&nbsp;&nbsp;&nbsp; Logs a stack trace. </li>
+        <li>Registry - Fires when a registry operation occurs.&nbsp;&nbsp; Logs a stack trace.
+        </li>
+        <li>VirtualAlloc - Fires when the Virtual memory allocation or free operation 
+            occurs.&nbsp; All memory in a process either was mapped or was allocated through 
+            Virtual Alloc operations.</li>
+    </ol>
+    <h5>
+        The Advanced Group</h5>
+    <p>
+        The finalThe final set of kernel events are typically useful for people writing device 
+        drivers or trying to understand why hardware or low level OS software is 
+        misbehaving&nbsp;
+    </p>
+    <ol>
+        <li>OS = AdvancedLocalProcedureCalls | DeferedProcedureCalls | Driver | Interrupt
+        </li>
+        <li>AdvancedLocalProcedureCalls - Logged when a OS machine local procedure call is 
+            made. </li>
+        <li>DeferedProcedureCalls - Logged when a OS Defered procedure call is made </li>
+        <li>SplitIO - Logged when an disk I/O had to be split into pieces </li>
+        <li>Driver - Logs various hardware driver events occur. </li>
+        <li>Interrupt - Logged when a hardware interupt occurs. </li>
+    </ol>
+    <hr />
+    <h4>
+        CLR Events</h4>
+    <p>
+        In addition to the kernel events, if you are running .NET Runtime code you are 
+        likely to want to also have the CLR ETW events truned on.&nbsp;&nbsp;&nbsp; 
+        PerfMonitor turns a number of these on by default.&nbsp;&nbsp; See 
+        <a href="http://msdn.microsoft.com/en-us/library/dd264810.aspx">CLR ETW Events</a> 
+        for more information on these events.
+    </p>
+    <ol>
+        <li>Default = GC | Binder | Loader | Jit | NGen | StopEnumeration | Security | 
+            AppDomainResourceManagement | Exception | Threading | Contention </li>
+        <li>GC - Fires when GC starts and stops </li>
+        <li>Binder - TODO </li>
+        <li>Loader -Fires when assemblies are loaded or unloaded </li>
+        <li>Jit - Fires when methods are Just in Time (JIT) compiled. </li>
+        <li>NGen - Fires when operations assumed with precompiled NGEN images happen
+        </li>
+        <li>Security - Fires on various security checks </li>
+        <li>AppDomainResourceManagement - Fires when certain appdomain resource management 
+            events occur. </li>
+        <li>Contention - Fires when managed locks cause a thread to sleep. </li>
+        <li>Exception - Fires when a managed exception happens. </li>
+        <li>Threading - Fires on various System.Threading.ThreadPool operations </li>
+        <li>Stop Enumeration - Dumps symbolic information as early as possible (not 
+            recommended) </li>
+        <li>Start Enumeration - Dumps symbolic informationb as late as possible (typically 
+            at process stop)&nbsp; This is the default. </li>
+        <li>JitTracing - Verbose information on Just in time compilation (why things were 
+            inlined ...) </li>
+        <li>Interop - Verbose information on the generation of Native Interopations code.&nbsp;
+        </li>
+        <li>Stack - Turn on stack traces for various CLR events.&nbsp; </li>
+    </ol>
+    <hr />
+    <h4>
+        Collecting data from other ETW Providers too</h4>
+    <p>
+        The Kernel and CLR ETW events are by far the most important because the data 
+        they collect applies to most programs.&nbsp;&nbsp; This is why PerfMonitor turns 
+        these providers on by default, and has special qualifers (/kernelEvents and 
+        /CLREvents) to make speicify specific events easy.&nbsp;&nbsp; However sometime 
+        it is useful to also have events that tell you &#39;higher level&#39; information.&nbsp;&nbsp; 
+        There are litterally hundreds of ETW providers built into Windows already, and 
+        it is also possible for you to instrument your own code with ETW event.&nbsp; 
+        PerfMonitor can control these other provider too.&nbsp;&nbsp;&nbsp; This is what 
+        the /providers: qualifer is for.</p>
+    <p>
+        To turn a ETW provider on, you need three pieces of information</p>
+    <ol>
+        <li>The GUID that was assigned to the provider that identifies it uniquely to the 
+            system.&nbsp;&nbsp; </li>
+        <li>A 64 bit integer that represents sets of events should be logged</li>
+        <li>A small integer that represents the verbosity desired (1 = critical, 5 = 
+            verbose)</li>
+    </ol>
+    <p>
+        The /providers qualifer is a comma separated list of these specifications where 
+        each component above is separted by a &#39;:&#39;&nbsp;&nbsp; For example the 
+        silverlight provider happens to be assigned the GUID 
+        AA087E0E-0B35-4e28-8F3A-440C3F51EEF1.&nbsp; Thus the specification</p>
+    <ul>
+        <li>perfMonitor /providers:AA087E0E-0B35-4e28-8F3A-440C3F51EEF1:0xFFFFFFFF:5 collect</li>
+    </ul>
+    <p>
+        Starts data collection with all the normal CLR and Kernel providers but also 
+        turns on the silverlight provider passing it the bitset 0xFFFFFFF and a verbose 
+        level (5).&nbsp;&nbsp; This is relatively advanced scenario as you need to know 
+        what each bit in the bitset means, and how to decode the events once they are 
+        collected.&nbsp;&nbsp;&nbsp;&nbsp;
+    </p>
+    <hr />
+    <h3>
+        <a id="SymbolResolution">Symbol Resolution</a></h3>
+    <p>
+        At collection time, when a CPU sample or a stack trace is taken, it is 
+        represented by an address in memory.&nbsp;&nbsp;&nbsp; This memory address needs 
+        to be converted to symbolic form to be useful for analysis.&nbsp;&nbsp; This 
+        happens in two steps.&nbsp;
+    </p>
+    <ol>
+        <li>&nbsp;First determine if the code belongs to a particular DLL (module) or not.&nbsp;
+        </li>
+        <li>Given the DLL, look up detailed symbolic information </li>
+    </ol>
+    <p>
+        If the first step fails (uncommon), then the address is given the symbolic name 
+        ?!? (unknown module and method).&nbsp;&nbsp; However if the second step fails 
+        (more common) then you can at least know the module and the address is given the 
+        symbolic name <strong>module</strong>!?.</p>
+    <h4>
+        <a id="UnknownMethods0">?!? Methods</a>
+    </h4>
+    <p>
+        Code that does not belong to any DLL must have been dynamically generated.&nbsp;&nbsp; 
+        If this code was generated by the .NET Runtime by compiling a .NET Method, it 
+        should&nbsp; have been decoded by PerfMonitor.&nbsp;&nbsp; Howvever if you 
+        specified the /NoRundown or the log file is otherwise incomplete, it is possible 
+        that the information necessary to decode the address has been lost.&nbsp;&nbsp;&nbsp; 
+        More commonly, however there are a number of &#39;anonymous&#39; helper methods that are 
+        generated by the runtime, and since these have no name, there is not much to do 
+        except leave them as ?!?.&nbsp;&nbsp;&nbsp; These helper typically are 
+        uninteresting (they don&#39;t have much exclusive time), and can ignored during 
+        analysis.&nbsp; They typically happen at the boundary of managed and 
+        unmanaged code.&nbsp;
+    </p>
+    <h4>
+        module!? Methods</h4>
+    <p>
+        Code that was not generated at runtime is always part of the body of a DLL, and 
+        thus the DLL name can always be determined.&nbsp;&nbsp;&nbsp;Precompiled managed code lives in 
+        (NGEN) images which have in <strong>.ni </strong>in their name and the 
+        information should be in the ETL file PerfMonitor collected.&nbsp;&nbsp;&nbsp; If 
+        you see things unknown function names in modules that have <strong>.ni </strong>
+        in them it implies that something went wrong with CLR rundown (see
+        <a href="#UnknownMethods">?!? methods</a>).&nbsp; For unmanaged code (that do 
+        not have <strong>.ni</strong>) the addresses need to be looked up in the 
+        symbolic information associated with that DLL.&nbsp;&nbsp; This symbolic 
+        information is stored in program database files (PDBs), and can be fairly 
+        expensive (10s of seconds or more), to resolve a large trace.&nbsp;&nbsp; 
+        Because of this PerfMonitor by default only fully decodes &#39;High Value&#39; DLLs 
+        including</p>
+    <ol>
+        <li>Important OS DLL (ntdll.dll, kernel32.dll, ntoskrnl.dll, ntkrnlpa.dll)</li>
+        <li>Important .NET Runtime DLLs (mscorwks.dll, clr.dll, corclr.dll)</li>
+    </ol>
+    <p>
+        This is a good set of defaults for most managed code development.&nbsp;&nbsp; 
+        However if your performance problem deals with unmanagd code., You will want 
+        other DLLs decoded.&nbsp;&nbsp; Currently the only way to do this is by 
+        specifying the /SymbolsForDlls:<strong>dll1</strong>,<strong>dll2</strong> ...&nbsp; 
+        when the data is analyzed.&nbsp; Where the dlls do NOT have their file name 
+        extension or path.&nbsp; (TODO: Improve the experence).&nbsp;&nbsp;&nbsp; The 
+        first time you use the&nbsp; /SymbolsForDlls qualifier you will also want to use 
+        /PrimeSymbols as explained below.
+    </p>
+    <h4>
+        Symbol servers and Symbol Priming</h4>
+    <p>
+        When a trace is opened for analysis, it does the symbolic lookup for unmanaged 
+        dlls.&nbsp;&nbsp;&nbsp; Click the &#39;log&#39; button in the lower right corner to see 
+        detailed diagnostic information about symbol loockup.&nbsp;&nbsp;&nbsp; An 
+        important part of this lookup is finding he program database (PDB) files.&nbsp;&nbsp;&nbsp; 
+        Like most diagnostic tools, PerfMonitor uses the
+        <a href="http://support.microsoft.com/kb/311503">_NT_SYMBOL_PATH</a> environment 
+        variable for a semi-colon separated list of places to look for PDB files.&nbsp;&nbsp; 
+        If you have unmanged executables that you built, this environment variable 
+        should include paths to the PDBs that your compiler generated.&nbsp;&nbsp;
+    </p>
+    <p>
+        The _NT_SYMBOL_PATH variable can have a special syntax of&nbsp; SRV*<strong>cacheDir</strong>*<strong>symbolServer</strong>, 
+        where <strong>cacheDir</strong> is a directory on the local machine, and <strong>
+        symbolsServer</strong> is a network or web path.&nbsp;&nbsp;&nbsp; This directs 
+        PerfMonitor to look up the PDB on the remote symbol server and copy the PDB to 
+        cacheDir, and then decode the symbols.&nbsp;&nbsp;&nbsp; If the PDB is archived 
+        in a symbol server, looking up the PDB is now easy (you point at a symbol 
+        server) but it can also be VERY slow (10s of seconds or more because of network 
+        latancies).&nbsp;&nbsp;&nbsp; The most important use of symbol servers is to get 
+        the PDBs for the Windows operating system DLLs.&nbsp;
+    </p>
+    <p>
+        Because symbol servers can be so slow and often you don&#39;t need the extra symbol 
+        information anyway (e.g if you are doing a pure managed investigation), by 
+        default PerfMonitor does NOT look up symbols on NON-LOCAL locations (it will look 
+        in al machine-local locations, including symbol server cache locations).&nbsp;&nbsp;&nbsp; 
+        However this does NOT work well the FIRST time.&nbsp; The FIRST time&nbsp; you 
+        must use the /PrimeSymbols option when launching PerfMonitor (TODO improve 
+        experience).&nbsp;&nbsp; This will tell PerfMonitor to take the time to look up the 
+        PDBs on symbol servers (and prime the local symbol server cache).&nbsp;&nbsp; 
+        After doing this once, you should not have to do it again (until OS dlls get 
+        updated).&nbsp;
+    </p>
+    <h4>
+        Default Symbol Path</h4>
+    <p>
+        By far, the most common unmanaged DLLs of interest are the DLLs that Microsoft 
+        ships as part of the operating system.&nbsp;&nbsp;&nbsp; Thus if you don&#39;t 
+        specify a _NT_SYMBOL_PATH PerfMonitor uses the following &#39;standard&#39; one</p>
+    <ul>
+        <li>_NT_SYMBOL_PATH=SRV*%TEMP%\symbols*http://msdl.microsoft.com/download/symbols
+        </li>
+    </ul>
+    <p>
+        This says is to look up PDB at the stanard microsoft PDB server 
+        http://msdl.microsoft.com/download/symbols and cache them locally in 
+        %TEMP%\symbols.&nbsp;&nbsp; Thus by default you can always find the PDBs for 
+        stanard Microsoft DLLs.&nbsp;
+    </p>
+    <h4>
+        Summary</h4>
+    <p>
+        Thus typically all you need to get good symbols is
+    </p>
+    <ol>
+        <li>
+            <p style="MARGIN-LEFT: 40px">
+                Run PerfMonitor /PrimeSymbols once when doing your first analysis.&nbsp; By default 
+                this will fetch the important OS and CLR dlls from the default Microsoft symbol 
+                server.
+            </p>
+        </li>
+        <li>
+            <p style="MARGIN-LEFT: 40px">
+                Afterward just run PerfMonitor normally.&nbsp;&nbsp; You will get the cached 
+                symbols and it will be (reasonably) fast (Because it finds them locally on your 
+                computer)</p>
+        </li>
+    </ol>
+    <p>
+        If you are investigating performance problems of unmanaged DLLs of EXEs that did 
+        not come from Microsoft (e.g you built them yourself), you have to set the 
+        _NT_SYMBOL_PATH to include the location of these PDBs before launching PerfMonitor.&nbsp;
+    </p>
+    <hr />
+    <h2>
+        <a id="TroubleShooting">TroubleShooting</a></h2>
+    <p>
+        Here are some tips for troubleshooting comon issues.
+    </p>
+    <h3>
+        <a id="TroubleShootingSymbols">TroubleShooting Symbols: (X!?&nbsp; or ?!? in the 
+        display)</a></h3>
+    <p>
+        Because of the expense of looking up symbols for unmanaged DLL, PerfMonitor 
+        requires a small amount of work by the user to decode them.&nbsp;&nbsp; First 
+        PerfMonitor by default only decodes a handful of important operating system dlls by 
+        default.&nbsp;&nbsp; You must use the /SymbolsForDlls:<strong>dll1,dll2</strong> 
+        to specify more.&nbsp;&nbsp; Second, even for these important DLLs PerfMonitor 
+        NEVER tries to find symbols except on the local machine unless the /PrimeSymbols 
+        options is given.&nbsp;&nbsp;&nbsp;&nbsp; Thus this option must be given the 
+        FIRST time you use PerfMonitor and wish to have symbols.&nbsp;&nbsp; Finally if the 
+        DLL is not shipped from Microsoft, symbol search path is almost certain NOT to 
+        work, you need to tell PerfMonitor where to find symbols by specifying the 
+        _NT_SYMBOL_PATH variable.&nbsp;
+    </p>
+    <p>
+        Thus if this is the first time you have used PerfMonitor and the symbols are 
+        important to your analysis, and the DLL were created by microsoft, then you can</p>
+    <ul>
+        <li>Specify the /PrimeSymbols&nbsp; /SymbolsForDlls:<strong>dll1,dll2 ...&nbsp; </strong>
+            qualifiers, where dll1, dll2 are the names of the dlls (without extension) of 
+            the dlls of interest.&nbsp; </li>
+    </ul>
+    <p>
+        If that does not work, look carefully at the 
+        *.convertlog.txt that is generated and 
+        read see <a href="#SymbolResolution">Symbol Resolution</a> for more complete 
+        information.</p>
+    <h3>
+        <strong><a id="BrokenStacks">&#39;BROKEN&#39; Stack Frame in Trace. </a>&nbsp;</strong></h3>
+    <p>
+        When a sample is taken, the ETW system attempts to take a stack trace.&nbsp;&nbsp;&nbsp; 
+        For a variety of reasons it is possible that this will fail before a complete 
+        stack is taken.&nbsp;&nbsp;&nbsp; PerfMonitor uses the heuristic that all stacks 
+        should end in a frame in a particular OS DLL (ntdll) which is responsible for 
+        creating threads.&nbsp;&nbsp; If a stack does not end there, PerfMonitor assumes 
+        that it is broken, and injects a pseduo-node called &#39;BROKEN&#39; between the thread 
+        and the part of the stack that was fetched (at the very least it will have the 
+        address of where the sample was taken).&nbsp;&nbsp;&nbsp; Thus BROKEN stacks 
+        should always be direct children of some frame representing a OS thread.&nbsp;&nbsp;
+    </p>
+    <p>
+        When the number of BROKEN stacks are small (say &lt; 3% of total samples), they can 
+        simply be ignored.&nbsp; This is the common case.&nbsp;&nbsp; However the more 
+        broken stacks there are, the less useful a &#39;top-down&#39; analysis (using the 
+        CallTree View) is because effectively some non-trivial fraction of the samples 
+        are not being placed in their proper place, giving you skewed results near the 
+        top of the stack.&nbsp;&nbsp;&nbsp; A &#39;bottom-up&#39; analysis (where you look first 
+        as where methods where samples occured) is not affected by broken stacks 
+        (however as that analysis moves &#39;up the stack&#39;, it can be affected)</p>
+    <p>
+        Broken stacks occur for the following reasons</p>
+    <ol>
+        <li>In 32 bit processes, ETW relys on the compiler to mark the stack by emiting a 
+            &#39;EBP Frame&#39;.&nbsp; When it fails to do this completely and uses the EBP register for 
+            other purposes, it breaks the stack.&nbsp;&nbsp; This should not happen for operating 
+            system code or for .NET Runtime code, but may occur for 3rd party code. </li>
+        <li>In a 64 bit process, ETW relys on a different mechanism to walk the stack.&nbsp; In 
+            this mechnism the compiler generates &#39;unwind information&#39;.&nbsp;&nbsp;&nbsp; Currently this ETW 
+            mechanism does not work properly for dynamically generated code (as generated by 
+            the .NET runtime JIT compiler).&nbsp; This causes stacks to be broken at the first 
+            JIT compiled method on the stack (you see the JIT compile method, but no callers 
+            of that method).&nbsp;&nbsp;&nbsp; This issue will be fixed in the future, but exists today.&nbsp;
+        </li>
+        <li>Asynchronous activities.&nbsp;&nbsp; Stack crawling is a &#39;best effort&#39; service.&nbsp;&nbsp; If the 
+            sample is taken at a time where it would be impossible to do logging safely, 
+            then the OS simply skips it.&nbsp;&nbsp; For example, if during stack crawing while in the 
+            kernel the stack page is found to be swapped out to the disk, then stack 
+            crawling is simply aborted.&nbsp; </li>
+    </ol>
+    <h4>
+        Working around 64 bit stack breaks:</h4>
+    <p>
+        If you are profing a 64 bit process there is pretty good chance that you are 
+        being affected by scenario (2) above.&nbsp;&nbsp;&nbsp; There are three 
+        work-arounds to broken stacks in that instance</p>
+    <ol>
+        <li>NGEN the application.&nbsp;&nbsp; The failures occur at JIT compiled code.&nbsp; If you
+            <a href="http://msdn.microsoft.com/en-us/library/6t9t5wcf(VS.80).aspx">NGEN</a> 
+            the application, JIT compilation will not be necessary and the broken stacks 
+            will disappear.&nbsp;&nbsp; To NGEN your appliation simply type&nbsp;
+            <p>
+                C:\Windows\Microsoft.NET\Framework\v2.0.50727\NGen install YourApp.exe.&nbsp;&nbsp;
+            </p>
+            You will have to repreat this every time your application is recompiled.
+        </li>
+        <li>Switch to 32 bit.&nbsp;&nbsp; If your code is pure managed code, then it can run both as a 
+            32 or a 64 bit process.&nbsp; By switching use a 32 bit process, you avoids the 
+            problem.&nbsp;&nbsp; This does not work if you took dependencies native code that only 
+            exists for 64 bit.&nbsp;&nbsp;&nbsp; You can convert your applciation to run 32 bit by using 
+            the <a href="http://msdn.microsoft.com/en-us/library/ms164699(VS.80).aspx">
+            CorFlags</a> utility that comes are part of the
+            <a href="http://www.microsoft.com/downloads/details.aspx?FamilyID=fe6f2099-b7b4-4f47-a244-c96d69c35dec&amp;DisplayLang=en">
+            .NET SDK</a>.&nbsp;&nbsp; It also comes are part of Visual Studio (open theVS command 
+            prompt).&nbsp;&nbsp; To switch simply type CorFlags /32bit+ <strong>YourApp.exe</strong>. 
+            You will have to repreat this every time your application is recompiled.
+        </li>
+        <li>Perform only a bottom-up analysis.&nbsp;&nbsp; Even with many broken stacks, there is a 
+            lot of information in the profile, and a &#39;bottom-up&#39; analysis is possible.&nbsp;
+        </li>
+    </ol>
+    <h3>
+        <a id="MissingFrames">Missing frames on stacks (Stacks Says A calls C, when in 
+        the source A calls B which calls C)</a></h3>
+    <p>
+        Missing stack frames are different than a broken stack because it is frames in 
+        the &#39;middle&#39; of the stack that are missing.&nbsp;&nbsp; Typically only one or 
+        maybe two methods are missing.&nbsp;&nbsp; There are three basic reasons for 
+        missing stacks.</p>
+    <ol>
+        <li>Inlining.&nbsp;&nbsp; If A calls B calls C, if B is very small it is not unusual for the 
+            compiler to have simply &#39;inlined&#39; the body of B into the body of A.&nbsp;&nbsp; In this 
+            case obviously B does not appear because in a very real sense B does not exist 
+            at the native code level.</li>
+        <li>Tail-calling.&nbsp;&nbsp; If the last thing method B does before returning is to call C, 
+            the compiler can do another optimization.&nbsp;&nbsp; Instead of calling C and then 
+            returning to A, B can simply jump to C.&nbsp;&nbsp;&nbsp; When C returns it will simply return 
+            to A directly.&nbsp;&nbsp;&nbsp; From a profiler&#39;s point of view, when the CPU is executing C, 
+            B has been removed from the stack and thus does not show up in the trace.&nbsp;&nbsp; Note 
+            also that B does not need to be small for this optimization to be beneficial.&nbsp; 
+            The only requirement is that calling C is the last thing that B does.&nbsp;&nbsp; </li>
+        <li>EBP Frame optimization.&nbsp; In 32 bit processes (64 bit processes don&#39;t use EBP 
+            Frames), the profiler is relying on the compiler to &#39;mark&#39; the call by emitting 
+            code at the be.g.ining of the method called the EBP Frame.&nbsp;&nbsp;&nbsp; If the comiler 
+            does not set up a frame at all and uses the EBP register for its on use it 
+            results in a <a href="#BrokenStacks">broken stack</a>.&nbsp;&nbsp; However even when the 
+            compiler is aware of the need to generate EBP Frames there is overhead in doing 
+            so (2 instructions at the beginning and end of the method.&nbsp;&nbsp; For small methods 
+            (too big to inline, but still small), the compiler can opt to simply omit the 
+            geneation of the frame (but LEAVE EBP unotuched).&nbsp;&nbsp; This results in a missing 
+            frame.&nbsp;&nbsp; It should be noted that that the EBP Frame that method sets up marks 
+            the CALLER, not itself.&nbsp;&nbsp; Thus if method B seems to be missing, it is not 
+            because B ommited its EBP frame but because method C did.&nbsp;&nbsp;&nbsp; Thus this kind of 
+            frame ommision happens when method C is small, not when B is small.&nbsp; </li>
+    </ol>
+    <p>
+        While missing frames can be confusing and thus slow down analysis, they rarely 
+        truely block it.&nbsp;&nbsp; Missing frames are the price paid&nbsp; for 
+        profiling unmodified code in a very low overhead way.&nbsp;&nbsp;&nbsp;&nbsp;
+    </p>
+    <hr />
+    <h2>
+        <a id="FAQ">Frequently Asked Questions (FAQ)</a></h2>
+    <ul>
+        <li><strong>How to I get rid of ? in node names (e.g. ntdll!?)?</strong>
+            <p>
+                PerfMonitor emits a ? for any program address that it can not resolve to a symbolic 
+                name.&nbsp;&nbsp;&nbsp; See<a href="#TroubleShootingSymbols"> troubleshooting 
+                Symbols</a> and <a href="#SymbolResolution">Symbol Resolution</a> for more.</p>
+        </li>
+        <li><strong>What are &#39;BROKEN&#39; stacks?&nbsp; What causes BROKEN stacks?</strong>
+            <p>
+                If the stack trace that is taken at data sample time does not terminate in OS 
+                DLL that starts threads, the stack is considered broken.&nbsp; See<a 
+                    href="#BrokenStacks"> Broken Stacks</a> for more.</p>
+        </li>
+        <li><strong>Stack frames seem to be missing.&nbsp; What is going on?</strong>
+            <p>
+                The algorithm used to crawl the stack is not perfect.&nbsp;&nbsp; In some cases 
+                there is not sufficient information on the stack to quickly find the caller.&nbsp;&nbsp; 
+                Also compilers perform inlining, tailcall and other optionations that literally 
+                remove the frame completely at runtime.&nbsp;&nbsp;&nbsp; The good news is that 
+                while sometimes confusing, it is usually pretty easy to fill in the gaps.&nbsp;&nbsp; 
+                See<a href="#MissingFrames"> Missing Frames</a> for more.</p>
+        </li>
+    </ul>
+    <p>
+        &nbsp;</p>
+    <p>
+        &nbsp;</p>
+    <p>
+        &nbsp;</p>
+    <p>
+        &nbsp;</p>
+    <p>
+        &nbsp;</p>
+    <p>
+        &nbsp;</p>
+    <p>
+        &nbsp;</p>
+<br />
+    <h2>
+    Appendix
+    </h2>
+    <h3>
+        <a name="CpuTestSource">Source Code for the CPUTest Example</a></h3>
+
+        <pre>
+/// This class is simply a example of a CPU bound computation.   It does it recurisively to 
+/// make the example more interesting.  The main entry point is the RecSpin routine.  
+class Spinner
+{
+    public static int aStatic = 0;
+
+    // Spin for 'timeSec' seconds.   We do only 1 second in this
+    // method, doing the rest in the helper.   
+    public static void RecSpin(int timeSec)
+    {
+        if (timeSec <= 0)
+            return;
+        --timeSec;
+        SpinForASecond();
+        RecSpinHelper(timeSec);
+    }
+
+    // RecSpinHelper is a clone of RecSpin.   It is repeated 
+    // to simulate mutual recursion (more interesting example)
+    static void RecSpinHelper(int timeSec)
+    {
+        if (timeSec <= 0)
+            return;
+        --timeSec;
+        SpinForASecond();
+        RecSpin(timeSec);
+    }
+
+    // SpingForASecond repeatedly calls DateTime.Now until for
+    // 1 second.  It also does some work of its own in this
+    // methods so we get some exclusive time to look at.  
+    static void SpinForASecond()
+    {
+        DateTime start = DateTime.Now;
+        for (; ; )
+        {
+            if ((DateTime.Now - start).TotalSeconds > 1)
+                break;
+
+            // Do some work in this routine as well.   
+            for (int i = 0; i < 10; i++)
+                aStatic += i;
+        }
+    }
+}
+        </pre>
 </body>
 
 </html>

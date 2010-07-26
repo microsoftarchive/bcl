@@ -18,6 +18,7 @@ Global
 		{B68F4968-A7CF-41CC-AD6E-373DB5E67944}.Debug|X86.ActiveCfg = Debug|Any CPU
 		{B68F4968-A7CF-41CC-AD6E-373DB5E67944}.Debug|X86.Build.0 = Debug|Any CPU
 		{B68F4968-A7CF-41CC-AD6E-373DB5E67944}.Release|X86.ActiveCfg = Release|Any CPU
+		{B68F4968-A7CF-41CC-AD6E-373DB5E67944}.Release|X86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

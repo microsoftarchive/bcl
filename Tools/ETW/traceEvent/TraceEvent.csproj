@@ -12,6 +12,7 @@
     <AssemblyName>TraceEvent</AssemblyName>
     <TargetFrameworkVersion>v3.5</TargetFrameworkVersion>
     <FileAlignment>512</FileAlignment>
+    <TargetFrameworkProfile />
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <DebugSymbols>true</DebugSymbols>
@@ -44,7 +45,6 @@
     <Compile Include="ClrTraceEventParser.cs" />
     <Compile Include="DynamicTraceEventParser.cs" />
     <Compile Include="ETWTraceEventSource.cs" />
-    <Compile Include="Stacks\FilterStacks.cs" />
     <Compile Include="Manifest.cs" />
     <Compile Include="Stacks\Stacks.cs" />
     <Compile Include="SymbolEventParser.cs" />

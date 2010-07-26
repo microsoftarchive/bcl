@@ -2,8 +2,8 @@
 /* This file is best viewed using outline mode (Ctrl-M Ctrl-O) */
 // This program uses code hyperlinks available as part of the HyperAddin Visual Studio plug-in.
 // It is available from http://www.codeplex.com/hyperAddin 
-/* */
-//#define DEBUG_SERIALIZE
+/* If you uncomment this line, log.serialize.xml and log.deserialize.xml are created, which allow debugging */ 
+// #define DEBUG_SERIALIZE
 using System;
 using System.Text;      // For StringBuilder.
 using System.IO;
@@ -330,9 +330,9 @@ namespace FastSerialization
     ///             begin with a code:Serializer.Tags.ForwardDefintion tag followed by a forward forwardReference
     ///             index which is being defined.
     ///         * code:Serializer.Tags.BeginObject tag
-    ///         * A forwardReference to the code:SerializationType for the object. This refernece CANNOT be a
+    ///         * A reference to the code:SerializationType for the object. This refernece CANNOT be a
     ///             forward forwardReference because its value is needed during the deserialization process before
-    ///             forward referneces are resolved.
+    ///             forward references are resolved.
     ///         * All the data that that objects 'code:IFastSerializable.ToStream methodIndex wrote. This is the
     ///             heart of the deserialized data, and the object itself has a lot of control over this
     ///             format.
@@ -365,7 +365,7 @@ namespace FastSerialization
     ///     the file are part of the serialization infratructure.  
     ///     
     /// Layout Synopsis
-    ///     * Signature representing code:Serializer format]
+    ///     * Signature representing code:Serializer format
     ///     * EntryObject (most of the rest of the file)
     ///         * BeginObject tag
     ///         * Type for This object (which is a object of type code:SerializationType)
@@ -503,10 +503,6 @@ namespace FastSerialization
                 Log("<Write Type=\"string\" Value=" + XmlUtilities.XmlQuote(value) + " StreamLabel=\"0x" + writer.GetLabel().ToString("x") + "\"/>");
 #endif
             writer.Write(value);
-        }
-        public void WriteInterned(string value)
-        {
-            
         }
 
         /// <summary>
@@ -806,10 +802,24 @@ namespace FastSerialization
             RegisterFactory(typeof(SerializationType), delegate { return new SerializationType(); });
 
             Log("<Deserialize>");
-            string sig = reader.ReadString();
-            if (sig != "!FastSerialization")
+            // We don't do this with ReadString() because it is a likely point of failure (a completely wrong file)
+            // and we want to not read garbage if we don't have to
+            var expectedSig = "!FastSerialization";
+            int sigLen = reader.ReadInt32();
+            if (sigLen != expectedSig.Length)
+                goto ThrowException;
+            for (int i = 0; i < sigLen; i++)
+                if (reader.ReadByte() != expectedSig[i])
+                    goto ThrowException;
+            return;
+            ThrowException:
                 throw new SerializationException("Not an ETLX file: " + streamName);
         }
+        /// <summary>
+        /// 
+        /// 
+        /// On by default.  
+        /// </summary>
         public bool AllowLazyDeserialization
         {
             get { return allowLazyDeserialization; }
@@ -1416,12 +1426,15 @@ namespace FastSerialization
         internal IDictionary<ForwardReference, IFastSerializable> unInitializedForwardReferences;
         internal List<StreamLabel> forwardReferenceDefinitions;
         internal bool allowLazyDeserialization;
+        /// <summary>
+        /// When we encounter a forward reference, we can either go to the forward reference table immediately and resolve it 
+        /// (deferForwardReferences == false), or simply remember that that position needs to be fixed up and continue with
+        /// the deserialization.   This later approach allows 'no seek' deserialization.   This variable which scheme we do. 
+        /// </summary>
         internal bool deferForwardReferences;
         private Dictionary<string, Func<IFastSerializable>> factories;
         Func<Type, IFastSerializable> defaultFactory;
         #endregion
-
-
         internal Func<IFastSerializable> GetFactory(string fullName)
         {
             Func<IFastSerializable> ret;
@@ -1452,6 +1465,7 @@ namespace FastSerialization
         }
     };
 
+    
     /// <summary>
     /// #DeferedRegionOverview. 
     /// 

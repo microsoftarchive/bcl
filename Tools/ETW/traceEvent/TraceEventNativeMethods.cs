@@ -620,7 +620,7 @@ namespace Diagnostics.Eventing
         internal extern static int StartTrace(
             [Out] out UInt64 sessionHandle,
             [In] string sessionName,
-            [In][Out] IntPtr properties);
+            EVENT_TRACE_PROPERTIES* properties);
 
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode), SuppressUnmanagedCodeSecurityAttribute]
         internal static extern int EnableTrace(
@@ -645,10 +645,10 @@ namespace Diagnostics.Eventing
 
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode), SuppressUnmanagedCodeSecurityAttribute]
         internal static extern int ControlTrace(
-            [In] UInt64 sessionHandle,
-            [In] string sessionName,
-            [In][Out] IntPtr properties,
-            [In] uint controlCode);
+            ulong sessionHandle,
+            string sessionName,
+            EVENT_TRACE_PROPERTIES* properties,
+            uint controlCode);
 
         #endregion // ETW tracing functions
 
@@ -675,7 +675,7 @@ namespace Diagnostics.Eventing
         [DllImport("KernelTraceControl.dll", CharSet = CharSet.Unicode), SuppressUnmanagedCodeSecurityAttribute]
         internal extern static int StartKernelTrace(
             out UInt64 TraceHandle,
-            IntPtr Properties,                                  // Actually a pointer to code:EVENT_TRACE_PROPERTIES
+            EVENT_TRACE_PROPERTIES* Properties,    
             STACK_TRACING_EVENT_ID* StackTracingEventIds,       // Actually an array of  code:STACK_TRACING_EVENT_ID
             int cStackTracingEventIds);
 
@@ -713,12 +713,62 @@ namespace Diagnostics.Eventing
         internal static uint TOKEN_ADJUST_SESSIONID = 0x0100;
         internal static uint TOKEN_READ = (STANDARD_RIGHTS_READ | TOKEN_QUERY);
 
+
+        public enum TOKEN_ELEVATION_TYPE
+        {
+            TokenElevationTypeDefault = 1,
+            TokenElevationTypeFull = 2,
+            TokenElevationTypeLimited = 3
+        }
+
+        public enum TOKEN_INFORMATION_CLASS
+        {
+            TokenUser = 1,
+            TokenGroups = 2,
+            TokenPrivileges = 3,
+            TokenOwner = 4,
+            TokenPrimaryGroup = 5,
+            TokenDefaultDacl = 6,
+            TokenSource = 7,
+            TokenType = 8,
+            TokenImpersonationLevel = 9,
+            TokenStatistics = 10,
+            TokenRestrictedSids = 11,
+            TokenSessionId = 12,
+            TokenGroupsAndPrivileges = 13,
+            TokenSessionReference = 14,
+            TokenSandBoxInert = 15,
+            TokenAuditPolicy = 16,
+            TokenOrigin = 17,
+            TokenElevationType = 18,
+            TokenLinkedToken = 19,
+            TokenElevation = 20,
+            TokenHasRestrictions = 21,
+            TokenAccessInformation = 22,
+            TokenVirtualizationAllowed = 23,
+            TokenVirtualizationEnabled = 24,
+            TokenIntegrityLevel = 25,
+            TokenUIAccess = 26,
+            TokenMandatoryPolicy = 27,
+            TokenLogonSid = 28,
+            MaxTokenInfoClass = 29  // MaxTokenInfoClass should always be the last enum
+        }
+
         [DllImport("advapi32.dll", SetLastError = true), SuppressUnmanagedCodeSecurityAttribute]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool OpenProcessToken(
             [In] IntPtr ProcessHandle,
             [In] UInt32 DesiredAccess,
             [Out] out IntPtr TokenHandle);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern bool GetTokenInformation(
+            IntPtr TokenHandle,
+            TOKEN_INFORMATION_CLASS TokenInformationClass,
+            IntPtr TokenInformation,
+            int TokenInformationLength,
+            out int ReturnLength);
 
         [DllImport("advapi32.dll", SetLastError = true), SuppressUnmanagedCodeSecurityAttribute]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -818,6 +868,27 @@ namespace Diagnostics.Eventing
             if (!success)
                 throw new Win32Exception();
 #endif
+        }
+
+        internal static bool? IsElevated() //= NULL )
+        {
+            if (Environment.OSVersion.Version.Major < 6)
+                return true;
+
+            Process process = Process.GetCurrentProcess();
+            IntPtr tokenHandle = IntPtr.Zero;
+            if (!OpenProcessToken(process.Handle, TOKEN_QUERY, out tokenHandle))
+                return null;
+
+            int tokenIsElevated = 0;
+            int retSize;
+            bool success = GetTokenInformation(tokenHandle, TOKEN_INFORMATION_CLASS.TokenElevation, (IntPtr) (&tokenIsElevated), 4, out retSize);
+            CloseHandle(tokenHandle);
+            if (!success)
+                return null;
+
+            GC.KeepAlive(process);                      // TODO get on SafeHandles. 
+            return tokenIsElevated != 0;
         }
 
         // TODO why do we need this? 

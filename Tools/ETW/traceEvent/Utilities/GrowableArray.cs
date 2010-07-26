@@ -50,7 +50,7 @@ namespace System.Collections.Generic
             {
                 if (value > arrayLength)
                 {
-                    if (value <= array.Length)
+                    if (array != null && value <= array.Length)
                     {
                         // Null out the entries.  
                         for (int i = arrayLength; i < value; i++)
@@ -59,13 +59,19 @@ namespace System.Collections.Generic
                     else
                     {
                         T[] newArray = new T[value];
-                        Array.Copy(array, newArray, array.Length);
+                        if (array !=  null)
+                            Array.Copy(array, newArray, array.Length);
                         array = newArray;
                     }
                 }
                 arrayLength = value;
             }
         }
+        public void Clear()
+        {
+            arrayLength = 0;
+        }
+
         /// <summary>
         /// Add an item at the end of the array, growing as necessary. 
         /// </summary>
@@ -73,8 +79,13 @@ namespace System.Collections.Generic
         public void Add(T item)
         {
             if (array == null || arrayLength >= array.Length)
-                Realloc();
+                Realloc(0);
             array[arrayLength++] = item;
+        }
+        public void AddRange(IEnumerable<T> items)
+        {
+            foreach (T item in items)
+                Add(item);
         }
         /// <summary>
         /// Insert 'item' directly at 'index', shifting all items >= index up.  'index' can be code:Count in
@@ -85,7 +96,7 @@ namespace System.Collections.Generic
             if ((uint)index > (uint)arrayLength)
                 throw new IndexOutOfRangeException();
             if (array == null || arrayLength >= array.Length)
-                Realloc();
+                Realloc(0);
 
             // Shift everything up to make room. 
             for (int idx = arrayLength; index < idx; --idx)
@@ -112,6 +123,51 @@ namespace System.Collections.Generic
 
             arrayLength = index;
         }
+        /// <summary>
+        /// Add 'count' null entries at the end of the list.  Useful to support 'autoexpand' arrays. 
+        /// </summary>
+        public void Expand(int count)
+        {
+            if (array == null || arrayLength + count >= array.Length)
+                Realloc(arrayLength + count);
+            else
+            {
+                while (count > 0)
+                {
+                    array[arrayLength++] = default(T);
+                    --count;
+                }
+            }
+            arrayLength += count;
+        }
+
+        // Support for stack-like operations 
+        public bool Empty { get { return arrayLength == 0; } } 
+        public T Pop()
+        {
+            T ret = array[arrayLength - 1];       // Will cause index out of range exception
+            --arrayLength;
+            return ret;
+        }
+        public T Top { get { return array[arrayLength - 1]; } }
+
+        /// <summary>
+        /// Trims the size of the array so that no more than 'maxWaste' slots are wasted.   Useful when
+        /// you know that the array has stopped growing.  
+        /// </summary>
+        public void Trim(int maxWaste)
+        {
+            if (array != null)
+            {
+                if (array.Length > arrayLength + maxWaste)
+                {
+                    T[] newArray = new T[arrayLength];
+                    Array.Copy(array, newArray, arrayLength);
+                    array = newArray;
+                }
+            }
+        }
+
         public override string ToString()
         {
             StringBuilder sb = new StringBuilder();
@@ -206,17 +262,21 @@ namespace System.Collections.Generic
             return false;
         }
         #region private
-        private void Realloc()
+        private void Realloc(int minSize)
         {
             if (array == null)
             {
-                array = new T[16];
+                if (minSize < 16)
+                    minSize = 16;
+                array = new T[minSize];
             }
             else
             {
-                int newLength = array.Length * 3 / 2 + 8;
-                T[] newArray = new T[newLength];
-                Array.Copy(array, newArray, array.Length);
+                int expandSize = array.Length * 3 / 2 + 8;
+                if (minSize < expandSize)
+                    minSize = expandSize;
+                T[] newArray = new T[minSize];
+                Array.Copy(array, newArray, arrayLength);
                 array = newArray;
             }
         }
@@ -290,7 +350,7 @@ namespace System.Collections.Generic
 #endif
         #endregion
 
-        // This allows 'foreach' to work.  
+        // This allows 'foreach' to work.  We are not a true IEnumerable however.  
         public GrowableArrayEnumerator GetEnumerator() { return new GrowableArrayEnumerator(this); }
         public struct GrowableArrayEnumerator
         {

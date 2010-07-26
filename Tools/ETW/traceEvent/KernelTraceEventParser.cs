@@ -39,42 +39,29 @@ namespace Diagnostics.Eventing
         public static Guid ProviderGuid = new Guid(unchecked((int)0x9e814aad), unchecked((short)0x3204), unchecked((short)0x11d2), 0x9a, 0x82, 0x00, 0x60, 0x08, 0xa8, 0x69, 0x39);
         /// <summary>
         /// This is passed to code:TraceEventSession.EnableKernelProvider to enable particular sets of
-        /// events. 
+        /// events.  See http://msdn.microsoft.com/en-us/library/aa363784(VS.85).aspx for more information on them 
         /// </summary>
         [Flags]
         public enum Keywords
         {
-            // These are available on XP and above 
             /// <summary>
             /// Logs nothing
             /// </summary>
             None = 0x00000000, // no tracing
-            /// <summary>
-            /// Logs process starts and stops.
-            /// </summary>
-            Process = 0x00000001,
-            /// <summary>
-            /// Logs threads starts and stops
-            /// </summary>
-            Thread = 0x00000002,
-            /// <summary>
-            /// Logs native modules loads (LoadLibrary), and unloads
-            /// </summary>
-            ImageLoad = 0x00000004, // image load
-            /* For 0x8 - 0x080 See code:#vistaOnly below */
 
+            // Part of the 'default set of keywords' (good value in most scenarios).  
+            /// <summary>
+            /// Logs the mapping of file IDs to actual (kernel) file names. 
+            /// </summary>
+            DiskFileIO = 0x00000200, 
             /// <summary>
             /// Loads the completion of Physical disk activity. 
             /// </summary>
             DiskIO = 0x00000100, // physical disk IO
             /// <summary>
-            /// Logs the mapping of file IDs to actual (kernel) file names. 
+            /// Logs native modules loads (LoadLibrary), and unloads
             /// </summary>
-            DiskFileIO = 0x00000200, // requires disk IO
-            /// <summary>
-            /// Logs all page faults (hard or soft)
-            /// </summary>
-            MemoryPageFaults = 0x00001000,
+            ImageLoad = 0x00000004, // image load
             /// <summary>
             /// Logs all page faults that must fetch the data from the disk (hard faults)
             /// </summary>
@@ -84,71 +71,111 @@ namespace Diagnostics.Eventing
             /// </summary>
             NetworkTCPIP = 0x00010000,
             /// <summary>
-            /// Logs activity to the windows registry. 
+            /// Logs process starts and stops.
             /// </summary>
-            Registry = 0x00020000, // registry calls
-
-            // #vistaOnly These are only available on Vista an above
+            Process = 0x00000001,
             /// <summary>
-            /// Logs process performance counters (TODO When?)
+            /// Logs process performance counters (TODO When?) (Vista+ only)
             /// see code:KernelTraceEventParser.ProcessPerfCtr, code:ProcessPerfCtrTraceData
             /// </summary>
             ProcessCounters = 0x00000008,
             /// <summary>
-            /// log thread context switches 
-            /// </summary>
-            ContextSwitch = 0x00000010,
-            /// <summary>
-            /// log defered procedure calls (an Kernel mechanism for having work done asynchronously)
-            /// </summary>
-            DeferedProcedureCalls = 0x00000020,
-            /// <summary>
-            /// log hardware interrupts. 
-            /// </summary>
-            Interrupt = 0x00000040,
-            /// <summary>
-            /// log calls to the OS
-            /// </summary>
-            SystemCall = 0x00000080,
-            /// <summary>
-            /// log Disk operations
-            /// </summary>
-            DiskIOInit = 0x00000400,
-            /// <summary>
-            /// Disk I/O that was split (eg because of mirroring requirements)
-            /// </summary>
-            SplitIO = 0x00200000,
-            Driver = 0x00800000,
-            /// <summary>
-            /// Sampled based profiling (every msec)
+            /// Sampled based profiling (every msec) (Vista+ only) (expect 1K events per proc per second)
             /// </summary>
             Profile = 0x01000000,
             /// <summary>
-            /// log file operations (even ones that do not actually cause Disk I/O).  
+            /// Logs threads starts and stops
             /// </summary>
-            FileIO = 0x02000000,
-            /// <summary>
-            /// log the start of the File I/O operation as well as the end. 
-            /// </summary>
-            FileIOInit = 0x04000000,
+            Thread = 0x00000002,
 
-            // Thes only work on Vista using the code:TraceEventNativeMethods.StartKernelTrace method
+            // These are useful in some situations, however are more volumous so are not part of the default set. 
             /// <summary>
-            /// Thread Dispatcher (ReadyThread)
+            /// log thread context switches (Vista only) (can be > 10K events per second)
+            /// </summary>
+            ContextSwitch = 0x00000010,
+            /// <summary>
+            /// log Disk operations (Vista+ only)
+            /// Generally not TOO volumous (typically less than 1K per second) (Stacks associated with this)
+            /// </summary>
+            DiskIOInit = 0x00000400,
+            /// <summary>
+            /// Thread Dispatcher (ReadyThread) (Vista+ only) (can be > 10K events per second)
             /// </summary>
             Dispatcher = 0x00000800,
             /// <summary>
-            /// Log Virutal Alloc calls and VirtualFree.  
+            /// log file operations when they complete (even ones that do not actually cause Disk I/O).  (Vista+ only)
+            /// Generally not TOO volumous (typically less than 1K per second) (No stacks associated with these)
             /// </summary>
+            FileIO = 0x02000000,
+            /// <summary>
+            /// log the start of the File I/O operation as well as the end. (Vista+ only)
+            /// Generally not TOO volumous (typically less than 1K per second)
+            /// </summary>
+            FileIOInit = 0x04000000,
+            /// <summary>
+            /// Logs all page faults (hard or soft)
+            /// Can be pretty volumous (> 1K per second)
+            /// </summary>
+            MemoryPageFaults = 0x00001000,
+            /// <summary>
+            /// Logs activity to the windows registry. 
+            /// Can be pretty volumous (> 1K per second)
+            /// </summary>
+            Registry = 0x00020000, // registry calls
+            /// <summary>
+            /// log calls to the OS (Vista+ only)
+            /// This is VERY volumous (can be > 100K events per second)
+            /// </summary>
+            SystemCall = 0x00000080,
+            /// <summary>
+            /// Log Virtual Alloc calls and VirtualFree.   (Vista+ Only)
+            /// Generally not TOO volumous (typically less than 1K per second)
+            /// </summary> 
             VirtualAlloc = 0x004000,
+
+            // advanced logging (when you care about the internals of the OS)
+            /// <summary>
+            /// Logs Advanced Local Procedure call events. 
+            /// </summary>
+            AdvancedLocalProcedureCalls  = 0x00100000,
+            /// <summary>
+            /// log defered procedure calls (an Kernel mechanism for having work done asynchronously) (Vista+ only)
+            /// </summary> 
+            DeferedProcedureCalls = 0x00000020,
+            /// <summary>
+            /// Device Driver logging (Vista+ only)
+            /// </summary>
+            Driver = 0x00800000,
+            /// <summary>
+            /// log hardware interrupts. (Vista+ only)
+            /// </summary>
+            Interrupt = 0x00000040,
+            /// <summary>
+            /// Disk I/O that was split (eg because of mirroring requirements) (Vista+ only)
+            /// </summary> 
+            SplitIO = 0x00200000,
 
             /// <summary>
             /// Good default kernel flags.  (TODO more detail)
             /// </summary>  
-            Default = Process | Thread | ImageLoad | DiskIO | DiskFileIO | NetworkTCPIP | MemoryHardFaults | ProcessCounters | Profile,
-            All = Default | DeferedProcedureCalls | Interrupt | SystemCall | DiskIOInit | SplitIO | Driver | FileIO | FileIOInit | ContextSwitch,
+            Default = DiskIO | DiskFileIO | ImageLoad | MemoryHardFaults | NetworkTCPIP | Process | ProcessCounters | Profile | Thread,
+            /// <summary>
+            /// These events are too verbose for normal use, but this give you a quick way of turing on 'interesting' events
+            /// This does not include SystemCall because it is 'too verbose'
+            /// </summary>
+            Verbose = Default | ContextSwitch | DiskIOInit | Dispatcher | FileIO | FileIOInit | MemoryPageFaults | Registry | VirtualAlloc,  // use as needed
+            /// <summary>
+            /// You mostly don't care about these unless you are dealing with OS internals.  
+            /// </summary>
+            OS = AdvancedLocalProcedureCalls | DeferedProcedureCalls | Driver | Interrupt | SplitIO,
+            /// <summary>
+            /// All legal kernel events
+            /// </summary>
+            All = Verbose | ContextSwitch | DiskIOInit | Dispatcher | FileIO | FileIOInit | MemoryPageFaults | Registry | VirtualAlloc  // use as needed
+                | SystemCall        // Interesting but very expensive. 
+                | OS,
         };
-        
+
         public KernelTraceEventParser(TraceEventSource source)
             : base(source)
         {
@@ -2034,7 +2061,6 @@ namespace Diagnostics.Eventing
                 throw new Exception("Not supported");
             }
         }
-
         // Added by hand. 
         public event Action<VirtualAllocTraceData> VirtualAlloc
         {
@@ -2088,7 +2114,7 @@ namespace Diagnostics.Eventing
         {
             get
             {
-                KernelTraceEventParserState ret = (KernelTraceEventParserState) StateObject;
+                KernelTraceEventParserState ret = (KernelTraceEventParserState)StateObject;
                 if (ret == null)
                 {
                     ret = new KernelTraceEventParserState();
@@ -2193,7 +2219,7 @@ namespace Diagnostics.Eventing
         private static extern uint QueryDosDevice(string lpDeviceName, StringBuilder lpTargetPath, int ucchMax);
         [DllImport("kernel32.dll", SetLastError = true), SuppressUnmanagedCodeSecurityAttribute]
         private static extern int GetLogicalDrives();
- 
+
         private void InitializeKernelNameMap()
         {
 #if !NEW
@@ -2569,7 +2595,7 @@ namespace Diagnostics.Eventing
         // public int ProcessID { get { if (Version >= 1) return GetInt32At(HostOffset(4, 1)); return (int) GetHostPointer(0); } }
         public int ParentID { get { if (Version >= 1) return GetInt32At(HostOffset(8, 1)); return (int)GetHostPointer(HostOffset(4, 1)); } }
         // Skipping UserSID
-        public string KernelImageFileName { get { if (Version >= 1) return GetAsciiStringAt(SkipSID((Version >= 3) ? HostOffset(24, 2):HostOffset(20,1))); return GetAsciiStringAt(SkipSID(HostOffset(8, 2))); } }
+        public string KernelImageFileName { get { if (Version >= 1) return GetAsciiStringAt(SkipSID((Version >= 3) ? HostOffset(24, 2) : HostOffset(20, 1))); return GetAsciiStringAt(SkipSID(HostOffset(8, 2))); } }
         public string ImageFileName { get { return state.KernelToUser(KernelImageFileName); } }
 
         public Address DirectoryTableBase { get { if (Version >= 3) return GetHostPointer(HostOffset(20, 1)); return 0; } }
@@ -4273,12 +4299,12 @@ namespace Diagnostics.Eventing
         internal FileIoCreateTraceData(Action<FileIoCreateTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
             : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
         {
+            this.FixupETLData = FixupData;
             this.Action = action;
             this.state = state;
         }
         protected internal override void Dispatch()
         {
-            Debug.Assert(GetInt32At(HostOffset(4, 1)) == ThreadID);
             Debug.Assert(!(Version == 2 && EventDataLength != SkipUnicodeString(HostOffset(24, 3))));
             Debug.Assert(!(Version > 2 && EventDataLength < SkipUnicodeString(HostOffset(24, 3))));
             Action(this);
@@ -4328,6 +4354,11 @@ namespace Diagnostics.Eventing
             }
         }
 
+        private unsafe void FixupData()
+        {
+            Debug.Assert(eventRecord->EventHeader.ThreadId == -1 || eventRecord->EventHeader.ThreadId == GetInt32At(HostOffset(4, 1)));
+            eventRecord->EventHeader.ThreadId = GetInt32At(HostOffset(4, 1));
+        }
         private event Action<FileIoCreateTraceData> Action;
         private KernelTraceEventParserState state;
         #endregion
@@ -4345,12 +4376,12 @@ namespace Diagnostics.Eventing
         internal FileIoSimpleOpTraceData(Action<FileIoSimpleOpTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
             : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
         {
+            this.FixupETLData = FixupData;
             this.Action = action;
             this.state = state;
         }
         protected internal override void Dispatch()
         {
-            Debug.Assert(GetInt32At(HostOffset(4, 1)) == ThreadID);
             Debug.Assert(!(Version == 2 && EventDataLength != HostOffset(16, 4)));
             Debug.Assert(!(Version > 2 && EventDataLength < HostOffset(16, 4)));
             Action(this);
@@ -4391,6 +4422,12 @@ namespace Diagnostics.Eventing
             }
         }
 
+        private unsafe void FixupData()
+        {
+            Debug.Assert(eventRecord->EventHeader.ThreadId == -1 || eventRecord->EventHeader.ThreadId == GetInt32At(HostOffset(4, 1)));
+            eventRecord->EventHeader.ThreadId = GetInt32At(HostOffset(4, 1));
+        }
+
         private event Action<FileIoSimpleOpTraceData> Action;
         private KernelTraceEventParserState state;
         #endregion
@@ -4411,12 +4448,12 @@ namespace Diagnostics.Eventing
         internal FileIoReadWriteTraceData(Action<FileIoReadWriteTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
             : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
         {
+            this.FixupETLData = FixupData;
             this.Action = action;
             this.state = state;
         }
         protected internal override void Dispatch()
         {
-            Debug.Assert(GetInt32At(HostOffset(4, 1)) == ThreadID);
             Debug.Assert(!(Version == 2 && EventDataLength != HostOffset(32, 4)));
             Debug.Assert(!(Version > 2 && EventDataLength < HostOffset(32, 4)));
             Action(this);
@@ -4466,6 +4503,11 @@ namespace Diagnostics.Eventing
             }
         }
 
+        private unsafe void FixupData()
+        {
+            Debug.Assert(eventRecord->EventHeader.ThreadId == -1 || eventRecord->EventHeader.ThreadId == GetInt32At(HostOffset(4, 1)));
+            eventRecord->EventHeader.ThreadId = GetInt32At(HostOffset(4, 1));
+        }
         private event Action<FileIoReadWriteTraceData> Action;
         private KernelTraceEventParserState state;
         #endregion
@@ -4485,12 +4527,12 @@ namespace Diagnostics.Eventing
         internal FileIoInfoTraceData(Action<FileIoInfoTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
             : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
         {
+            this.FixupETLData = FixupData;
             this.Action = action;
             this.state = state;
         }
         protected internal override void Dispatch()
         {
-            Debug.Assert(GetInt32At(HostOffset(4, 1)) == ThreadID);
             Debug.Assert(!(Version == 2 && EventDataLength != HostOffset(24, 5)));
             Debug.Assert(!(Version > 2 && EventDataLength < HostOffset(24, 5)));
             Action(this);
@@ -4536,7 +4578,11 @@ namespace Diagnostics.Eventing
                     return null;
             }
         }
-
+        private unsafe void FixupData()
+        {
+            Debug.Assert(eventRecord->EventHeader.ThreadId == -1 || eventRecord->EventHeader.ThreadId == GetInt32At(HostOffset(4, 1)));
+            eventRecord->EventHeader.ThreadId = GetInt32At(HostOffset(4, 1));
+        }
         private event Action<FileIoInfoTraceData> Action;
         private KernelTraceEventParserState state;
         #endregion
@@ -4557,12 +4603,12 @@ namespace Diagnostics.Eventing
         internal FileIoDirEnumTraceData(Action<FileIoDirEnumTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
             : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
         {
+            this.FixupETLData = FixupData;
             this.Action = action;
             this.state = state;
         }
         protected internal override void Dispatch()
         {
-            Debug.Assert(GetInt32At(HostOffset(4, 1)) == ThreadID);
             Debug.Assert(!(Version == 2 && EventDataLength != SkipUnicodeString(HostOffset(28, 4))));
             Debug.Assert(!(Version > 2 && EventDataLength < SkipUnicodeString(HostOffset(28, 4))));
             Action(this);
@@ -4613,6 +4659,12 @@ namespace Diagnostics.Eventing
                     Debug.Assert(false, "Bad field index");
                     return null;
             }
+        }
+
+        private unsafe void FixupData()
+        {
+            Debug.Assert(eventRecord->EventHeader.ThreadId == -1 || eventRecord->EventHeader.ThreadId == GetInt32At(HostOffset(4, 1)));
+            eventRecord->EventHeader.ThreadId = GetInt32At(HostOffset(4, 1));
         }
 
         private event Action<FileIoDirEnumTraceData> Action;
@@ -6164,7 +6216,6 @@ namespace Diagnostics.Eventing
         /// Each sample may represent mulitiple instances of samples with the same Instruction
         /// Pointer and ThreadID.  
         /// </summary>
-        /// <param name="i"></param>
         /// <returns></returns>
         public int InstanceCount(int i)
         {
@@ -7770,9 +7821,9 @@ namespace Diagnostics.Eventing
         };
 
         public Address BaseAddr { get { return GetHostPointer(0); } }
-        public int Length { get { return GetInt32At(HostOffset(4, 1)); } }
+        public long Length { get { return (long) GetHostPointer(HostOffset(4, 1)); } }
         // Process ID is next (we fix it up). 
-        public VirtualAllocFlags Flags { get { return (VirtualAllocFlags)GetInt32At(HostOffset(0xC, 1)); } }
+        public VirtualAllocFlags Flags { get { return (VirtualAllocFlags)GetInt32At(HostOffset(0xC, 2)); } }
 
         #region Private
         internal VirtualAllocTraceData(Action<VirtualAllocTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
@@ -7784,14 +7835,14 @@ namespace Diagnostics.Eventing
         }
         protected internal override void Dispatch()
         {
-            Debug.Assert(EventDataLength == HostOffset(0x10, 1), "Unexpected data length");
-            Action(this);
+            Debug.Assert(EventDataLength == HostOffset(0x10, 2), "Unexpected data length");
+            Action(this);   
         }
 
         private unsafe void FixupData()
         {
             Debug.Assert(eventRecord->EventHeader.ProcessId == -1);
-            eventRecord->EventHeader.ProcessId = GetInt32At(HostOffset(8, 1));
+            eventRecord->EventHeader.ProcessId = GetInt32At(HostOffset(8, 2));
         }
         public override StringBuilder ToXml(StringBuilder sb)
         {
@@ -7831,6 +7882,7 @@ namespace Diagnostics.Eventing
         #endregion
     }
 
+
     public sealed class ReadyThreadTraceData : TraceEvent
     {
         public enum AdjustReasonEnum
@@ -7840,7 +7892,7 @@ namespace Diagnostics.Eventing
             Boost = 2,
         };
 
-        // Thread ID is at offset 0 (we fix it up
+        // Thread ID is at offset 0 (we fix it up)
         public AdjustReasonEnum AdjustReason { get { return (AdjustReasonEnum)GetByteAt(4); } }
         public int AdjustIncrement { get { return GetByteAt(5); } }
         public bool ExecutingDpc { get { return GetByteAt(6) != 0; } }
@@ -7910,7 +7962,7 @@ namespace Diagnostics.Eventing
     {
         public static string ProviderName = "ThreadPool";
         public static Guid ProviderGuid = new Guid(unchecked((int)0xc861d0e2), unchecked((short)0xa2c1), unchecked((short)0x4d36), 0x9f, 0x9c, 0x97, 0x0b, 0xab, 0x94, 0x3a, 0x12);
-        public ThreadPoolTraceEventParser(TraceEventSource source) :base(source) {}
+        public ThreadPoolTraceEventParser(TraceEventSource source) : base(source) { }
 
         public event Action<TPCBEnqueueTraceData> ThreadPoolTraceCBEnqueue
         {
@@ -8336,7 +8388,7 @@ namespace Diagnostics.Eventing
     {
         public static string ProviderName = "HeapTraceProvider";
         public static Guid ProviderGuid = new Guid(unchecked((int)0x222962ab), unchecked((short)0x6180), unchecked((short)0x4b88), 0xa8, 0x25, 0x34, 0x6b, 0x75, 0xf2, 0xa2, 0x4a);
-        public HeapTraceProviderTraceEventParser(TraceEventSource source) : base(source) {}
+        public HeapTraceProviderTraceEventParser(TraceEventSource source) : base(source) { }
 
         public event Action<HeapCreateTraceData> HeapTraceCreate
         {
@@ -9035,7 +9087,7 @@ namespace Diagnostics.Eventing
     {
         public static string ProviderName = "CritSecTraceProvider";
         public static Guid ProviderGuid = new Guid(unchecked((int)0x3ac66736), unchecked((short)0xcc59), unchecked((short)0x4cff), 0x81, 0x15, 0x8d, 0xf5, 0x0e, 0x39, 0x81, 0x6b);
-        public CritSecTraceProviderTraceEventParser(TraceEventSource source) : base(source) {}
+        public CritSecTraceProviderTraceEventParser(TraceEventSource source) : base(source) { }
 
         public event Action<CritSecCollisionTraceData> CritSecTraceCollision
         {
