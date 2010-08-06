@@ -105,7 +105,7 @@ namespace Diagnostics.Eventing
             this.m_FileName = new string((char*)(((byte*)properties) + properties->LogFileNameOffset));
             this.m_BufferSizeMB = (int)properties->MinimumBuffers;
             if ((properties->LogFileMode & TraceEventNativeMethods.EVENT_TRACE_FILE_MODE_CIRCULAR) != 0)
-                m_CircularBufferMB = (int) properties->MaximumFileSize;
+                m_CircularBufferMB = (int)properties->MaximumFileSize;
         }
         public bool EnableKernelProvider(KernelTraceEventParser.Keywords flags)
         {
@@ -825,7 +825,7 @@ namespace Diagnostics.Eventing
             char* sessionNamePtr = (char*)(((byte*)properties) + properties->LoggerNameOffset);
             CopyStringToPtr(sessionNamePtr, m_SessionName);
 
-            properties->Wnode.BufferSize = (uint) PropertiesSize;
+            properties->Wnode.BufferSize = (uint)PropertiesSize;
             properties->Wnode.Flags = TraceEventNativeMethods.WNODE_FLAG_TRACED_GUID;
             properties->LoggerNameOffset = (uint)sizeof(TraceEventNativeMethods.EVENT_TRACE_PROPERTIES);
             properties->LogFileNameOffset = properties->LoggerNameOffset + MaxNameSize * sizeof(char);
@@ -843,19 +843,17 @@ namespace Diagnostics.Eventing
                     throw new ArgumentException("File name too long", "fileName");
                 char* fileNamePtr = (char*)(((byte*)properties) + properties->LogFileNameOffset);
                 CopyStringToPtr(fileNamePtr, m_FileName);
-                properties->LogFileMode = TraceEventNativeMethods.EVENT_TRACE_FILE_MODE_SEQUENTIAL;
+                if (m_CircularBufferMB == 0)
+                {
+                    properties->LogFileMode |= TraceEventNativeMethods.EVENT_TRACE_FILE_MODE_SEQUENTIAL;
+                }
+                else
+                {
+                    properties->LogFileMode |= TraceEventNativeMethods.EVENT_TRACE_FILE_MODE_CIRCULAR;
+                    properties->MaximumFileSize = (uint)m_CircularBufferMB;
+                }
             }
 
-            if (m_CircularBufferMB == 0)
-            {
-                properties->LogFileMode = TraceEventNativeMethods.EVENT_TRACE_FILE_MODE_SEQUENTIAL;
-                properties->MaximumFileSize = 0;     // This means infinite size. 
-            }
-            else
-            {
-                properties->LogFileMode = TraceEventNativeMethods.EVENT_TRACE_FILE_MODE_CIRCULAR;
-                properties->MaximumFileSize = (uint)m_CircularBufferMB;
-            }
             properties->MinimumBuffers = (uint)m_BufferSizeMB;
             properties->MaximumBuffers = (uint)(m_BufferSizeMB * 4);
 
@@ -868,10 +866,10 @@ namespace Diagnostics.Eventing
             fixed (char* fromPtr = str)
             {
                 int i = 0;
-                while(i < str.Length)
+                while (i < str.Length)
                 {
                     toPtr[i] = fromPtr[i];
-                     i++;
+                    i++;
                 }
                 toPtr[i] = '\0';   // Null terminate
             }
