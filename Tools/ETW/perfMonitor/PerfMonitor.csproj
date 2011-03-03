@@ -10,7 +10,8 @@
     <AppDesignerFolder>Properties</AppDesignerFolder>
     <RootNamespace>PerfMonitor</RootNamespace>
     <AssemblyName>PerfMonitor</AssemblyName>
-    <TargetFrameworkVersion>v3.5</TargetFrameworkVersion>
+    <TargetFrameworkVersion>v4.0</TargetFrameworkVersion>
+    <TargetFrameworkProfile />
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|x86' ">
     <DebugSymbols>true</DebugSymbols>
@@ -65,17 +66,17 @@
     </ProjectReference>
   </ItemGroup>
   <ItemGroup>
-    <EmbeddedResource Include="..\TraceEvent\SupportDlls\dbghelp.dll">
+    <EmbeddedResource Include="..\TraceEvent\SupportDlls\x86\dbghelp.dll">
       <Type>Non-Resx</Type>
       <WithCulture>false</WithCulture>
       <LogicalName>.\dbghelp.dll</LogicalName>
     </EmbeddedResource>
-    <EmbeddedResource Include="..\TraceEvent\SupportDlls\symsrv.dll">
+    <EmbeddedResource Include="..\TraceEvent\SupportDlls\x86\symsrv.dll">
       <Type>Non-Resx</Type>
       <WithCulture>false</WithCulture>
       <LogicalName>.\symsrv.dll</LogicalName>
     </EmbeddedResource>
-    <EmbeddedResource Include="..\TraceEvent\SupportDlls\KernelTraceControl.dll">
+    <EmbeddedResource Include="..\TraceEvent\SupportDlls\x86\KernelTraceControl.dll">
       <Type>Non-Resx</Type>
       <WithCulture>false</WithCulture>
       <LogicalName>.\KernelTraceControl.dll</LogicalName>

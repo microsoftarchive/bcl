@@ -1,3 +1,3 @@
-.\prepareUpload perfMonitor TraceEvent /RemoveFromBin=*.pdb,*.dll,*.xml
+.\prepareUpload perfMonitor /RemoveFromBin=*.pdb,*.dll,*.xml
 .\prepareUpload TraceEvent 
 

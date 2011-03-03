@@ -107,6 +107,18 @@ namespace Diagnostics.Eventing
             if ((properties->LogFileMode & TraceEventNativeMethods.EVENT_TRACE_FILE_MODE_CIRCULAR) != 0)
                 m_CircularBufferMB = (int)properties->MaximumFileSize;
         }
+
+        /// <summary>
+        /// Start a kernel session (name is required to be NT Kernel Logger) and turn on 'eventsToEnable' events 
+        /// and 'eventStacksToEnable' stacks.  
+        /// </summary>
+        public TraceEventSession(string fileName, 
+            KernelTraceEventParser.Keywords eventsToEnable, 
+            KernelTraceEventParser.Keywords eventStacksToEnable) : this(KernelTraceEventParser.KernelSessionName, fileName)
+        {
+            EnableKernelProvider(eventsToEnable, eventStacksToEnable);
+        }
+
         public bool EnableKernelProvider(KernelTraceEventParser.Keywords flags)
         {
             return EnableKernelProvider(flags, KernelTraceEventParser.Keywords.None);
@@ -126,6 +138,8 @@ namespace Diagnostics.Eventing
                 throw new Exception("Cannot enable kernel events to a real time session unless it is named " + KernelTraceEventParser.KernelSessionName);
             if (m_SessionHandle != TraceEventNativeMethods.INVALID_HANDLE_VALUE)
                 throw new Exception("The kernel provider must be enabled as the only provider.");
+            if (Environment.OSVersion.Version.Major < 6)
+                throw new NotSupportedException("Kernel Event Tracing is only supported on Windows 6.0 (Vista) and above.");
 
             var propertiesBuff = stackalloc byte[PropertiesSize];
             var properties = GetProperties(propertiesBuff);
@@ -156,6 +170,7 @@ namespace Diagnostics.Eventing
                 {
                     ret = true;
                     Stop();
+                    m_Stopped = false;
                     Thread.Sleep(100);  // Give it some time to stop. 
                     dwErr = TraceEventNativeMethods.StartKernelTrace(out m_SessionHandle, properties, stackTracingIds, numIDs);
                 }
@@ -292,18 +307,6 @@ namespace Diagnostics.Eventing
         /// </summary>
         public bool StopOnDispose { get { return m_StopOnDispose; } set { m_StopOnDispose = value; } }
         /// <summary>
-        /// Stop the user and kernel mode session, ignoring errors.
-        /// </summary>
-        /// <param name="userModeSessionName"></param>
-        [Obsolete("Use Stop(noThrow) on kernel and user mode session explicitly.")]
-        public static void StopUserAndKernelSession(string userModeSessionName)
-        {
-            try { new TraceEventSession(userModeSessionName).Stop(true); }
-            catch (Exception) { }
-            try { new TraceEventSession(KernelTraceEventParser.KernelSessionName).Stop(true); }
-            catch (Exception) { }
-        }
-        /// <summary>
         /// The name of the session that can be used by other threads to attach to the session. 
         /// </summary>
         public string SessionName
@@ -390,31 +393,33 @@ namespace Diagnostics.Eventing
         }
         /// <summary>
         /// This variation of the Merge command takes the 'primary' etl file name (X.etl)
-        /// and will merge in any files of the form X.*.etl and update the X.etl file to
-        /// be the merged file (deleting the others)
+        /// and will merge in any files that match the list of file pattern in 'suffixPats'
+        /// By default this list is .clr*.etl .user*.etl. and .kernel.etl.  
         /// </summary>
-        public static void MergeInPlace(string etlFileName)
+        public static void MergeInPlace(string etlFileName, List<String> suffixPats = null)
         {
+            if (suffixPats == null)
+                suffixPats = new List<string>() { ".clr*.etl", "user*.etl", ".kernel.etl" };
+
+            var dir = Path.GetDirectoryName(etlFileName);
+            if (dir.Length == 0)
+                dir = ".";
+            var baseName = Path.GetFileNameWithoutExtension(etlFileName);
+            List<string> mergeInputs = new List<string>();
+            mergeInputs.Add(etlFileName);
+
+            foreach(var suffixPat in suffixPats)
+                mergeInputs.AddRange(Directory.GetFiles(dir, baseName + suffixPat));
+                
             string tempName = Path.ChangeExtension(etlFileName, ".etl.new");
             try
             {
-                string fileBaseName = Path.GetFileNameWithoutExtension(etlFileName);
-                string dir = Path.GetDirectoryName(etlFileName);
-                if (dir.Length == 0)
-                    dir = ".";
-                string[] additionalLogFiles = Directory.GetFiles(dir, fileBaseName + ".*.etl");
-
-                string[] mergeInputs = new string[additionalLogFiles.Length + 1];
-                mergeInputs[0] = etlFileName;
-                Array.Copy(additionalLogFiles, 0, mergeInputs, 1, additionalLogFiles.Length);
-
                 // Do the merge;
-                Merge(mergeInputs, tempName);
+                Merge(mergeInputs.ToArray(), tempName);
 
                 // Delete the originals.  
-                foreach (var additionalLogFile in additionalLogFiles)
-                    File.Delete(additionalLogFile);
-                File.Delete(etlFileName);
+                foreach (var mergeInput in mergeInputs)
+                    File.Delete(mergeInput);
 
                 // Place the output in its final resting place.  
                 File.Move(tempName, etlFileName);
@@ -803,6 +808,7 @@ namespace Diagnostics.Eventing
             {
                 ret = true;
                 Stop();
+                m_Stopped = false;
                 Thread.Sleep(100);  // Give it some time to stop. 
                 retCode = TraceEventNativeMethods.StartTrace(out m_SessionHandle, m_SessionName, properties);
             }

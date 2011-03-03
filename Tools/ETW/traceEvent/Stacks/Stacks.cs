@@ -1,3 +1,5 @@
+#define TOSTRING_FTNS
+
 // Copyright (c) Microsoft Corporation.  All rights reserved
 // This file is best viewed using outline mode (Ctrl-M Ctrl-O)
 //
@@ -17,6 +19,8 @@ namespace Stacks
     /// </summary>    
     public abstract class StackSource : StackSourceStacks
     {
+        // Generate the samples.  The callback will be called for each sample.   The callback is not allowed to modify the sample
+        // and can not cache the sample past the return of the callback (we reuse the StackSourceSample on each call)
         public abstract void ProduceSamples(Action<StackSourceSample> callback);
 
         // These are optional
@@ -27,11 +31,13 @@ namespace Stacks
         // TODO does this belong on StackSourceStacks?
         public virtual StackSource BaseStackSource { get { return this; } }
         /// <summary>
-        /// If this source supports fetching the samples by index, this is how you get it.  
+        /// If this source supports fetching the samples by index, this is how you get it.  Like ProduceSamples the sample that
+        /// is returned is not allowed to be modified.   Also the returned sample will become invalid the next time GetSampleIndex
+        /// is called (we reuse the StackSourceSample on each call)
         /// </summary>
         public virtual StackSourceSample GetSampleByIndex(StackSourceSampleIndex sampleIndex) { return null; }
-        public virtual int MaxSampleIndex { get { return 0; } }
-        public virtual double MaxSampleTimeRelMSec { get { return 0; } }
+        public virtual int SampleIndexLimit { get { return 0; } }
+        public virtual double SampleTimeRelMSecLimit { get { return 0; } }
     }
 
     /// <summary>
@@ -78,13 +84,24 @@ namespace Stacks
         /// <summary>
         /// all StackSourceCallStackIndex are guarenteed to be less than this.  Allocate an array of this size to associate side information
         /// </summary>
-        public abstract int MaxCallStackIndex { get; }
+        public abstract int CallStackIndexLimit { get; }
         /// <summary>
         /// all StackSourceFrameIndex are guarenteed to be less than this.  Allocate an array of this size to associate side information
         /// </summary>
-        public abstract int MaxCallFrameIndex { get; }
+        public abstract int CallFrameIndexLimit { get; }
 
-#if DEBUG
+        public int StackDepth(StackSourceCallStackIndex callStackIndex)
+        {
+            int ret = 0;
+            while (callStackIndex != StackSourceCallStackIndex.Invalid)
+            {
+                callStackIndex = GetCallerIndex(callStackIndex);
+                ret++;
+            }
+            return ret;
+        }
+
+#if TOSTRING_FTNS
         // For debugging. 
         public string ToString(StackSourceSample sample)
         {
@@ -92,6 +109,7 @@ namespace Stacks
             sb.Append("<StackSourceSample");
             sb.Append(" Metric=\"").Append(sample.Metric.ToString("f1")).Append('"');
             sb.Append(" TimeRelMSec=\"").Append(sample.TimeRelMSec.ToString("f3")).Append('"');
+            sb.Append(" SampleIndex=\"").Append(sample.SampleIndex.ToString()).Append('"');
             sb.Append(">").AppendLine();
             sb.AppendLine(ToString(sample.StackIndex));
             sb.Append("</StackSourceSample>");
@@ -103,7 +121,7 @@ namespace Stacks
             sb.Append(" <CallStack Index =\"").Append((int)callStackIndex).Append("\">").AppendLine();
             for (int i = 0; callStackIndex != StackSourceCallStackIndex.Invalid; i++)
             {
-                if (i >= 100)
+                if (i >= 300)
                 {
                     sb.AppendLine("  <Truncated/>");
                     break;
@@ -140,9 +158,21 @@ namespace Stacks
         public StackSourceSampleIndex SampleIndex { get; set; }  // This identifies the sample uniquely in the source.  
         public double TimeRelMSec { get; set; }
 
+#if TOSTRING_FTNS
+        public override string ToString()
+        {
+            return String.Format("<Sample Metric=\"{0:f1}\" TimeRelMSec=\"{1:f3}\" StackIndex=\"{2}\" SampleIndex=\"{3}\">", 
+                Metric, TimeRelMSec, StackIndex, SampleIndex);
+        }
+        public string ToString(StackSource source)
+        {
+            return source.ToString(this);
+        }
+#endif
+
         #region protected
         public StackSourceSample(StackSourceStacks source) { SampleIndex = StackSourceSampleIndex.Invalid; }
-        internal protected StackSourceSample(StackSourceSample template)
+        public StackSourceSample(StackSourceSample template)
         {
             StackIndex = template.StackIndex;
             Metric = template.Metric;
@@ -199,8 +229,8 @@ namespace Stacks
                 var sampleCopy = new StackSourceSample(sample);
                 sampleCopy.SampleIndex = (StackSourceSampleIndex)m_samples.Count;
                 m_samples.Add(sampleCopy);
-                if (sampleCopy.TimeRelMSec > m_maxSampleTimeRelMSec)
-                    m_maxSampleTimeRelMSec = sampleCopy.TimeRelMSec;
+                if (sampleCopy.TimeRelMSec > m_sampleTimeRelMSecLimit)
+                    m_sampleTimeRelMSecLimit = sampleCopy.TimeRelMSec;
             });
         }
 
@@ -210,12 +240,12 @@ namespace Stacks
         {
             return m_samples[(int)sampleIndex];
         }
-        public override int MaxSampleIndex
+        public override int SampleIndexLimit
         {
             get { return m_samples.Count; }
         }
 
-        public override double MaxSampleTimeRelMSec { get { return m_maxSampleTimeRelMSec; } }
+        public override double SampleTimeRelMSecLimit { get { return m_sampleTimeRelMSecLimit; } }
         public override void ProduceSamples(Action<StackSourceSample> callback)
         {
             for (int i = 0; i < m_samples.Count; i++)
@@ -234,58 +264,54 @@ namespace Stacks
             return m_source.GetFrameName(frameIndex, fullModulePath);
         }
 
-        public override int MaxCallStackIndex
+        public override int CallStackIndexLimit
         {
-            get { if (m_source == null) return 0; return m_source.MaxCallStackIndex; }
+            get { if (m_source == null) return 0; return m_source.CallStackIndexLimit; }
         }
-        public override int MaxCallFrameIndex
+        public override int CallFrameIndexLimit
         {
-            get { if (m_source == null) return 0; return m_source.MaxCallFrameIndex; }
+            get { if (m_source == null) return 0; return m_source.CallFrameIndexLimit; }
         }
 
         #region private
         protected GrowableArray<StackSourceSample> m_samples;
-        protected double m_maxSampleTimeRelMSec;
+        protected double m_sampleTimeRelMSecLimit;
         protected StackSource m_source;
         #endregion
     }
 
     /// <summary>
     /// Like CopyStackSource InternStackSource copies the samples. however unlike CopyStackSource
-    /// InternStackSource copies all the information in the stacks too (it never refers to the 
-    /// original source again).   It also interns the stacks making for an efficient representation
-    /// of the data.   This is useful when the original source is expensive to iterate over.  
+    /// InternStackSource copies all the information in the stacks too (mapping stack indexes to names)
+    /// Thus it never refers to the original source again).   It also interns the stacks making for 
+    /// an efficient representation of the data.   This is useful when the original source is expensive 
+    /// to iterate over.   
+    /// 
+    /// If you have 'raw' uninterned data, subclassing InternStackSource 
     /// </summary>
-    public class InternStackSource : CopyStackSource
+    public class InternStackSource : CopyStackSource    // TODO FIX NOW: should this inherit from CopyStackSource?
     {
+
+#if false   // TODO FIX NOW remove?
         public InternStackSource(StackSource source)
+            : this()
         {
-            m_modules = new GrowableArray<string>(100);
-            m_frames = new GrowableArray<FrameInfo>(1000);
-            m_callStacks = new GrowableArray<CallStackInfo>(5000);
-
-            if (source != null)
-            {
-                m_moduleIntern = new Dictionary<string, StackSourceModuleIndex>(100);
-                m_frameIntern = new Dictionary<FrameInfo, StackSourceFrameIndex>(1000);
-                m_callStackIntern = new GrowableArray<GrowableArray<StackSourceCallStackIndex>>(5000);
-                m_callStackIntern.Add(new GrowableArray<StackSourceCallStackIndex>(4));     // For the root
-
-                source.ProduceSamples(delegate(StackSourceSample sample)
-                {
-                    var sampleCopy = new StackSourceSample(sample);
-                    sampleCopy.SampleIndex = (StackSourceSampleIndex)m_samples.Count;
-                    sampleCopy.StackIndex = CallStackIntern(sampleCopy.StackIndex);
-                    m_samples.Add(sampleCopy);
-                    if (sampleCopy.TimeRelMSec > m_maxSampleTimeRelMSec)
-                        m_maxSampleTimeRelMSec = sampleCopy.TimeRelMSec;
-                });
-
-                m_moduleIntern = null;
-                m_frameIntern = null;
-                m_callStackIntern = new GrowableArray<GrowableArray<StackSourceCallStackIndex>>();
-            }
+            ReadAllSamples(source, 1.0F);
+            CompletedReading();
         }
+#endif 
+        /// <summary>
+        /// Compute only the delta of soruce from the baseline. 
+        /// </summary>
+        public static InternStackSource Diff(StackSource source, StackSource baselineSource)
+        {
+            var ret = new InternStackSource();
+            ret.ReadAllSamples(source, 1.0F);
+            ret.ReadAllSamples(baselineSource, -1.0F);
+            ret.CompletedReading();
+            return ret;
+        }
+
         public override StackSourceCallStackIndex GetCallerIndex(StackSourceCallStackIndex callStackIndex)
         {
             return m_callStacks[(int)callStackIndex].callerIndex;
@@ -310,16 +336,48 @@ namespace Stacks
             }
             return moduleName + "!" + frameName;
         }
-        public override int MaxCallStackIndex
+        public override int CallStackIndexLimit
         {
             get { return m_callStacks.Count; }
         }
-        public override int MaxCallFrameIndex
+        public override int CallFrameIndexLimit
         {
             get { return (int)(StackSourceFrameIndex.Start + m_frames.Count); }
         }
 
         #region protected
+        protected InternStackSource()
+        {
+            m_modules = new GrowableArray<string>(100);
+            m_frames = new GrowableArray<FrameInfo>(1000);
+            m_callStacks = new GrowableArray<CallStackInfo>(5000);
+            m_moduleIntern = new Dictionary<string, StackSourceModuleIndex>(100);
+            m_frameIntern = new Dictionary<FrameInfo, StackSourceFrameIndex>(1000);
+            m_callStackIntern = new GrowableArray<GrowableArray<StackSourceCallStackIndex>>(5000);
+            m_callStackIntern.Add(new GrowableArray<StackSourceCallStackIndex>(4));     // For the root
+        }
+
+        protected void ReadAllSamples(StackSource source, float scaleFactor)
+        {
+            source.ProduceSamples(delegate(StackSourceSample sample)
+            {
+                var sampleCopy = new StackSourceSample(sample);
+                if (scaleFactor != 1.0F)
+                    sampleCopy.Metric *= scaleFactor;
+                sampleCopy.SampleIndex = (StackSourceSampleIndex)m_samples.Count;
+                sampleCopy.StackIndex = CallStackIntern(source, sampleCopy.StackIndex);
+                m_samples.Add(sampleCopy);
+                if (sampleCopy.TimeRelMSec > m_sampleTimeRelMSecLimit)
+                    m_sampleTimeRelMSecLimit = sampleCopy.TimeRelMSec;
+            });
+        }
+
+        protected void CompletedReading()
+        {
+            m_moduleIntern = null;
+            m_frameIntern = null;
+            m_callStackIntern = new GrowableArray<GrowableArray<StackSourceCallStackIndex>>();
+        }
         protected StackSourceModuleIndex ModuleIntern(string moduleName)
         {
             StackSourceModuleIndex ret;
@@ -368,15 +426,15 @@ namespace Stacks
             Debug.Assert(m_callStackIntern.Count == m_callStacks.Count + 1);
             return ret;
         }
-        protected StackSourceCallStackIndex CallStackIntern(StackSourceCallStackIndex baseCallStackIndex)
+        protected StackSourceCallStackIndex CallStackIntern(StackSource source, StackSourceCallStackIndex baseCallStackIndex)
         {
             if (baseCallStackIndex == StackSourceCallStackIndex.Invalid)
                 return StackSourceCallStackIndex.Invalid;
 
-            var baseCaller = m_source.GetCallerIndex(baseCallStackIndex);
-            var baseFrame = m_source.GetFrameIndex(baseCallStackIndex);
+            var baseCaller = source.GetCallerIndex(baseCallStackIndex);
+            var baseFrame = source.GetFrameIndex(baseCallStackIndex);
 
-            var baseFullFrameName = m_source.GetFrameName(baseFrame, true);
+            var baseFullFrameName = source.GetFrameName(baseFrame, true);
             var moduleName = "";
             var frameName = baseFullFrameName;
             var index = baseFullFrameName.IndexOf('!');
@@ -388,7 +446,7 @@ namespace Stacks
 
             var myModuleIndex = ModuleIntern(moduleName);
             var myFrameIndex = FrameIntern(frameName, myModuleIndex);
-            var ret = CallStackIntern(myFrameIndex, CallStackIntern(baseCaller));
+            var ret = CallStackIntern(myFrameIndex, CallStackIntern(source, baseCaller));
             return ret;
         }
 
@@ -459,11 +517,11 @@ namespace Stacks
         {
             return m_baseStackSource.GetFrameName(frameIndex, verboseName);
         }
-        public override int MaxCallStackIndex
+        public override int CallStackIndexLimit
         {
-            get { return m_baseStackSource.MaxCallFrameIndex; }
+            get { return m_baseStackSource.CallFrameIndexLimit; }
         }
-        public override int MaxCallFrameIndex
+        public override int CallFrameIndexLimit
         {
             get { throw new NotImplementedException(); }
         }
@@ -471,15 +529,14 @@ namespace Stacks
         {
             return m_baseStackSource.GetSampleByIndex(sampleIndex);
         }
-        public override int MaxSampleIndex { get { return m_baseStackSource.MaxSampleIndex; } }
-        public override double MaxSampleTimeRelMSec { get { return m_baseStackSource.MaxSampleTimeRelMSec; } }
+        public override int SampleIndexLimit { get { return m_baseStackSource.SampleIndexLimit; } }
+        public override double SampleTimeRelMSecLimit { get { return m_baseStackSource.SampleTimeRelMSecLimit; } }
 
         #region private
         StackSource m_baseStackSource;
         string m_nodeName;
         #endregion
     }
-
 
     /// <summary>
     /// Creates a stack source that can refer to stacks from either the stack sources x or y.  This
@@ -537,13 +594,13 @@ namespace Stacks
             else
                 return m_y.GetFrameName((StackSourceFrameIndex)(((int)frameIndex) >> 1), verboseName);
         }
-        public override int MaxCallStackIndex
+        public override int CallStackIndexLimit
         {
-            get { return 2 * Math.Max(m_x.MaxCallFrameIndex, m_y.MaxCallStackIndex); }
+            get { return 2 * Math.Max(m_x.CallFrameIndexLimit, m_y.CallStackIndexLimit); }
         }
-        public override int MaxCallFrameIndex
+        public override int CallFrameIndexLimit
         {
-            get { return 2 * Math.Max(m_x.MaxCallFrameIndex, m_y.MaxCallFrameIndex); }
+            get { return 2 * Math.Max(m_x.CallFrameIndexLimit, m_y.CallFrameIndexLimit); }
         }
 
         #region private
@@ -567,9 +624,11 @@ namespace Stacks
             m_root = new CallTreeNode("ROOT", StackSourceFrameIndex.Root, null, this);
         }
 
+        // TODO FIX NOW remove?
+#if false 
         // TODO untested. 
         /// <summary>
-        /// Compute the difference between two call trees.  Effectively it is a node-by-node differnece 
+        /// Compute the difference between two call trees.  Effectively it is a node-by-node difference 
         /// Thus you can have negative weights on some nodes. 
         /// </summary>
         public static CallTree Diff(CallTree x, CallTree y)
@@ -580,6 +639,7 @@ namespace Stacks
             ret.Diff(x.m_root, y.m_root, null, stackSource);
             return ret;
         }
+#endif 
 
         // TODO, not tested. 
         /// <summary>
@@ -701,7 +761,7 @@ namespace Stacks
         {
             Sort(delegate(CallTreeNode x, CallTreeNode y)
             {
-                int ret = y.InclusiveMetric.CompareTo(x.InclusiveMetric);
+                int ret = Math.Abs(y.InclusiveMetric).CompareTo(Math.Abs(x.InclusiveMetric));
                 if (ret != 0)
                     return ret;
                 // Sort by first sample time (assending) if the counts are the same.  
@@ -736,26 +796,33 @@ namespace Stacks
         public List<CallTreeNodeBase> ByIDSortedExclusiveMetric()
         {
             var ret = new List<CallTreeNodeBase>(ByID);
-            ret.Sort((x, y) => y.ExclusiveMetric.CompareTo(x.ExclusiveMetric));
-            return ret;
-        }
-        public List<CallTreeNodeBase> ByIDSortedInclusiveMetric()
-        {
-            var ret = new List<CallTreeNodeBase>(ByID);
-            ret.Sort((x, y) => y.InclusiveMetric.CompareTo(x.InclusiveMetric));
+            ret.Sort((x, y) => Math.Abs(y.ExclusiveMetric).CompareTo(Math.Abs(x.ExclusiveMetric)));
             return ret;
         }
 
         /// <summary>
         /// If there are any nodes that have strictly less than to 'minInclusiveMetric'
         /// then remove the node, placing its samples into its parent (thus the parent's
-        /// exclusive metric goes up).  Thus after calling this all nodes will have
-        /// an inclusive time >= minInclusiveMetric
+        /// exclusive metric goes up).  
+        /// 
+        /// If useWholeTraceMetric is true, nodes are only foled if their inclusive metric
+        /// OVER THE WHOLE TRACE is less than 'minInclusiveMetric'.  If false, then a node
+        /// is folded if THAT NODE has less than the 'minInclusiveMetric'  
+        /// 
+        /// Thus if 'useWholeTraceMetric' == false then after calling this routine no
+        /// node will have less than minInclusiveMetric.  
+        /// 
         /// </summary>
-        public int FoldNodesUnder(float minInclusiveMetric)
+        public int FoldNodesUnder(float minInclusiveMetric, bool useWholeTraceMetric)
         {
             m_root.CheckClassInvarients();
-            int ret = m_root.FoldNodesUnder(minInclusiveMetric);
+
+            // If we filter by whole trace metric we need to cacluate the byID sums.  
+            Dictionary<int, CallTreeNodeBase> sumByID = null;
+            if (useWholeTraceMetric)
+                sumByID = GetSumByID();
+
+            int ret = m_root.FoldNodesUnder(minInclusiveMetric, sumByID);
 
             m_root.CheckClassInvarients();
             m_sumByID = null;   // Force a recalculation of the list by ID
@@ -911,7 +978,8 @@ namespace Stacks
                     callersOnStack.Remove((int)treeNode.m_id);
             }
         }
-
+                // TODO FIX NOW remove?
+#if false 
         /// <summary>
         /// Compute the difference between x and y nodes.  Either can be null which semantically a call tree node with no samples. 
         /// </summary>
@@ -1007,6 +1075,7 @@ namespace Stacks
             }
             return null;
         }
+#endif
 
         internal StackSource m_SampleInfo;
         private CallTreeNode m_root;
@@ -1328,7 +1397,7 @@ namespace Stacks
             {
                 return m_source.GetSampleByIndex(sampleIndex);
             }
-            public override int MaxSampleIndex { get { return m_source.MaxSampleIndex; } }
+            public override int SampleIndexLimit { get { return m_source.SampleIndexLimit; } }
             public override StackSourceCallStackIndex GetCallerIndex(StackSourceCallStackIndex callStackIndex)
             {
                 return m_source.GetCallerIndex(callStackIndex);
@@ -1341,8 +1410,8 @@ namespace Stacks
             {
                 return m_source.GetFrameName(frameIndex, verboseName);
             }
-            public override int MaxCallStackIndex { get { return m_source.MaxCallStackIndex; } }
-            public override int MaxCallFrameIndex { get { return m_source.MaxCallFrameIndex; } }
+            public override int CallStackIndexLimit { get { return m_source.CallStackIndexLimit; } }
+            public override int CallFrameIndexLimit { get { return m_source.CallFrameIndexLimit; } }
             public override StackSource BaseStackSource { get { return m_source; } }
 
             #region private
@@ -1378,17 +1447,17 @@ namespace Stacks
             // TODO
             if (addInclusive)
             {
-                m_inclusiveMetric += (float) (other.m_inclusiveMetric * weight);
-                m_inclusiveCount += (float) (other.m_inclusiveCount * weight);
+                m_inclusiveMetric += (float)(other.m_inclusiveMetric * weight);
+                m_inclusiveCount += (float)(other.m_inclusiveCount * weight);
                 if (m_inclusiveMetricByTime != null && other.m_inclusiveMetricByTime != null)
                 {
                     for (int i = 0; i < m_inclusiveMetricByTime.Length; i++)
-                        m_inclusiveMetricByTime[i] += (float) (other.m_inclusiveMetricByTime[i] * weight);
+                        m_inclusiveMetricByTime[i] += (float)(other.m_inclusiveMetricByTime[i] * weight);
                 }
             }
-            m_exclusiveMetric += (float) (other.m_exclusiveMetric * weight);
-            m_exclusiveCount += (float) (other.m_exclusiveCount * weight);
-            m_exclusiveFoldedMetric += (float) (other.m_exclusiveFoldedMetric * weight);
+            m_exclusiveMetric += (float)(other.m_exclusiveMetric * weight);
+            m_exclusiveCount += (float)(other.m_exclusiveCount * weight);
+            m_exclusiveFoldedMetric += (float)(other.m_exclusiveFoldedMetric * weight);
 
             if (other.MinFoldedFrames < MinFoldedFrames)
                 MinFoldedFrames = other.MinFoldedFrames;
@@ -1528,7 +1597,11 @@ namespace Stacks
             this.m_caller = caller;
         }
 
-        internal int FoldNodesUnder(float minInclusiveMetric)
+        /// <summary>
+        /// Fold away any nodes having less than 'minInclusiveMetric'.  If 'sumByID' is non-null then the 
+        /// only nodes that have a less then the minInclusiveMetric for the whole trace are folded. 
+        /// </summary>
+        internal int FoldNodesUnder(float minInclusiveMetric, Dictionary<int, CallTreeNodeBase> sumByID)
         {
             int nodesFolded = 0;
             if (m_callees != null)
@@ -1538,7 +1611,8 @@ namespace Stacks
                 {
                     var callee = m_callees[from];
                     // We don't fold away Broken stacks ever.  
-                    if (callee.InclusiveMetric < minInclusiveMetric && callee.m_id != StackSourceFrameIndex.Broken)
+                    if (Math.Abs(callee.InclusiveMetric) < minInclusiveMetric && callee.m_id != StackSourceFrameIndex.Broken &&
+                        (sumByID == null || sumByID[(int) callee.m_id].InclusiveMetric < minInclusiveMetric))
                     {
                         // TODO the samples are no longer in time order, do we care?
                         nodesFolded++;
@@ -1557,7 +1631,7 @@ namespace Stacks
                     }
                     else
                     {
-                        nodesFolded += callee.FoldNodesUnder(minInclusiveMetric);
+                        nodesFolded += callee.FoldNodesUnder(minInclusiveMetric, sumByID);
                         if (to != from)
                             m_callees[to] = m_callees[from];
                         to++;
@@ -1573,8 +1647,8 @@ namespace Stacks
 
             // TODO is it worth putting this back (taking into account the 'Broken' node case?
             //Debug.Assert(this == m_callTree.Top || InclusiveMetric >= minInclusiveMetric);
-            Debug.Assert(InclusiveMetric >= ExclusiveMetric);
-            Debug.Assert(m_callees != null || ExclusiveMetric == InclusiveMetric);
+            // TODO FIX NOW Debug.Assert(Math.Abs(InclusiveMetric - ExclusiveMetric) >= -Math.Abs(InclusiveMetric) * .001);
+            // TODO FIX NOW Debug.Assert(m_callees != null || Math.Abs(ExclusiveMetric - InclusiveMetric) <= .001 * Math.Abs(ExclusiveMetric));
             return nodesFolded;
         }
 
@@ -1656,7 +1730,7 @@ namespace Stacks
                     count += callee.m_inclusiveCount;
                 }
             }
-            Debug.Assert(sum == m_inclusiveMetric);
+            Debug.Assert(Math.Abs(sum - m_inclusiveMetric) <= Math.Abs(sum) * .001);
             Debug.Assert(count == m_inclusiveCount);
         }
 
@@ -1695,10 +1769,10 @@ namespace Stacks
             double weightedSummaryScale;
             bool isUniform;
             AccumlateSamplesForNode(callTree.Root, 0, out weightedSummary, out weightedSummaryScale, out isUniform);
-#endif 
+#endif
 
-            m_callers.Sort((x, y) => y.InclusiveMetric.CompareTo(x.InclusiveMetric));
-            m_callees.Sort((x, y) => y.InclusiveMetric.CompareTo(x.InclusiveMetric));
+            m_callers.Sort((x, y) => Math.Abs(y.InclusiveMetric).CompareTo(Math.Abs(x.InclusiveMetric)));
+            m_callees.Sort((x, y) => Math.Abs(y.InclusiveMetric).CompareTo(Math.Abs(x.InclusiveMetric)));
 
 #if DEBUG
             float callerSum = 0;
@@ -1710,8 +1784,8 @@ namespace Stacks
                 calleeSum += callee.m_inclusiveMetric;
 
             if (this.Name != m_callTree.Root.Name)
-                Debug.Assert(Math.Abs(callerSum - m_inclusiveMetric) < .01);
-            Debug.Assert(Math.Abs(calleeSum + m_exclusiveMetric - m_inclusiveMetric) < .01);
+                Debug.Assert(Math.Abs(callerSum - m_inclusiveMetric) <= .001);
+            Debug.Assert(Math.Abs(calleeSum + m_exclusiveMetric - m_inclusiveMetric) <= .001 * Math.Abs(m_inclusiveMetric));
 #endif
         }
 
@@ -1771,7 +1845,7 @@ namespace Stacks
         /// isUniformRet is set to true if anyplace in 'treeNode' does not have the scaling factor weightedSummaryScaleRet.  This
         /// means the the caller cannot simply scale 'treeNode' by a weight to get weightedSummaryRet.  
         /// </summary>
-        private void AccumlateSamplesForNode(CallTreeNode treeNode, int recursionCount, 
+        private void AccumlateSamplesForNode(CallTreeNode treeNode, int recursionCount,
             out CallTreeNodeBase weightedSummaryRet, out double weightedSummaryScaleRet, out bool isUniformRet)
         {
             bool isFocusNode = treeNode.Name.Equals(Name);
@@ -1779,7 +1853,7 @@ namespace Stacks
                 recursionCount++;
 
             // We hope we are uniform (will fix if this is not true)
-            isUniformRet = true;            
+            isUniformRet = true;
 
             // Compute the weighting.   This is either 0 if we have not yet seen the focus node, or
             // 1/recusionCount if we have (splitting all samples equally among each of the samples)
@@ -1806,7 +1880,7 @@ namespace Stacks
                     // Get the correct weighted summary for the children.  
                     CallTreeNodeBase calleeWeightedSummary;
                     double calleeWeightedSummaryScale;
-                    bool isUniform; 
+                    bool isUniform;
                     AccumlateSamplesForNode(treeNodeCallee, recursionCount, out calleeWeightedSummary, out calleeWeightedSummaryScale, out isUniform);
 
                     // Did we have any samples at all that contained the focus node this treeNode's callee?

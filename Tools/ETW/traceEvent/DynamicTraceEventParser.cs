@@ -7,6 +7,7 @@ using System.Security;
 using System.Xml;
 using FastSerialization;
 using Diagnostics.Eventing;
+using System.Text.RegularExpressions;
 
 [SecuritySafeCritical]
 public sealed class DynamicTraceEventParser : TraceEventParser
@@ -28,7 +29,7 @@ public sealed class DynamicTraceEventParser : TraceEventParser
             {
                 if (data.Opcode != (TraceEventOpcode)0xFE)
                     return;
-                if (data.ID != 0 && (byte) data.ID != 0xFE)    // Zero is for classic ETW.  
+                if (data.ID != 0 && (byte)data.ID != 0xFE) // for classic ETW.  
                     return;
 
                 // Look up our information. 
@@ -109,7 +110,7 @@ public sealed class DynamicTraceEventParser : TraceEventParser
             {
                 // Chunks have to agree with the format and version information. 
                 if (format != (ManifestEnvelope.ManifestFormats)data.GetByteAt(0) ||
-                    majorVersion != data.GetByteAt(1) || minorVersion == data.GetByteAt(2))
+                    majorVersion != data.GetByteAt(1) || minorVersion != data.GetByteAt(2))
                     return null;
             }
 
@@ -148,12 +149,12 @@ public sealed class DynamicTraceEventParser : TraceEventParser
 
     private void AddProvider(ProviderManifest provider)
     {
-        // If someone as asked for callbacks on every event, then include these too. 
-        if (allCallbackCalled && state.providers.ContainsKey(provider.Guid))
-            provider.AddProviderEvents(source, allCallback);
-
         // Remember this serialized information.
         state.providers[provider.Guid] = provider;
+
+        // If someone as asked for callbacks on every event, then include these too. 
+        if (allCallbackCalled)
+            provider.AddProviderEvents(source, allCallback);
     }
 
     DynamicTraceEventParserState state;
@@ -171,7 +172,7 @@ class DynamicTraceEventData : TraceEvent
         Action = action;
     }
 
-    internal event Action<TraceEvent> Action;
+    internal protected event Action<TraceEvent> Action;
     protected internal override void Dispatch()
     {
         if (Action != null)
@@ -217,6 +218,70 @@ class DynamicTraceEventData : TraceEvent
                 throw new Exception("Unsupported type " + payloadFetches[index].type);
         }
     }
+    public override string PayloadString(int index)
+    {
+        object value = PayloadValue(index);
+        var map = payloadFetches[index].map;
+        string ret = null;
+        if (map != null)
+        {
+            long asLong = (long)((IConvertible)value).ToInt64(null);
+            if (map is SortedList<long, string>)
+            {
+                StringBuilder sb = new StringBuilder();
+                // It is a bitmap, compute the bits from the bitmap.  
+                foreach (var keyValue in map)
+                {
+                    if (asLong == 0)
+                        break;
+                    if ((keyValue.Key & asLong) != 0)
+                    {
+                        if (sb.Length != 0)
+                            sb.Append('|');
+                        sb.Append(keyValue.Value);
+                        asLong &= ~keyValue.Key;
+                    }
+                }
+                if (asLong != 0)
+                {
+                    if (sb.Length != 0)
+                        sb.Append('|');
+                    sb.Append(asLong);
+                }
+                else if (sb.Length == 0)
+                    sb.Append('0');
+                ret = sb.ToString();
+            }
+            else
+            {
+                // It is a value map, just look up the value
+                map.TryGetValue(asLong, out ret);
+            }
+        }
+
+        if (ret == null)
+            ret = value.ToString();
+        return ret;
+    }
+    public override string FormattedMessage
+    {
+        get
+        {
+            if (MessageFormat == null)
+                return null;
+
+            // TODO is this error handling OK?  
+            // Replace all %N with the string value for that parameter.  
+            return Regex.Replace(MessageFormat, @"%(\d+)", delegate(Match m)
+            {
+                int index = int.Parse(m.Groups[1].Value) - 1;
+                if ((uint)index < (uint)PayloadNames.Length)
+                    return PayloadString(index);
+                else
+                    return "<<Out Of Range>>";
+            });
+        }
+    }
 
     private int SkipToField(int index)
     {
@@ -249,13 +314,12 @@ class DynamicTraceEventData : TraceEvent
         }
         return offset;
     }
-
     internal static short SizeOfType(Type type)
     {
         switch (Type.GetTypeCode(type))
         {
             case TypeCode.String:
-                return short.MinValue;
+                return sbyte.MinValue;
             case TypeCode.Boolean:
             case TypeCode.SByte:
             case TypeCode.Byte:
@@ -275,20 +339,68 @@ class DynamicTraceEventData : TraceEvent
                 throw new Exception("Unsupported type " + type.Name); // TODO 
         }
     }
-
     internal struct PayloadFetch
     {
-        public PayloadFetch(short offset, short size, Type type)
+        public PayloadFetch(short offset, short size, Type type, IDictionary<long, string> map = null)
         {
             this.offset = offset;
             this.size = size;
             this.type = type;
+            this.map = map;
         }
+
         public short offset;
         public short size;
+        public IDictionary<long, string> map;
         public Type type;
     };
+
+    // Fields
     internal PayloadFetch[] payloadFetches;
+    internal string MessageFormat;
+}
+
+/// <summary>
+/// This class is only used to pretty-print the manifest event itself.   It is pretty special purpose
+/// </summary>
+class DynamicManifestTraceEventData : DynamicTraceEventData
+{
+    internal DynamicManifestTraceEventData(Action<TraceEvent> action, ProviderManifest manifest)
+        : base(action, 0xFFFE, 0, "Manifest", Guid.Empty, 0xFE, "Dump", manifest.Guid, manifest.Name)
+    {
+        this.manifest = manifest;
+        payloadNames = new string[] { "Format", "MajorVersion", "MinorVersion", "Magic", "TotalChunks", "ChunkNumber" };
+        payloadFetches = new PayloadFetch[] {
+            new PayloadFetch(0, 1, typeof(byte)),
+            new PayloadFetch(1, 1, typeof(byte)),
+            new PayloadFetch(2, 1, typeof(byte)),
+            new PayloadFetch(3, 1, typeof(byte)),
+            new PayloadFetch(4, 2, typeof(ushort)),
+            new PayloadFetch(6, 2, typeof(ushort)),
+        };
+        Action += action;
+    }
+
+    public override StringBuilder ToXml(StringBuilder sb)
+    {
+        int totalChunks = GetInt16At(4);
+        int chunkNumber = GetInt16At(6);
+        if (chunkNumber + 1 == totalChunks)
+        {
+            StringBuilder baseSb = new StringBuilder();
+            base.ToXml(baseSb);
+            sb.AppendLine(XmlUtilities.OpenXmlElement(baseSb.ToString()));
+            sb.Append(manifest.Manifest);
+            sb.Append("</Event>");
+            return sb;
+        }
+        else
+            return base.ToXml(sb);
+    }
+
+    #region private
+    ProviderManifest manifest;
+    #endregion
 }
 
 class DynamicTraceEventParserState : IFastSerializable
@@ -314,7 +426,7 @@ class DynamicTraceEventParserState : IFastSerializable
         {
             ProviderManifest provider;
             deserializer.Read(out provider);
-            providers.Add(provider.Guid, provider); 
+            providers.Add(provider.Guid, provider);
         }
     }
 
@@ -355,6 +467,12 @@ class ProviderManifest : IFastSerializable
             opcodes.Add("win:Receive", 240);
             Dictionary<string, TaskInfo> tasks = new Dictionary<string, TaskInfo>();
             Dictionary<string, DynamicTraceEventData> templates = new Dictionary<string, DynamicTraceEventData>();
+            Dictionary<string, IDictionary<long, string>> maps = null;
+            Dictionary<string, string> strings = new Dictionary<string, string>();
+            IDictionary<long, string> map = null;
+            List<DynamicTraceEventData> events = new List<DynamicTraceEventData>();
+            bool alreadyReadMyCulture = false;            // I read my culture some time in the past (I can igore things)
+            string cultureBeingRead = null;
             while (reader.Read())
             {
                 // TODO I currently require opcodes,and tasks BEFORE events BEFORE templates.  
@@ -398,9 +516,9 @@ class ProviderManifest : IFastSerializable
                             }
 
                             int eventID = int.Parse(reader.GetAttribute("value"));
-
                             DynamicTraceEventData eventTemplate = new DynamicTraceEventData(
                             callback, eventID, taskNum, taskName, taskGuid, opcode, opcodeName, Guid, Name);
+                            events.Add(eventTemplate);
 
                             string templateName = reader.GetAttribute("template");
                             if (templateName != null)
@@ -409,8 +527,10 @@ class ProviderManifest : IFastSerializable
                             {
                                 eventTemplate.payloadNames = new string[0];
                                 eventTemplate.payloadFetches = new DynamicTraceEventData.PayloadFetch[0];
-                                source.RegisterEventTemplate(eventTemplate);
                             }
+
+                            // This will be looked up in the string table in a second pass.  
+                            eventTemplate.MessageFormat = reader.GetAttribute("message");
                         } break;
                     case "template":
                         {
@@ -419,19 +539,19 @@ class ProviderManifest : IFastSerializable
                             DynamicTraceEventData eventTemplate = templates[templateName];
                             try
                             {
-                                ComputeFieldInfo(eventTemplate, reader.ReadSubtree());
+                                ComputeFieldInfo(eventTemplate, reader.ReadSubtree(), maps);
                             }
                             catch (Exception e)
                             {
 #if DEBUG
                                 Console.WriteLine("Error: Exception during processing template {0}: {1}", templateName, e.ToString());
-#endif 
+#endif
                                 throw;
                             }
-                            source.RegisterEventTemplate(eventTemplate);
                             templates.Remove(templateName);
                         } break;
                     case "opcode":
+                        // TODO use message for opcode if it is available so it is localized.  
                         opcodes.Add(reader.GetAttribute("name"), int.Parse(reader.GetAttribute("value")));
                         break;
                     case "task":
@@ -443,16 +563,84 @@ class ProviderManifest : IFastSerializable
                                 info.guid = new Guid(guidString);
                             tasks.Add(reader.GetAttribute("name"), info);
                         } break;
+                    case "valueMap":
+                        map = new Dictionary<long, string>();    // value maps use dictionaries
+                        goto DoMap;
+                    case "bitMap":
+                        map = new SortedList<long, string>();    // Bitmaps stored as sorted lists
+                        goto DoMap;
+                    DoMap:
+                        string name = reader.GetAttribute("name");
+                        var mapValues = reader.ReadSubtree();
+                        while (mapValues.Read())
+                        {
+                            if (mapValues.Name == "map")
+                            {
+                                long key = int.Parse(reader.GetAttribute("value"));
+                                string value = reader.GetAttribute("message");
+                                map[key] = value;
+                            }
+                        }
+                        if (maps == null)
+                            maps = new Dictionary<string, IDictionary<long, string>>();
+                        maps[name] = map;
+                        break;
+                    case "resources":
+                        {
+                            if (!alreadyReadMyCulture)
+                            {
+                                string desiredCulture = System.Globalization.CultureInfo.CurrentCulture.Name;
+                                if (cultureBeingRead != null && string.Compare(cultureBeingRead, desiredCulture, StringComparison.OrdinalIgnoreCase) == 0)
+                                    alreadyReadMyCulture = true;
+                                cultureBeingRead = reader.GetAttribute("culture");
+                            }
+                        } break;
+                    case "string":
+                        if (!alreadyReadMyCulture)
+                            strings[reader.GetAttribute("id")] = reader.GetAttribute("value");
+                        break;
                 }
             }
 
-            // TODO Register any events with undefined templates as having empty payloads (can rip out after 1/2009)
-            foreach (DynamicTraceEventData eventTemplate in templates.Values)
+            // localize strings for maps.
+            if (maps != null)
             {
-                eventTemplate.payloadNames = new string[0];
-                eventTemplate.payloadFetches = new DynamicTraceEventData.PayloadFetch[0];
-                source.RegisterEventTemplate(eventTemplate);
+                foreach (IDictionary<long, string> amap in maps.Values)
+                {
+                    foreach (var keyValue in new List<KeyValuePair<long, string>>(amap))
+                    {
+                        Match m = Regex.Match(keyValue.Value, @"^\$\(string\.(.*)\)$");
+                        if (m.Success)
+                        {
+                            string newValue;
+                            if (strings.TryGetValue(m.Groups[1].Value, out newValue))
+                                amap[keyValue.Key] = newValue;
+                        }
+                    }
+                }
             }
+
+            // Register all the events
+            foreach (var event_ in events)
+            {
+                // before registering, localize any message format strings.  
+                string message = event_.MessageFormat;
+                if (message != null)
+                {
+                    // Expect $(STRINGNAME) where STRINGNAME needs to be looked up in the string table
+                    // TODO currently we just ignore messages without a valid string name.  Is that OK?
+                    event_.MessageFormat = null;
+                    Match m = Regex.Match(message, @"^\$\(string\.(.*)\)$");
+                    if (m.Success)
+                        strings.TryGetValue(m.Groups[1].Value, out event_.MessageFormat);
+                }
+
+
+                source.RegisterEventTemplate(event_);
+            }
+
+            // Create an event for the manifest event itself so it looks pretty in dumps.  
+            source.RegisterEventTemplate(new DynamicManifestTraceEventData(callback, this));
         }
         catch (Exception e)
         {
@@ -462,7 +650,8 @@ class ProviderManifest : IFastSerializable
         }
         inited = false;     // If we call it again, start over from the begining.  
     }
-    
+    public string Manifest { get { if (!inited) Init(); return Encoding.UTF8.GetString(serializedManifest); } }
+
     #region private
     private class TaskInfo
     {
@@ -470,7 +659,7 @@ class ProviderManifest : IFastSerializable
         public Guid guid;
     };
 
-    private void ComputeFieldInfo(DynamicTraceEventData template, XmlReader reader)
+    private void ComputeFieldInfo(DynamicTraceEventData template, XmlReader reader, Dictionary<string, IDictionary<long, string>> maps)
     {
         List<string> payloadNames = new List<string>();
         List<DynamicTraceEventData.PayloadFetch> payloadFetches = new List<DynamicTraceEventData.PayloadFetch>();
@@ -481,13 +670,17 @@ class ProviderManifest : IFastSerializable
             {
                 Type type = GetTypeForManifestTypeName(reader.GetAttribute("inType"));
                 short size = DynamicTraceEventData.SizeOfType(type);
-               
+
                 // TODO There is disagreement in what win:Boolean means.  Currently it is serialized as 1 byte
                 // by manage code.  However all other windows tools assume it is 4 bytes.   we are likely
                 // to change this to align with windows at some point.
 
                 payloadNames.Add(reader.GetAttribute("name"));
-                payloadFetches.Add(new DynamicTraceEventData.PayloadFetch(offset, size, type));
+                IDictionary<long, string> map = null;
+                string mapName = reader.GetAttribute("map");
+                if (mapName != null && maps != null)
+                    maps.TryGetValue(mapName, out map);
+                payloadFetches.Add(new DynamicTraceEventData.PayloadFetch(offset, size, type, map));
                 if (offset >= 0)
                 {
                     Debug.Assert(size != 0);
@@ -511,7 +704,7 @@ class ProviderManifest : IFastSerializable
             case "trace:SizeT":
                 return typeof(IntPtr);
             case "win:Boolean":
-                    return typeof(bool);
+                return typeof(bool);
             case "win:UInt8":
             case "win:Int8":
                 return typeof(byte);
@@ -556,7 +749,7 @@ class ProviderManifest : IFastSerializable
     {
         deserializer.Read(out majorVersion);
         deserializer.Read(out minorVersion);
-        format = (ManifestEnvelope.ManifestFormats) deserializer.ReadInt();
+        format = (ManifestEnvelope.ManifestFormats)deserializer.ReadInt();
         int count = deserializer.ReadInt();
         serializedManifest = new byte[count];
         for (int i = 0; i < count; i++)
@@ -573,12 +766,19 @@ class ProviderManifest : IFastSerializable
             settings.IgnoreWhitespace = true;
             System.IO.MemoryStream stream = new System.IO.MemoryStream(serializedManifest);
             reader = XmlReader.Create(stream, settings);
-            if (reader.Read() && reader.Name == "provider")
+            while (reader.Read())
             {
-                guid = new Guid(reader.GetAttribute("guid"));
-                name = reader.GetAttribute("name");
-                fileName = reader.GetAttribute("resourceFileName");
+                if (reader.Name == "provider")
+                {
+                    guid = new Guid(reader.GetAttribute("guid"));
+                    name = reader.GetAttribute("name");
+                    fileName = reader.GetAttribute("resourceFileName");
+                    break;
+                }
             }
+
+            if (name == null)
+                throw new Exception("No provider element found in manifest");
         }
         catch (Exception e)
         {

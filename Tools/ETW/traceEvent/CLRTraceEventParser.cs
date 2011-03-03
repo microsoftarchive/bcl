@@ -31,6 +31,7 @@ namespace Diagnostics.Eventing
         /// </summary>
         public enum Keywords : long
         {
+            None = 0,
             /// <summary>
             /// Logging when garbage collections and finalization happen. 
             /// </summary>

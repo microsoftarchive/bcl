@@ -67,10 +67,6 @@ namespace System.Collections.Generic
                 arrayLength = value;
             }
         }
-        public void Clear()
-        {
-            arrayLength = 0;
-        }
 
         /// <summary>
         /// Add an item at the end of the array, growing as necessary. 
@@ -122,23 +118,6 @@ namespace System.Collections.Generic
                 array[index++] = array[endIndex];
 
             arrayLength = index;
-        }
-        /// <summary>
-        /// Add 'count' null entries at the end of the list.  Useful to support 'autoexpand' arrays. 
-        /// </summary>
-        public void Expand(int count)
-        {
-            if (array == null || arrayLength + count >= array.Length)
-                Realloc(arrayLength + count);
-            else
-            {
-                while (count > 0)
-                {
-                    array[arrayLength++] = default(T);
-                    --count;
-                }
-            }
-            arrayLength += count;
         }
 
         // Support for stack-like operations 
@@ -261,6 +240,11 @@ namespace System.Collections.Generic
             }
             return false;
         }
+
+        /// <summary>
+        /// Returns the underlying array.  Should not be used most of the time!
+        /// </summary>
+        public T[] UnderlyingArray { get { return array; } }
         #region private
         private void Realloc(int minSize)
         {

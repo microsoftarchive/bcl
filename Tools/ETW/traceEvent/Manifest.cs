@@ -15,9 +15,10 @@ internal struct ManifestEnvelope
     public const int MaxChunkSize = 0xFF00;
     public enum ManifestFormats : byte
     {
-        SimpleXmlFormat = 1,          // Simply dump what is under the <proivider> tag in an XML manifest
+        SimpleXmlFormat = 1,          // Simply dump the XML manifest
     }
 
+    // If you change these, please update code:DynamicManifestTraceEventData
     public ManifestFormats Format;
     public byte MajorVersion;
     public byte MinorVersion;

@@ -58,11 +58,18 @@ namespace Diagnostics.Eventing
                 string dir = Path.GetDirectoryName(fileOrSessionName);
                 if (dir.Length == 0)
                     dir = ".";
-                string[] additionalLogFiles = Directory.GetFiles(dir, fileBaseName + ".*.etl");
-                logFiles = new TraceEventNativeMethods.EVENT_TRACE_LOGFILEW[1 + additionalLogFiles.Length];
-                logFiles[0].LogFileName = fileOrSessionName;
-                for (int i = 0; i < additionalLogFiles.Length; i++)
-                    logFiles[i + 1].LogFileName = additionalLogFiles[i];
+                List<string> allLogFiles = new List<string>();
+                allLogFiles.AddRange(Directory.GetFiles(dir, fileBaseName + ".etl"));
+                allLogFiles.AddRange(Directory.GetFiles(dir, fileBaseName + ".kernel.etl"));
+                allLogFiles.AddRange(Directory.GetFiles(dir, fileBaseName + ".clr*.etl"));
+                allLogFiles.AddRange(Directory.GetFiles(dir, fileBaseName + ".user*.etl"));
+
+                if (allLogFiles.Count == 0)
+                    throw new FileNotFoundException("Could not find any files in the file family " + fileOrSessionName);
+
+                logFiles = new TraceEventNativeMethods.EVENT_TRACE_LOGFILEW[allLogFiles.Count];
+                for (int i = 0; i < allLogFiles.Count; i++)
+                    logFiles[i].LogFileName = allLogFiles[i];
             }
             else
             {
@@ -145,6 +152,7 @@ namespace Diagnostics.Eventing
 
             cpuSpeedMHz = (int)logFiles[0].LogfileHeader.CpuSpeedInMHz;
             numberOfProcessors = (int)logFiles[0].LogfileHeader.NumberOfProcessors;
+            perfFreq = logFiles[0].LogfileHeader.PerfFreq;
 
             // Logic for looking up process names
             processNameForID = new Dictionary<int, string>();
@@ -182,7 +190,7 @@ namespace Diagnostics.Eventing
             int dwErr = TraceEventNativeMethods.ProcessTrace(handles, (uint)handles.Length, (IntPtr)0, (IntPtr)0);
 
             // ETW returns 1223 when you stop processing explicitly 
-            if (dwErr != 1223 && stopProcessing)
+            if (!(dwErr == 1223 && stopProcessing))
                 Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(dwErr));
 
             return !stopProcessing;

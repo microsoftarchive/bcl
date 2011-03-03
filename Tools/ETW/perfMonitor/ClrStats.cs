@@ -1,17 +1,16 @@
 ﻿// Copyright (c) Microsoft Corporation.  All rights reserved
 using System;
 using System.Collections.Generic;
-using System.Text;
-using System.IO;
 using System.Diagnostics;
+using System.IO;
 using Diagnostics.Eventing;
 
-namespace PerfMonitor
+namespace Stats
 {
     /// <summary>
     /// GCProcess holds information about GCs in a particular process. 
     /// </summary>
-    class GCProcess : ProcessLookupContract
+    class GCProcess : ProcessLookupContract, IComparable<GCProcess>
     {
         public static ProcessLookup<GCProcess> Collect(TraceEventDispatcher source)
         {
@@ -107,12 +106,12 @@ namespace PerfMonitor
 
                 _event.GCStartRelMSec = data.TimeStampRelativeMSec;
                 Debug.Assert(0 <= data.Depth && data.Depth <= 2);
-                _event.GCGeneration = data.Depth;
+                // _event.GCGeneration = data.Depth;   Old style events only have this in the GCEnd event.  
                 _event.Reason = data.Reason;
                 _event.GCNumber = data.Count;
                 _event.Type = data.Type;
                 _event.SizeBeforeMB = stats.currentAllocatedSizeMB;
-                _event.AllocedSinceLastGC = stats.currentAllocatedSizeMB - stats.sizeOfHeapAtLastGCMB;
+                _event.AllocedSinceLastGCMB = stats.currentAllocatedSizeMB - stats.sizeOfHeapAtLastGCMB;
                 _event.DurationSinceLastGCMSec = _event.GCStartRelMSec - stats.lastGCEndTimeRelativeMSec;
 
                 stats.events.Add(_event);
@@ -125,6 +124,7 @@ namespace PerfMonitor
                 {
                     _event.GCDurationMSec = (data.TimeStamp100ns - _event.StartTime100ns) / 10000.0F;
                     _event.StoppedOnThreadId = data.ThreadID;
+                    _event.GCGeneration = data.Depth;
                 }
             };
             source.Clr.GCHeapStats += delegate(GCHeapStatsTraceData data)
@@ -141,7 +141,7 @@ namespace PerfMonitor
                     stats.Generations[_event.GCGeneration].TotalSizeAfterMB += _event.SizeAfterMB;
                     stats.Generations[_event.GCGeneration].TotalPauseTimeMSec += _event.PauseDurationMSec;
                     stats.Generations[_event.GCGeneration].TotalReclaimedMB += _event.SizeBeforeMB - _event.SizeAfterMB;
-                    stats.Generations[_event.GCGeneration].TotalAllocatedMB += _event.AllocedSinceLastGC;
+                    stats.Generations[_event.GCGeneration].TotalAllocatedMB += _event.AllocedSinceLastGCMB;
                     stats.Generations[_event.GCGeneration].MaxPauseDurationMSec = Math.Max(stats.Generations[_event.GCGeneration].MaxPauseDurationMSec, _event.PauseDurationMSec);
                     stats.Generations[_event.GCGeneration].MaxSizeBeforeMB = Math.Max(stats.Generations[_event.GCGeneration].MaxSizeBeforeMB, _event.SizeBeforeMB);
                     stats.Generations[_event.GCGeneration].MaxAllocRateMBSec = Math.Max(stats.Generations[_event.GCGeneration].MaxAllocRateMBSec, _event.AllocRateMBSec);
@@ -152,7 +152,7 @@ namespace PerfMonitor
                     stats.Total.TotalSizeAfterMB += _event.SizeAfterMB;
                     stats.Total.TotalPauseTimeMSec += _event.PauseDurationMSec;
                     stats.Total.TotalReclaimedMB += _event.SizeBeforeMB - _event.SizeAfterMB;
-                    stats.Total.TotalAllocatedMB += _event.AllocedSinceLastGC;
+                    stats.Total.TotalAllocatedMB += _event.AllocedSinceLastGCMB;
                     stats.Total.MaxPauseDurationMSec = Math.Max(stats.Total.MaxPauseDurationMSec, _event.PauseDurationMSec);
                     stats.Total.MaxSizeBeforeMB = Math.Max(stats.Total.MaxSizeBeforeMB, _event.SizeBeforeMB);
                     stats.Total.MaxAllocRateMBSec = Math.Max(stats.Total.MaxAllocRateMBSec, _event.AllocRateMBSec);
@@ -199,6 +199,8 @@ namespace PerfMonitor
             writer.WriteLine("<LI>CLR Startup Flags: {0}</LI>", StartupFlags);
             writer.WriteLine("<LI>Total CPU Time: {0:f3} msec</LI>", ProcessCpuTimeMsec);
             writer.WriteLine("<LI>Total GC  Time: {0:f3} msec</LI>", Total.TotalGCDurationMSec);
+            writer.WriteLine("<LI>Total Allocs  : {0:f3} MB</LI>", Total.TotalAllocatedMB);
+            writer.WriteLine("<LI>MSec/MB Alloc : {0:f3} msec/MB</LI>", Total.TotalGCDurationMSec/Total.TotalAllocatedMB);
             writer.WriteLine("<LI>Total GC Pause: {0:f3} msec</LI>", Total.TotalPauseTimeMSec);
             if (Total.TotalGCDurationMSec != 0)
                 writer.WriteLine("<LI>% CPU Time spent Garbage Collecting: {0:f1}%</LI>", Total.TotalGCDurationMSec * 100.0 / ProcessCpuTimeMsec);
@@ -210,15 +212,15 @@ namespace PerfMonitor
                 writer.WriteLine("<LI>Peak Virtual Memory Usage: {0:f3} MB</LI>", PeakVirtualMB);
 
             writer.WriteLine("<LI><A HREF=\"#Events_{0}\">Individual GC Events</A></LI>", ProcessID);
-            var usersGuideFile = ReportGenerator.WriteUsersGuide(fileName);
+            var usersGuideFile = UsersGuide.WriteUsersGuide(fileName);
             writer.WriteLine("<LI> <A HREF=\"{0}#UnderstandingGCPerf\">GC Perf Users Guide</A></LI>", usersGuideFile);
 
             writer.WriteLine("</UL>");
 
             writer.WriteLine("<Center>");
             writer.WriteLine("<Table Border=\"1\">");
-            writer.WriteLine("<TR><TH colspan=\"10\" Align=\"Center\">GC Rollup By Generation</TH></TR>");
-            writer.WriteLine("<TR><TH colspan=\"10\" Align=\"Center\">All times are in msec.</TH></TR>");
+            writer.WriteLine("<TR><TH colspan=\"12\" Align=\"Center\">GC Rollup By Generation</TH></TR>");
+            writer.WriteLine("<TR><TH colspan=\"12\" Align=\"Center\">All times are in msec.</TH></TR>");
             writer.WriteLine("<TR>" +
                              "<TH>Gen</TH>" +
                              "<TH>Count</TH>" +
@@ -227,6 +229,8 @@ namespace PerfMonitor
                              "<TH>Max Alloc<BR/>MB/sec</TH>" +
                              "<TH>Total<BR/>Pause</TH>" +
                              "<TH>Total<BR/>Alloc MB</TH>" +
+                             "<TH>MSec GC /<BR/>Alloc MB</TH>" +
+                             "<TH>MSec GC /<BR/>Kept MB</TH>" +
                              "<TH>Total<BR/>Reclaimed MB</TH>" +
                              "<TH>Mean<BR/>Pause</TH>" +
                              "<TH>Mean<BR/>Reclaim MB</TH>" +
@@ -242,6 +246,8 @@ namespace PerfMonitor
                              "<TD Align=\"Center\">{7:f1}</TD>" +
                              "<TD Align=\"Center\">{8:f1}</TD>" +
                              "<TD Align=\"Center\">{9:f1}</TD>" +
+                             "<TD Align=\"Center\">{10:f1}</TD>" +
+                             "<TD Align=\"Center\">{11:f1}</TD>" +
                              "</TR>",
                             "ALL",
                             Total.GCCount,
@@ -250,6 +256,8 @@ namespace PerfMonitor
                             Total.MaxAllocRateMBSec,
                             Total.TotalPauseTimeMSec,
                             Total.TotalAllocatedMB,
+                            Total.TotalPauseTimeMSec / Total.TotalAllocatedMB,
+                            Total.TotalPauseTimeMSec / Total.TotalSizeAfterMB,
                             Total.TotalReclaimedMB,
                             Total.MeanPauseDurationMSec,
                             Total.MeanReclaimedMB);
@@ -268,6 +276,8 @@ namespace PerfMonitor
                                  "<TD Align=\"Center\">{7:f2}</TD>" +
                                  "<TD Align=\"Center\">{8:f2}</TD>" +
                                  "<TD Align=\"Center\">{9:f2}</TD>" +
+                                 "<TD Align=\"Center\">{10:f2}</TD>" +
+                                 "<TD Align=\"Center\">{11:f2}</TD>" +
                                  "</TR>",
                                 genNum,
                                 gen.GCCount,
@@ -276,6 +286,8 @@ namespace PerfMonitor
                                 gen.MaxAllocRateMBSec,
                                 gen.TotalPauseTimeMSec,
                                 gen.TotalAllocatedMB,
+                                gen.TotalPauseTimeMSec / gen.TotalAllocatedMB,
+                                gen.TotalPauseTimeMSec / gen.TotalSizeAfterMB,
                                 gen.TotalReclaimedMB,
                                 gen.MeanPauseDurationMSec,
                                 gen.MeanReclaimedMB);
@@ -287,14 +299,17 @@ namespace PerfMonitor
             writer.WriteLine("<H4><A Name=\"Events_{0}\">Individual GC Events for Process {1,5}: {2}<A></H4>", ProcessID, ProcessID, ProcessName);
             writer.WriteLine("<Center>");
             writer.WriteLine("<Table Border=\"1\">");
-            writer.WriteLine("<TR><TH colspan=\"20\" Align=\"Center\">GC Events by Time</TH></TR>");
-            writer.WriteLine("<TR><TH colspan=\"20\" Align=\"Center\">All times are in msec.  Start time is msec from trace start.</TH></TR>");
+            writer.WriteLine("<TR><TH colspan=\"22\" Align=\"Center\">GC Events by Time</TH></TR>");
+            writer.WriteLine("<TR><TH colspan=\"22\" Align=\"Center\">All times are in msec.  Start time is msec from trace start.</TH></TR>");
             writer.WriteLine("<TR>" +
                  "<TH>Start Time</TH>" +
                  "<TH>GC Num</TH>" +
                  "<TH>Gen</TH>" +
                  "<TH>Pause</TH>" +
                  "<TH>Alloc Rate<BR/>MB/sec</TH>" +
+                 "<TH>Alloc<BR/>MB</TH>" +
+                 "<TH>MSec GC/<BR/>Alloc MB</TH>" +
+                 "<TH>MSec GC/<BR/>Kept MB</TH>" +
                  "<TH>Before<BR/>MB</TH>" +
                  "<TH>After<BR/>MB</TH>" +
                  "<TH>Ratio<BR/>Before/After</TH>" +
@@ -310,20 +325,26 @@ namespace PerfMonitor
                                  "<TD Align=\"Center\">{1}</TD>" +
                                  "<TD Align=\"Center\">{2}</TD>" +
                                  "<TD Align=\"Center\">{3:f2}</TD>" +
-                                 "<TD Align=\"Center\">{4:f3}</TD>" +
+                                 "<TD Align=\"Center\">{4:f2}</TD>" +
                                  "<TD Align=\"Center\">{5:f2}</TD>" +
-                                 "<TD Align=\"Center\">{6:f2}</TD>" +
+                                 "<TD Align=\"Center\">{6:f3}</TD>" +
                                  "<TD Align=\"Center\">{7:f2}</TD>" +
                                  "<TD Align=\"Center\">{8:f2}</TD>" +
                                  "<TD Align=\"Center\">{9:f2}</TD>" +
-                                 "<TD Align=\"Center\">{10}</TD>" +
-                                 "<TD Align=\"Center\">{11}</TD>" +
+                                 "<TD Align=\"Center\">{10:f2}</TD>" +
+                                 "<TD Align=\"Center\">{11:f2}</TD>" +
+                                 "<TD Align=\"Center\">{12:f2}</TD>" +
+                                 "<TD Align=\"Center\">{13}</TD>" +
+                                 "<TD Align=\"Center\">{14}</TD>" +
                                  "</TR>",
                                  _event.PauseStartRelMSec,
                                  _event.GCNumber,
                                  _event.GCGeneration,
                                 _event.PauseDurationMSec,
                                 _event.AllocRateMBSec,
+                                _event.AllocedSinceLastGCMB,
+                                _event.GCDurationMSec / _event.AllocedSinceLastGCMB,
+                                _event.GCDurationMSec / _event.SizeAfterMB,
                                 _event.SizeBeforeMB,
                                 _event.SizeAfterMB,
                                 _event.RatioBeforeAfter,
@@ -337,9 +358,9 @@ namespace PerfMonitor
             writer.WriteLine("</Center>");
             writer.WriteLine("<HR/><HR/><BR/><BR/>");
         }
-        public virtual void ToXml(TextWriter writer)
+        public virtual void ToXml(TextWriter writer, string indent)
         {
-            writer.Write(" <GCProcess");
+            writer.Write("{0}<GCProcess", indent);
             writer.Write(" Process="); GCEvent.QuotePadLeft(writer, ProcessName, 10);
             writer.Write(" ProcessID="); GCEvent.QuotePadLeft(writer, ProcessID.ToString(), 5);
             if (ProcessCpuTimeMsec != 0)
@@ -354,26 +375,29 @@ namespace PerfMonitor
                 writer.Write(" CommandLine="); writer.Write(XmlUtilities.XmlQuote(CommandLine));
             }
             if (PeakVirtualMB != 0)
+            {
                 writer.Write(" PeakVirtualMB="); GCEvent.QuotePadLeft(writer, PeakVirtualMB.ToString(), 8);
+            }
             if (PeakWorkingSetMB != 0)
+            {
                 writer.Write(" PeakWorkingSetMB="); GCEvent.QuotePadLeft(writer, PeakWorkingSetMB.ToString(), 8);
+            }
             writer.WriteLine(">");
-            writer.WriteLine("  <Generations Count=\"{0}\" TotalGCCount=\"{1}\" TotalGCDurationMSec=\"{2}\">",
-                Generations.Length, Total.GCCount, Total.TotalGCDurationMSec);
+            writer.WriteLine("{0}  <Generations Count=\"{1}\" TotalGCCount=\"{2}\" TotalAllocatedMB=\"{3:f3}\" TotalGCDurationMSec=\"{4:f3}\" MSecPerMBAllocated=\"{5:f3}\">",
+                indent, Generations.Length, Total.GCCount, Total.TotalAllocatedMB, Total.TotalGCDurationMSec, Total.TotalGCDurationMSec / Total.TotalAllocatedMB);
             for (int gen = 0; gen < Generations.Length; gen++)
             {
-                writer.Write("   <Generation Gen=\"{0}\"", gen);
+                writer.Write("{0}   <Generation Gen=\"{1}\"", indent, gen);
                 Generations[gen].ToXmlAttribs(writer);
                 writer.WriteLine("/>");
             }
-            writer.WriteLine("  </Generations>");
+            writer.WriteLine("{0}  </Generations>", indent);
 
-            writer.WriteLine("  <GCEvents Count=\"{0}\">", events.Count);
+            writer.WriteLine("{0}  <GCEvents Count=\"{1}\">", indent, events.Count);
             foreach (GCEvent _event in events)
                 _event.ToXml(writer);
-            writer.WriteLine("  </GCEvents>");
-
-            writer.WriteLine(" </GCProcess>");
+            writer.WriteLine("{0}  </GCEvents>", indent);
+            writer.WriteLine("{0} </GCProcess>", indent);
         }
         #region private
         public virtual void Init(TraceEvent data)
@@ -409,7 +433,7 @@ namespace PerfMonitor
         public override string ToString()
         {
             StringWriter sw = new StringWriter();
-            ToXml(sw);
+            ToXml(sw, "");
             return sw.ToString();
         }
 
@@ -423,6 +447,15 @@ namespace PerfMonitor
         // Keep track of the last time we started suspending the EE.  Will use in 'Start' to set PauseStartRelMSec
         int suspendThreadID = -1;
         double GCSuspendTimeRelativeMSec = -1;
+
+        #endregion
+
+        #region IComparable<GCProcess> Members
+
+        public int CompareTo(GCProcess other)
+        {
+            return ProcessCpuTimeMsec.CompareTo(other.ProcessCpuTimeMsec);
+        }
 
         #endregion
     }
@@ -462,6 +495,7 @@ namespace PerfMonitor
             writer.Write(" TotalAllocatedMB="); GCEvent.QuotePadLeft(writer, TotalAllocatedMB.ToString("f1"), 10);
             writer.Write(" TotalReclaimedMB="); GCEvent.QuotePadLeft(writer, TotalReclaimedMB.ToString("f1"), 10);
             writer.Write(" TotalGCDurationMSec="); GCEvent.QuotePadLeft(writer, TotalGCDurationMSec.ToString("f3"), 10);
+            writer.Write(" MSecPerMBAllocated="); GCEvent.QuotePadLeft(writer, (TotalGCDurationMSec/TotalAllocatedMB).ToString("f3"), 10);
             writer.Write(" TotalPauseTimeMSec="); GCEvent.QuotePadLeft(writer, TotalPauseTimeMSec.ToString("f3"), 10);
             writer.Write(" MaxAllocRateMBSec="); GCEvent.QuotePadLeft(writer, MaxAllocRateMBSec.ToString("f3"), 10);
             writer.Write(" MeanGCDurationMSec="); GCEvent.QuotePadLeft(writer, MeanGCDurationMSec.ToString("f3"), 10);
@@ -478,12 +512,12 @@ namespace PerfMonitor
         public double PauseStartRelMSec;        //  Set in SuspendGCStart
         public double PauseDurationMSec;        //  Total time EE is suspended (can be less than GC time for background)
         public double DurationSinceLastGCMSec;  //  Set in Start
-        public double AllocedSinceLastGC;       //  Set in Start
+        public double AllocedSinceLastGCMB;       //  Set in Start
         public double SizeBeforeMB;             //  Set in Start
         public double SizeAfterMB;              //  Set in HeapStats
         public double SizeReclaimed { get { return SizeBeforeMB - SizeAfterMB; } }
         public double RatioBeforeAfter { get { if (SizeAfterMB == 0) return 0; return SizeBeforeMB / SizeAfterMB; } }
-        public double AllocRateMBSec { get { return AllocedSinceLastGC * 1000.0 / DurationSinceLastGCMSec; } }
+        public double AllocRateMBSec { get { return AllocedSinceLastGCMB * 1000.0 / DurationSinceLastGCMSec; } }
         public int GCNumber;                    //  Set in Start (starts at 1, unique for process)
         public int GCGeneration;                //  Set in Start (Generation 0, 1 or 2)
         public double GCDurationMSec;           //  Set in Stop This is JUST the GC time (not including suspension)
@@ -508,7 +542,7 @@ namespace PerfMonitor
             writer.Write(" SuspendDurationMSec="); QuotePadLeft(writer, SuspendDurationMSec.ToString("f3").ToString(), 10);
             writer.Write(" GCStartRelMSec="); QuotePadLeft(writer, GCStartRelMSec.ToString("f3"), 10);
             writer.Write(" DurationSinceLastGCMSec="); QuotePadLeft(writer, DurationSinceLastGCMSec.ToString("f3"), 5);
-            writer.Write(" AllocedSinceLastGC="); QuotePadLeft(writer, AllocedSinceLastGC.ToString("f3"), 5);
+            writer.Write(" AllocedSinceLastGC="); QuotePadLeft(writer, AllocedSinceLastGCMB.ToString("f3"), 5);
             writer.Write(" Type="); QuotePadLeft(writer, Type.ToString(), 18);
             writer.Write(" Reason="); QuotePadLeft(writer, Reason.ToString(), 27);
             writer.WriteLine("/>");
@@ -592,7 +626,7 @@ namespace PerfMonitor
     /// <summary>
     /// JitProcess holds information about Jitting for a particular process.
     /// </summary>
-    class JitProcess : ProcessLookupContract
+    class JitProcess : ProcessLookupContract, IComparable<JitProcess>
     {
         public static ProcessLookup<JitProcess> Collect(TraceEventDispatcher source)
         {
@@ -673,7 +707,7 @@ namespace PerfMonitor
             if (Total.JitTimeMSec != 0)
                 writer.WriteLine("<LI>% CPU Time spent JIT compiling: {0:f1}%</LI>", Total.JitTimeMSec * 100.0 / ProcessCpuTimeMsec);
             writer.WriteLine("<LI><A HREF=\"#Events_{0}\">Individual JIT Events</A></LI>", ProcessID);
-            var usersGuideFile = ReportGenerator.WriteUsersGuide(fileName);
+            var usersGuideFile = UsersGuide.WriteUsersGuide(fileName);
             writer.WriteLine("<LI> <A HREF=\"{0}#UnderstandingJITPerf\">JIT Perf Users Guide</A></LI>", usersGuideFile);
             writer.WriteLine("</UL>");
 
@@ -686,8 +720,8 @@ namespace PerfMonitor
             writer.WriteLine("<P>" +
                 "The list below is also useful for tuning the startup performance of your application in general.  \r\n" +
                 "In general you want as little to be run during startup as possible.  \r\n" +
-                "If you have 1000s of methods being compiled on startup " + 
-                "you should try to defer some of that computation until absolutely necessary.\r\n" + 
+                "If you have 1000s of methods being compiled on startup " +
+                "you should try to defer some of that computation until absolutely necessary.\r\n" +
                 "</P>");
 
             // Sort the module list by Jit Time;
@@ -731,13 +765,14 @@ namespace PerfMonitor
             writer.WriteLine("</Center>");
             writer.WriteLine("<HR/><HR/><BR/><BR/>");
         }
-        public virtual void ToXml(TextWriter writer)
+        public virtual void ToXml(TextWriter writer, string indent)
         {
+            // TODO pay attention to indent;
             writer.Write(" <JitProcess Process=\"{0}\" ProcessID=\"{1}\" JitTimeMSec=\"{2:f3}\" Count=\"{3}\" ILSize=\"{4}\" NativeSize=\"{5}\"",
                 ProcessName, ProcessID, Total.JitTimeMSec, Total.Count, Total.ILSize, Total.NativeSize);
             if (ProcessCpuTimeMsec != 0)
                 writer.Write(" ProcessCpuTimeMsec=\"{0}\"", ProcessCpuTimeMsec);
-            if (CommandLine != null)
+            if (!string.IsNullOrEmpty(CommandLine))
                 writer.Write(" CommandLine=\"{0}\"", XmlUtilities.XmlEscape(CommandLine, false));
             writer.WriteLine(">");
             writer.WriteLine("  <JitEvents>");
@@ -856,7 +891,7 @@ namespace PerfMonitor
         public override string ToString()
         {
             StringWriter sw = new StringWriter();
-            ToXml(sw);
+            ToXml(sw, "");
             return sw.ToString();
         }
 
@@ -864,110 +899,226 @@ namespace PerfMonitor
         Dictionary<long, string> moduleNamesFromID = new Dictionary<long, string>();
         SortedDictionary<string, JitInfo> moduleStats = new SortedDictionary<string, JitInfo>(StringComparer.OrdinalIgnoreCase);
         #endregion
+
+        #region IComparable<JitProcess> Members
+        public int CompareTo(JitProcess other)
+        {
+            return ProcessCpuTimeMsec.CompareTo(other.ProcessCpuTimeMsec);
+        }
+        #endregion
     }
 
-    class DllProcess : ProcessLookupContract
+    public class DllProcess : ProcessLookupContract, IComparable<DllProcess>
     {
         public static ProcessLookup<DllProcess> Collect(TraceEventDispatcher source)
         {
+            var symbols = new SymbolTraceEventParser(source);
             ProcessLookup<DllProcess> perProc = new ProcessLookup<DllProcess>();
-            source.Kernel.ImageLoad += delegate(ImageLoadTraceData data)
-            {
-                DllProcess stats = perProc[data];
-                stats.m_images.Add((ImageLoadTraceData)data.Clone());
-            };
 
-            /***
-            source.Kernel.DiskIoRead += delegate(DiskIoTraceData data)
+            source.Kernel.ProcessGroup += delegate(ProcessTraceData data)
             {
-            };
-             ****/
+                var proc = perProc[data];
+                if (proc.ProcessName == null)
+                    proc.ProcessName = data.ProcessName;
 
-            source.Clr.LoaderModuleLoad += delegate(ModuleLoadUnloadTraceData data)
-            {
-                DllProcess stats = perProc[data];
-                stats.m_modules.Add((ModuleLoadUnloadTraceData)data.Clone());
+                if (proc.CommandLine == null)
+                {
+                    var commandLine = data.CommandLine;
+                    if (commandLine.Length > 0)
+                        proc.CommandLine = commandLine;
+                }
+                if (proc.StartTimeRelMSec == 0 && data.Opcode == TraceEventOpcode.Start)
+                    proc.StartTimeRelMSec = data.TimeStampRelativeMSec;
+                if (proc.EndTimeRelMSec == 0 && data.Opcode == TraceEventOpcode.Stop)
+                    proc.EndTimeRelMSec = data.TimeStampRelativeMSec;
+                if (proc.ParentID == 0)
+                    proc.ParentID = data.ParentID;
             };
             source.Clr.RuntimeStart += delegate(RuntimeInformationTraceData data)
             {
-                DllProcess stats = perProc[data];
-                if (stats.CommandLine == null)
-                    stats.CommandLine = data.CommandLine;
+                DllProcess proc = perProc[data];
+                if (proc.CommandLine == null)
+                {
+                    var commandLine = data.CommandLine;
+                    if (commandLine.Length > 0)
+                        proc.CommandLine = commandLine;
+                }
             };
-            source.Kernel.ProcessStart += delegate(ProcessTraceData data)
+            FileVersionTraceData lastFileVersionInfo = null;
+            DbgIDRSDSTraceData lastDbgInfo = null;
+            source.Kernel.ImageGroup += delegate(ImageLoadTraceData data)
             {
-                var stats = perProc[data];
-                var commandLine = data.CommandLine;
-                if (!string.IsNullOrEmpty(commandLine))
-                    stats.CommandLine = commandLine;
+                DllProcess proc = perProc[data];
+                DllInfo dllInfo = proc.GetDllInfo(data.ImageBase, data.ImageSize, data.TimeStamp100ns);
+                if (dllInfo.Path == null)
+                    dllInfo.Path = data.FileName;
+                if (dllInfo.Size == 0)
+                    dllInfo.Size = data.ImageSize;
+                if (data.Opcode == TraceEventOpcode.Start && dllInfo.LoadTimeRelMsec == 0)
+                    dllInfo.LoadTimeRelMsec = data.TimeStampRelativeMSec;
+                if (data.Opcode == TraceEventOpcode.Stop && dllInfo.UnloadTimeRelMsec == 0)
+                    dllInfo.UnloadTimeRelMsec = data.TimeStampRelativeMSec;
+                if (lastFileVersionInfo != null && lastFileVersionInfo.TimeStamp100ns == data.TimeStamp100ns)
+                {
+                    dllInfo.FileVersion = lastFileVersionInfo.FileVersion;
+                }
+                if (lastDbgInfo != null && lastDbgInfo.TimeStamp100ns == data.TimeStamp100ns)
+                {
+                    dllInfo.PdbSimpleName = lastDbgInfo.PdbFileName;
+                    dllInfo.PdbGuid = lastDbgInfo.GuidSig;
+                    dllInfo.PdbAge = lastDbgInfo.Age;
+                }
+            };
+            symbols.FileVersion += delegate(FileVersionTraceData data)
+            {
+                lastFileVersionInfo = (FileVersionTraceData)data.Clone();
             };
 
-            /**
+            symbols.DbgIDRSDS += delegate(DbgIDRSDSTraceData data)
+            {
+                lastDbgInfo = (DbgIDRSDSTraceData)data.Clone();
+            };
+            Address lastPerfInfoSample = 0;
+            source.Kernel.PerfInfoSampleProf += delegate(SampledProfileTraceData data)
+            {
+                DllProcess proc = perProc[data];
+                lastPerfInfoSample = data.InstructionPointer;
+                proc.AddSample(data.InstructionPointer, data.TimeStamp100ns, true, true);
+            };
+
+            source.Kernel.AddToAllMatching(delegate(DiskIoTraceData data)
+            {
+                DllProcess proc = perProc[data];
+
+                FileInfo fileInfo = proc.GetFileInfo(data.FileObject);
+                fileInfo.Path = data.FileName;
+                // Do I care about Read vs Write?
+                fileInfo.DiskIOMB += data.TransferSize / 1000000.0F;
+                proc.DiskIOMB += data.TransferSize / 1000000.0F;
+                fileInfo.DiskIOCount++;
+                proc.DiskIOCount++;
+                fileInfo.DiskIOMSec += (float)data.ElapsedTimeMSec;
+                proc.DiskIOMSec += (float)data.ElapsedTimeMSec;
+            });
+
+            source.Kernel.StackWalk += delegate(StackWalkTraceData data)
+            {
+                DllProcess proc = perProc[data];
+                if (data.FrameCount > 0)
+                {
+                    bool isForCPUSample = (lastPerfInfoSample == data.InstructionPointer(0));
+                    for (int i = 1; i < data.FrameCount; i++)
+                        proc.AddSample(data.InstructionPointer(i), data.TimeStamp100ns, false, isForCPUSample);
+                }
+            };
             source.Kernel.PageFaultHardFault += delegate(PageFaultHardFaultTraceData data)
             {
+                DllProcess proc = perProc[data];
+                DllInfo dllInfo = proc.ProbeDllInfo(data.VirtualAddress, data.TimeStamp100ns);
 
-
+                proc.PageFaults++;
+                dllInfo.PageFaults++;
             };
-            **/
+
+            source.Clr.LoaderModuleLoad += delegate(ModuleLoadUnloadTraceData data)
+            {
+                DllProcess proc = perProc[data];
+                proc.CLRLoads.Add((ModuleLoadUnloadTraceData)data.Clone());
+            };
 
             source.Process();
+
+            // At this point, all of our FileInfos probably don't have names because 
+            // we did not know the name until very late in the trace.   However now that
+            // the trace is done we can fill them in.  
+
+            var byName = new Dictionary<string, FileInfo>();
+            foreach (var proc in perProc)
+            {
+                byName.Clear();
+                foreach (var fileInfo in proc.Files.Values)
+                {
+                    // See if we have a real name for the file object
+                    if (fileInfo.Path.Length == 0)
+                        fileInfo.Path = source.Kernel.FileIDToFileName(fileInfo.FileObject);
+
+                    if (fileInfo.Path.Length > 0)
+                        byName[fileInfo.Path] = fileInfo;
+                }
+                // Link the DLL information to the file information. 
+                foreach (var image in proc.Images)
+                    byName.TryGetValue(image.Path, out image.FileInfo);
+            }
             return perProc;
         }
 
         public void Init(TraceEvent data)
         {
             ProcessID = data.ProcessID;
-            ProcessName = data.ProcessName;
-            m_images = new List<ImageLoadTraceData>();
-            m_modules = new List<ModuleLoadUnloadTraceData>();
+            CLRLoads = new List<ModuleLoadUnloadTraceData>();
+            Files = new Dictionary<Address, FileInfo>();
+            OutsideImages = new DllInfo() { Path = "<<NO IMAGE>>" };
         }
-        public void ToXml(TextWriter writer)
+        public void ToXml(TextWriter writer, string indent)
         {
-            writer.Write(" <DllLoads Process=\"{0}\" ProcessID=\"{1}\"", ProcessName, ProcessID);
-            if (CommandLine != null)
-                writer.Write(" CommandLine=\"{0}\"", XmlUtilities.XmlEscape(CommandLine));
+            writer.Write("{0}<Process Name=\"{1}\" ID=\"{2}\"", indent, ProcessName, ProcessID);
+            if (CPUSamples > 0)
+                writer.Write(" CpuMSec=\"{0}\"", CPUSamples);
+            writer.WriteLine(" ParentID=\"{0}\"", ParentID);
+            if (!string.IsNullOrEmpty(CommandLine))
+                writer.WriteLine("{0} CommandLine=\"{1}\"", indent, XmlUtilities.XmlEscape(CommandLine));
+
+            if (StartTimeRelMSec != 0)
+                writer.Write("{0} StartTimeRelMSec=\"{1:n3}\"", indent, StartTimeRelMSec);
+            if (EndTimeRelMSec != 0)
+            {
+                writer.Write(" EndTimeRelMSec=\"{0:n3}\"", EndTimeRelMSec);
+                writer.Write(" DurationMSec=\"{0:n3}\"", DurationMSec);
+            }
             writer.WriteLine(">");
 
-            StringBuilder sb = new StringBuilder();
-            if (m_modules.Count > 0)
+
+            if (Images.Count > 0)
             {
-                writer.WriteLine("   <ModuleLoads>");
-                foreach (var module in m_modules)
-                {
-                    module.ToXml(sb);
-                    writer.Write("    ");
-                    writer.WriteLine(sb);
-                    sb.Length = 0;
-                }
-                writer.WriteLine("   </ModuleLoads>");
+                writer.Write("{0}  <ImageLoads Count=\"{0}\"", indent, Images.Count);
+                if (CPUSamples > 0)
+                    writer.Write(" CpuMSec=\"{0}\"", CPUSamples);
+                if (PageFaults > 0)
+                    writer.Write(" PageFaults=\"{1}\"", indent, PageFaults);
+                writer.WriteLine(">");
+                List<DllInfo> sortedImages = new List<DllInfo>();
+                foreach (var image in Images)
+                    sortedImages.Add(image);
+                sortedImages.Sort((x, y) => x.CPUSamplesExclusive.CompareTo(y.CPUSamplesExclusive));
+
+                for (int i = sortedImages.Count - 1; i >= 0; --i)
+                    sortedImages[i].ToXml(writer, indent + "    ");
+                writer.WriteLine("{0}   </ImageLoads>", indent);
             }
 
-            if (m_images.Count > 0)
+            if (Files.Count > 0)
             {
-                writer.WriteLine("   <ImageLoads>");
-                foreach (var image in m_images)
-                {
-                    image.ToXml(sb);
-                    writer.Write("    ");
-                    var element = sb.ToString();
-                    sb.Length = 0;
+                writer.Write("{0}  <Files", indent);
+                writer.Write(" DiskIOMSec=\"{0:n3}\"", DiskIOMSec);
+                writer.Write(" DiskIOMB=\"{0:n3}\"", DiskIOMB);
+                writer.Write(" DiskIOCount=\"{0}\"", DiskIOCount);
+                writer.WriteLine(">");
 
-                    var callstack = image.CallStack();
-                    if (callstack != null)
-                    {
-                        element = XmlUtilities.OpenXmlElement(element);
-                        writer.WriteLine(element);
-                        writer.Write("   ");
-                        writer.Write(callstack.ToString().Replace("\n", "\n   "));
-                        writer.WriteLine("    </Event>");
-                    }
-                    else 
-                        writer.Write(element);
-                }
-                writer.WriteLine("   </ImageLoads>");
+                List<FileInfo> sortedFiles = new List<FileInfo>(Files.Values);
+                sortedFiles.Sort((x, y) => x.DiskIOMSec.CompareTo(y.DiskIOMSec));
+                for (int i = sortedFiles.Count - 1; i >= 0; --i)
+                    sortedFiles[i].ToXml(writer, indent + "    ");
+                writer.WriteLine("{0}  </Files>", indent);
             }
 
-            writer.WriteLine(" </DllLoads>");
+            if (CLRLoads.Count > 0)
+            {
+                writer.WriteLine("{0}  <CLRLoads Count=\"{1}\">", indent, CLRLoads.Count);
+                foreach (var clrModule in CLRLoads)
+                    writer.WriteLine("{0}    <CLRLoad ILPath=\"{1}\"/>", indent, clrModule.ModuleILPath);
+                writer.WriteLine("{0}  </CLRLoads>", indent);
+            }
+            writer.WriteLine(" </Process>");
         }
         public void ToHtml(TextWriter writer, string fileName)
         {
@@ -978,45 +1129,191 @@ namespace PerfMonitor
         public string ProcessName { get; set; }
         public string CommandLine { get; set; }
 
-        List<ImageLoadTraceData> m_images;
-        List<ModuleLoadUnloadTraceData> m_modules;
-    }
+        public int ParentID;
+        public int CPUSamples;
 
-    /** TODO REMOVE?
-    class DllInfo
-    {
-        public DllInfo(string name, Address baseAddress, int size, double loadTimeRelMSec)
+        public double StartTimeRelMSec;
+        public double EndTimeRelMSec;
+        public double DurationMSec { get { return EndTimeRelMSec - StartTimeRelMSec; } }
+
+        public int PageFaults;
+
+        public float DiskIOMB;
+        public int DiskIOCount;
+        public float DiskIOMSec;
+
+        public GrowableArray<DllInfo> Images;         // This is sorted by imageBase.  
+        public Dictionary<Address, FileInfo> Files;
+        public DllInfo OutsideImages;
+        public List<ModuleLoadUnloadTraceData> CLRLoads;
+        public int CompareTo(DllProcess other)
         {
-            Name = name;
-            BaseAddress = baseAddress;
-            Size = size;
-            LoadTimeRelMsec = loadTimeRelMSec;
+            var ret = CPUSamples.CompareTo(other.CPUSamples);
+            if (ret != 0)
+                return ret;
+            return ret;
         }
 
-        public double LoadTimeRelMsec;
-        public string Name;
-        public Address BaseAddress;
-        public int Size;
-        public TraceCallStack LoadCallStack;
+        #region private
 
-        public void ToXml(StringBuilder sb)
+        /// <summary>
+        /// Called every time we have a address.  This routine finds the DLL it lives in and increments its stats.
+        /// </summary>
+        /// <param name="address">The address to lookup</param>
+        /// <param name="timeStamp100ns">Timestamp of the event associted with the address</param>
+        /// <param name="isExclusiveSample">Is this the current CPU EIP?</param>
+        /// <param name="isForCPUSample">Is this a CPU profile sample?  (coudl be a CSwitch ...)</param>
+        private void AddSample(Address address, long timeStamp100ns, bool isExclusiveSample, bool isForCPUSample)
         {
-            sb.Append("    <ImageLoad");
-            sb.Append(" LoadTimeRelMSec=\"").Append(LoadTimeRelMsec.ToString("f3")).Append("\"");
-            sb.Append(" Name=\"").Append(Name).Append("\"");
-            sb.Append(" BaseAddress=\"0x").Append(((long)BaseAddress).ToString("x")).Append("\"");
-            sb.Append(" Size=\"0x").Append(((long)Size).ToString("x")).Append("\"");
-            sb.Append(">").AppendLine();
-            if (LoadCallStack != null)
+            DllInfo dllInfo = ProbeDllInfo(address, timeStamp100ns);
+            if (isForCPUSample)
             {
-                sb.Append("     <StackTrace>").AppendLine();
-                LoadCallStack.ToString(sb);
-                sb.Append("     </StackTrace>").AppendLine();
+                if (isExclusiveSample)
+                    dllInfo.CPUSamplesExclusive++;
+                dllInfo.CPUSamplesInclusive++;
+                CPUSamples++;
             }
-            sb.Append("    </ImageLoad>").AppendLine();
+            dllInfo.AnyStack++;
+        }
+
+        GrowableArray<DllInfo>.Comparison<Address> dllInfoCompare = delegate(Address key, DllInfo info)
+        {
+            if (key < info.ImageBase)
+                return -1;
+            if (key > info.ImageBase)
+                return 1;
+            return 0;
+        };
+        /// <summary>
+        /// Get the DllInfo associated with 'address' at time 'timeStamp100ns' Unlike GetDllInfo
+        /// if an existing DllInfo is now found, it will return an 'other' DLL.  
+        /// </summary>
+        private DllInfo ProbeDllInfo(Address interiorAddress, long timeStamp100ns)
+        {
+            int index;
+            var found = Images.BinarySearch(interiorAddress, out index, dllInfoCompare);
+            if (index < 0)
+                return OutsideImages;
+            var ret = Images[index];
+            if ((Address)((long)ret.ImageBase + ret.Size) <= interiorAddress)
+                return OutsideImages;
+            return ret;
+        }
+
+        /// <summary>
+        /// Gets a DllInfo that tracks 'address' at time 'timeStamp100ns'   
+        /// It alwasy returns something, creating a new entry as needed.  
+        /// </summary>
+        private DllInfo GetDllInfo(Address address, int size, long timeStamp100ns)
+        {
+            int index;
+            var found = Images.BinarySearch(address, out index, dllInfoCompare);
+            if (found)
+                return Images[index];
+
+            var ret = new DllInfo() { ImageBase = address, Size = size };
+            Images.Insert(index + 1, ret);
+            return ret;
+        }
+
+        /// <summary>
+        /// Gets a fileInfo given a fileObject.  Creates a new one if necessary. 
+        /// </summary>
+        /// <param name="fileObject"></param>
+        /// <returns></returns>
+        private FileInfo GetFileInfo(Address fileObject)
+        {
+            FileInfo fileInfo;
+            if (!Files.TryGetValue(fileObject, out fileInfo))
+            {
+                fileInfo = new FileInfo();
+                fileInfo.FileObject = fileObject;
+                Files.Add(fileObject, fileInfo);
+            }
+            return fileInfo;
+        }
+        #endregion
+    }
+
+    public class FileInfo
+    {
+        public void ToXml(TextWriter writer, string indent)
+        {
+            writer.Write("{0}<File", indent);
+            writer.Write(" DiskIOMSec=\"{0:n3}\"", DiskIOMSec);
+            writer.Write(" DiskIOMB=\"{0:n3}\"", DiskIOMB);
+            writer.Write(" DiskIOCount=\"{0}\"", DiskIOCount);
+            writer.Write(" Path=\"{0}\"", XmlUtilities.XmlEscape(Path));
+            writer.WriteLine("/>");
+        }
+
+        public string Path;
+        public float DiskIOMB;
+        public int DiskIOCount;
+        public float DiskIOMSec;
+        public DllInfo DllInfo;
+        public Address FileObject;      // ID from the OS's point of view. 
+    }
+
+    public class DllInfo
+    {
+        public double LoadTimeRelMsec;
+        public double UnloadTimeRelMsec;
+
+        public Address ImageBase;
+        public int Size;
+
+        public string Path;
+        public string FileVersion;
+        public FileInfo FileInfo;
+
+        public string PdbSimpleName;
+        public Guid PdbGuid;
+        public int PdbAge;
+
+        public int PageFaults;
+
+        public int CPUSamplesExclusive;
+        public int CPUSamplesInclusive;
+
+        public int AnyStack;    // This DLL was in any stack that was collected.  
+
+        public void ToXml(TextWriter writer, string indent)
+        {
+            writer.Write("{0}<Image Name=\"{1}\"", indent, XmlUtilities.XmlEscape(System.IO.Path.GetFileNameWithoutExtension(Path)));
+            if (CPUSamplesInclusive != 0)
+            {
+                writer.Write(" CPUExc=\"{0}\"", CPUSamplesExclusive);
+                writer.Write(" CPUInc=\"{0}\"", CPUSamplesInclusive);
+            }
+            if (PageFaults != 0)
+                writer.Write(" PageFaults=\"{0}\"", PageFaults);
+            writer.WriteLine("{0} AnyStack=\"{1}\"", indent, AnyStack);
+
+            writer.Write("{0} ImageBase=\"0x{1:x}\"", indent, ImageBase);
+            writer.WriteLine(" Size=\"0x{0:x}\"", Size);
+            if (FileVersion != null)
+                writer.WriteLine("{0} FileVersion=\"{1}\"", indent, XmlUtilities.XmlEscape(FileVersion));
+            if (LoadTimeRelMsec != 0)
+                writer.WriteLine("{0} LoadTimeRelMsec=\"{1:n3}\"", indent, LoadTimeRelMsec);
+            if (UnloadTimeRelMsec != 0)
+                writer.WriteLine("{0} UnloadTimeRelMsec=\"{1:n3}\"", indent, UnloadTimeRelMsec);
+
+            if (PdbSimpleName != null)
+            {
+                writer.Write(indent);
+                writer.Write(" PdbSimpleName=\"{0}\"", PdbSimpleName);
+                writer.Write(" PdbGuid=\"{0}\"", PdbGuid);
+                writer.WriteLine(" PdbAge=\"{0}\"", PdbAge);
+            }
+
+            writer.WriteLine(">");
+
+            if (FileInfo != null && FileInfo.DiskIOCount != 0)
+                FileInfo.ToXml(writer, indent + "  ");
+            writer.WriteLine("{0}</Image>", indent);
         }
     }
-     ****/
 
     /************************************************************************/
     /*  Reusable stuff */
@@ -1041,7 +1338,7 @@ namespace PerfMonitor
     /// <summary>
     /// ProcessLookup is a generic lookup by process.  
     /// </summary>
-    class ProcessLookup<T> : IEnumerable<T> where T : ProcessLookupContract, new()
+    public class ProcessLookup<T> : IEnumerable<T> where T : ProcessLookupContract, new()
     {
         /// <summary>
         /// Given an event, find the 'T' that cooresponds to that the process 
@@ -1070,10 +1367,11 @@ namespace PerfMonitor
         public void ToXml(TextWriter writer, string tag)
         {
             writer.WriteLine("<{0} Count=\"{0}\">", tag, perProc.Count);
-            foreach (T stats in perProc.Values)
-            {
-                stats.ToXml(writer);
-            }
+            List<T> sortedProcs = new List<T>(perProc.Values);
+            sortedProcs.Sort();
+
+            for (int i = sortedProcs.Count - 1; i >= 0; --i)
+                sortedProcs[i].ToXml(writer, "");
             writer.WriteLine("</{0}>", tag);
         }
         public void ToHtml(TextWriter writer, string fileName, string title, Predicate<T> filter)
@@ -1140,7 +1438,7 @@ namespace PerfMonitor
     /// ProcessLookupContract is used by code:ProcessLookup.  The type
     /// parameter needs to implement these functions 
     /// </summary>
-    interface ProcessLookupContract
+    public interface ProcessLookupContract
     {
         /// <summary>
         /// Init is called after a new 'T' is created, to initialize the new instance
@@ -1149,10 +1447,23 @@ namespace PerfMonitor
         /// <summary>
         /// Prints the 'T' as XML, to 'writer'
         /// </summary>
-        void ToXml(TextWriter writer);
+        void ToXml(TextWriter writer, string indent);
         void ToHtml(TextWriter writer, string fileName);
         int ProcessID { get; }
         string ProcessName { get; }
         string CommandLine { get; }
     }
+
+    public class UsersGuide
+    {
+        public static string WriteUsersGuide(string inputFileName)
+        {
+
+            var usersGuideName = Path.ChangeExtension(Path.ChangeExtension(inputFileName, null), "usersGuide.html");
+            if (!File.Exists(usersGuideName) || (DateTime.UtcNow - File.GetLastWriteTimeUtc(usersGuideName)).TotalHours > 1)
+                ResourceUtilities.UnpackResourceAsFile(@".\UsersGuide.htm", usersGuideName);
+            return Path.GetFileName(usersGuideName);        // return the relative path
+        }
+    }
+
 }

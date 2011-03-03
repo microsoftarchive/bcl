@@ -19,7 +19,6 @@
     <DebugType>full</DebugType>
     <Optimize>false</Optimize>
     <OutputPath>bin\Debug\</OutputPath>
-    <PlatformTarget>x86</PlatformTarget>
     <DefineConstants>DEBUG;TRACE</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
@@ -32,7 +31,6 @@
     <DebugType>pdbonly</DebugType>
     <Optimize>true</Optimize>
     <OutputPath>bin\Release\</OutputPath>
-    <PlatformTarget>x86</PlatformTarget>
     <DefineConstants>TRACE</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
@@ -46,9 +44,10 @@
     <Compile Include="DynamicTraceEventParser.cs" />
     <Compile Include="ETWTraceEventSource.cs" />
     <Compile Include="Manifest.cs" />
+    <Compile Include="PEFile.cs" />
     <Compile Include="Stacks\Stacks.cs" />
     <Compile Include="SymbolEventParser.cs" />
-    <Compile Include="SymbolResolver.cs" />
+    <Compile Include="SymbolReader.cs" />
     <Compile Include="KernelTraceEventParser.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="TraceEvent.cs" />

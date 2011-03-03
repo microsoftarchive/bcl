@@ -53,7 +53,7 @@ namespace Diagnostics.Eventing
             /// <summary>
             /// Logs the mapping of file IDs to actual (kernel) file names. 
             /// </summary>
-            DiskFileIO = 0x00000200, 
+            DiskFileIO = 0x00000200,
             /// <summary>
             /// Loads the completion of Physical disk activity. 
             /// </summary>
@@ -137,7 +137,7 @@ namespace Diagnostics.Eventing
             /// <summary>
             /// Logs Advanced Local Procedure call events. 
             /// </summary>
-            AdvancedLocalProcedureCalls  = 0x00100000,
+            AdvancedLocalProcedureCalls = 0x00100000,
             /// <summary>
             /// log defered procedure calls (an Kernel mechanism for having work done asynchronously) (Vista+ only)
             /// </summary> 
@@ -203,7 +203,33 @@ namespace Diagnostics.Eventing
                     Debug.Assert(data.ProcessID >= 0);
                     State.threadIDtoProcessID.Add((Address)data.ThreadID, data.TimeStamp100ns, data.ProcessID);
                 };
+                VolumeMapping += delegate(VolumeMappingTraceData data)
+                {
+                    // Remove trailing \
+                    var kernelPath = data.NtPath;
+                    if (kernelPath.Length > 0 && kernelPath[kernelPath.Length - 1] == '\\')
+                        kernelPath = kernelPath.Substring(0, kernelPath.Length - 1);
+                    var dosPath = data.DosPath;
+                    if (dosPath.Length > 0 && dosPath[dosPath.Length - 1] == '\\')
+                        dosPath = dosPath.Substring(0, dosPath.Length - 1);
+                    State.kernelToDriveMap.Add(new KeyValuePair<string, string>(kernelPath, dosPath));
+                };
+                SystemPaths += delegate(SystemPathsTraceData data)
+                {
+                    // Remove trailing \
+                    var windows = data.SystemWindowsDirectory;
+                    if (windows.Length > 0 && windows[windows.Length - 1] == '\\')
+                        windows = windows.Substring(0, windows.Length - 1);
+
+                    State.kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\Windows", windows));
+                };
+
             }
+        }
+
+        public string FileIDToFileName(Address fileObject, long time100ns = long.MaxValue)
+        {
+            return State.KernelToUser(State.FileIDToName(fileObject, time100ns));
         }
 
         public event Action<EventTraceHeaderTraceData> EventTraceHeader
@@ -308,6 +334,19 @@ namespace Diagnostics.Eventing
                 throw new Exception("Not supported");
             }
         }
+        public event Action<ProcessTraceData> ProcessGroup
+        {
+            add
+            {
+                ProcessEndGroup += value;
+                ProcessStartGroup += value;
+            }
+            remove
+            {
+                throw new Exception("Not supported");
+            }
+        }
+
         public event Action<ProcessTraceData> ProcessDCStart
         {
             add
@@ -1467,6 +1506,18 @@ namespace Diagnostics.Eventing
                 throw new Exception("Not supported");
             }
         }
+        public event Action<ImageLoadTraceData> ImageGroup
+        {
+            add
+            {
+                ImageLoadGroup += value;
+                ImageUnloadGroup += value;
+            }
+            remove
+            {
+                throw new Exception("Not supported");
+            }
+        }
         public event Action<ImageLoadTraceData> ImageLoad
         {
             add
@@ -1701,6 +1752,20 @@ namespace Diagnostics.Eventing
                 throw new Exception("Not supported");
             }
         }
+        public event Action<PageFaultMemInfoTraceData> MemInfo
+        {
+            add
+            {
+                // action, eventid, taskid, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName
+                source.RegisterEventTemplate(new PageFaultMemInfoTraceData(value, 0xFFFF, 10, "PageFault", PageFaultTaskGuid, 112, "MemInfo", ProviderGuid, ProviderName, State));
+            }
+            remove
+            {
+                throw new Exception("Not supported");
+            }
+        }
+
+
         public event Action<SampledProfileTraceData> PerfInfoSampleProf
         {
             add
@@ -2109,6 +2174,59 @@ namespace Diagnostics.Eventing
             }
         }
 
+        public event Action<BuildInfoTraceData> BuildInfo
+        {
+            add
+            {
+                source.RegisterEventTemplate(new BuildInfoTraceData(value, 0xFFFF, 0, "SysConfigEx", SysConfigExTaskGuid, 32, "BuidlInfo", ProviderGuid, ProviderName));
+            }
+            remove
+            {
+                throw new NotImplementedException();
+            }
+        }
+
+        /// <summary>
+        /// File names in ETW are the Kernel names, which need to be mapped to the drive specification users see. 
+        /// This event indicates this mapping. 
+        /// </summary>
+        public event Action<VolumeMappingTraceData> VolumeMapping
+        {
+            add
+            {
+                source.RegisterEventTemplate(new VolumeMappingTraceData(value, 0xFFFF, 0, "SysConfigEx", SysConfigExTaskGuid, 35, "VolumeMapping", ProviderGuid, ProviderName));
+            }
+            remove
+            {
+                throw new NotImplementedException();
+            }
+
+        }
+        public event Action<StringTraceData> UnknownVolume
+        {
+            add
+            {
+                source.RegisterEventTemplate(new StringTraceData(value, 0xFFFF, 0, "SysConfigEx", SysConfigExTaskGuid, 34, "UnknownVolume", ProviderGuid, ProviderName, true));
+            }
+            remove
+            {
+                throw new NotImplementedException();
+            }
+
+        }
+        public event Action<SystemPathsTraceData> SystemPaths
+        {
+            add
+            {
+                source.RegisterEventTemplate(new SystemPathsTraceData(value, 0xFFFF, 0, "SysConfigEx", SysConfigExTaskGuid, 33, "SystemPaths", ProviderGuid, ProviderName));
+            }
+            remove
+            {
+                throw new NotImplementedException();
+            }
+
+        }
+
         #region private
         KernelTraceEventParserState State
         {
@@ -2141,8 +2259,8 @@ namespace Diagnostics.Eventing
         internal static Guid SystemConfigTaskGuid = new Guid(unchecked((int)0x01853a65), unchecked((short)0x418f), unchecked((short)0x4f36), 0xae, 0xfc, 0xdc, 0x0f, 0x1d, 0x2f, 0xd2, 0x35);
         internal static Guid VirtualAllocTaskGuid = new Guid(unchecked((int)0x3d6fa8d3), unchecked((short)0xfe05), unchecked((short)0x11d0), 0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c);
         internal static Guid ReadyThreadTaskGuid = new Guid(unchecked((int)0x3d6fa8d1), unchecked((short)0xfe05), unchecked((short)0x11d0), 0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c);
+        internal static Guid SysConfigExTaskGuid = new Guid(0x9b79ee91, 0xb5fd, 0x41c0, 0xa2, 0x43, 0x42, 0x48, 0xe2, 0x66, 0xe9, 0xD0);
         #endregion
-
     }
     #region private types
     /// <summary>
@@ -2161,6 +2279,7 @@ namespace Diagnostics.Eventing
         {
             fileIDToName = new HistoryDictionary<string>(500);
             threadIDtoProcessID = new HistoryDictionary<int>(50);
+            kernelToDriveMap = new List<KeyValuePair<string, string>>(8);
         }
 
         internal string FileIDToName(Address fileHandle, long time100ns)
@@ -2179,36 +2298,18 @@ namespace Diagnostics.Eventing
         }
         internal string KernelToUser(string kernelName)
         {
-            if (driveNames == null)
-                InitializeKernelNameMap();
+            if (kernelToDriveMap.Count == 0)
+                InitializeKernelDriveMapFromLocalMachine();
 
-            for (int i = 0; i < kernelNameForDrives.Length; i++)
+            for (int i = 0; i < kernelToDriveMap.Count; i++)
             {
-                string kernelPrefix = kernelNameForDrives[i];
+                string kernelPrefix = kernelToDriveMap[i].Key;
                 if (kernelName.Length > kernelPrefix.Length && kernelName[kernelPrefix.Length] == '\\' &&
                     string.Compare(kernelName, 0, kernelPrefix, 0, kernelPrefix.Length, StringComparison.OrdinalIgnoreCase) == 0)
-                    return driveNames[i] + kernelName.Substring(kernelPrefix.Length);
+                    return kernelToDriveMap[i].Value + kernelName.Substring(kernelPrefix.Length);
             }
-            string kernelSystemRoot = @"\SystemRoot\";
-            if (string.Compare(kernelName, 0, kernelSystemRoot, 0, kernelSystemRoot.Length, StringComparison.OrdinalIgnoreCase) == 0)
-                return systemRoot + kernelName.Substring(kernelSystemRoot.Length - 1);
 
-            string kernelWindows = @"\Windows\";
-            if (string.Compare(kernelName, 0, kernelWindows, 0, kernelWindows.Length, StringComparison.OrdinalIgnoreCase) == 0)
-                return windows + kernelName.Substring(kernelWindows.Length - 1);
-
-            string kernelMup = @"\Device\Mup\";
-            if (string.Compare(kernelName, 0, kernelMup, 0, kernelMup.Length, StringComparison.OrdinalIgnoreCase) == 0)
-                return @"\\" + kernelName.Substring(kernelMup.Length - 1);
-
-            if (kernelName.Length > 1 && kernelName[0] == '\\' && kernelName[1] != '?')
-            {
-                // TODO : improve this
-                string trialName = systemRoot.Substring(0, 2) + kernelName;
-                if (trialName.IndexOfAny(System.IO.Path.GetInvalidPathChars()) < 0 && trialName.IndexOf(':', 2) < 0 && System.IO.File.Exists(trialName))
-                    return trialName;
-                return @"\??" + kernelName;
-            }
+            // TODO this is still not complete.   
             return kernelName;
         }
 
@@ -2220,86 +2321,53 @@ namespace Diagnostics.Eventing
         [DllImport("kernel32.dll", SetLastError = true), SuppressUnmanagedCodeSecurityAttribute]
         private static extern int GetLogicalDrives();
 
-        private void InitializeKernelNameMap()
+        private void InitializeKernelDriveMapFromLocalMachine()
         {
-#if !NEW
-#if !Silverlight
-            driveNames = Environment.GetLogicalDrives();
-            kernelNameForDrives = new string[driveNames.Length];
+            kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\??", ""));
+            kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\SystemRoot", Environment.GetEnvironmentVariable("SystemRoot")));
 
             StringBuilder kernelNameBuff = new StringBuilder(2048);
-            for (int i = 0; i < driveNames.Length; i++)
-            {
-                string drive = driveNames[i].Substring(0, 2);
-                driveNames[i] = drive;
-                string kernelName = "";
-                kernelNameBuff.Length = 0;
-                if (QueryDosDevice(drive, kernelNameBuff, 2048) != 0)
-                    kernelName = kernelNameBuff.ToString();
-                kernelNameForDrives[i] = kernelName;
-            }
-            systemRoot = Environment.GetEnvironmentVariable("SystemRoot");
-            windows = Environment.GetEnvironmentVariable("windir");
-#endif
-#else
-            List<string> kernelNameForDriveList = new List<string>(8);
-            List<string> driveNameList = new List<string>(8);
-
             int logicalDriveBitVector = GetLogicalDrives();
-            int bit = 1;
-            StringBuilder kernelNameBuff = new StringBuilder(2048);
-            StringBuilder driveNameBuff = new StringBuilder(8);
-            for (int bitNum = 0; bitNum < kernelNameForDrives.Length; bitNum++)
+            char curChar = 'A';
+            while (logicalDriveBitVector != 0)
             {
-                if ((bit & logicalDriveBitVector) != 0)
+                if ((logicalDriveBitVector & 1) != 0)
                 {
-                    driveNameBuff.Length = 0;
-                    driveNameBuff.Append('A' + bitNum).Append(':');
-                    string driveName = driveNameBuff.ToString();
-
-                    string kernelName = "";
+                    string driveName = new string(curChar, 1) + ":";
                     kernelNameBuff.Length = 0;
                     if (QueryDosDevice(driveName, kernelNameBuff, 2048) != 0)
-                        kernelName = kernelNameBuff.ToString();
-
-                    driveNameList.Add(driveName);
-                    kernelNameForDriveList.Add(kernelName);
+                        kernelToDriveMap.Add(new KeyValuePair<string, string>(kernelNameBuff.ToString(), driveName));
                 }
-                bit >>= 1;
+                logicalDriveBitVector >>= 1;
+                curChar++;
             }
-            kernelNameForDrives = kernelNameForDriveList.ToArray();
-            driveNames = driveNameList.ToArray();
-            systemRoot = Environment.GetEnvironmentVariable("SystemRoot");
-            windows = Environment.GetEnvironmentVariable("windir");
-#endif
-        }
 
-        string[] driveNames;
-        string[] kernelNameForDrives;
-        string systemRoot;
-        string windows;
+            kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\Device\LanmanRedirector", @"\"));
+            kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\Device\Mup", @"\"));
+            kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\Windows", Environment.GetEnvironmentVariable("windir")));
+            kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\", @"\"));     // This translates \\ to \\
+        }
+        internal List<KeyValuePair<string, string>> kernelToDriveMap;
 
         #endregion
 
         void IFastSerializable.ToStream(Serializer serializer)
         {
-            if (driveNames == null)
-                InitializeKernelNameMap();
+            if (kernelToDriveMap.Count == 0)
+                InitializeKernelDriveMapFromLocalMachine();
             // We mark the end of this set of variables so we can add to the end of it, since there is a
             // good chance we will have to change it.  
             ForwardReference endOfKernelNameMap = serializer.GetForwardReference();
             serializer.Write(endOfKernelNameMap);
             serializer.Write(1);        // This is a version number.  
-            serializer.Write(driveNames.Length);
-            serializer.Log("<WriteColection name=\"driveNames\" count=\"" + driveNames.Length + "\">\r\n");
-            for (int i = 0; i < driveNames.Length; i++)
+            serializer.Write(kernelToDriveMap.Count);
+            serializer.Log("<WriteColection name=\"driveNames\" count=\"" + kernelToDriveMap.Count + "\">\r\n");
+            foreach (var keyValue in kernelToDriveMap)
             {
-                serializer.Write(driveNames[i]);
-                serializer.Write(kernelNameForDrives[i]);
+                serializer.Write(keyValue.Key);
+                serializer.Write(keyValue.Value);
             }
             serializer.Log("</WriteColection>\r\n");
-            serializer.Write(windows);
-            serializer.Write(systemRoot);
             serializer.DefineForwardReference(endOfKernelNameMap);
 
             serializer.Write(threadIDtoProcessID.Count);
@@ -2329,15 +2397,13 @@ namespace Diagnostics.Eventing
             ForwardReference endOfKernelNameMap = deserializer.ReadForwardReference();
             int version; deserializer.Read(out version);        // Not used (yet).  
             int numDrives; deserializer.Read(out numDrives);
-            driveNames = new string[numDrives];
-            kernelNameForDrives = new string[numDrives];
             for (int i = 0; i < numDrives; i++)
             {
-                deserializer.Read(out driveNames[i]);
-                deserializer.Read(out kernelNameForDrives[i]);
+                string key, value;
+                deserializer.Read(out key);
+                deserializer.Read(out value);
+                kernelToDriveMap.Add(new KeyValuePair<string, string>(key, value));
             }
-            deserializer.Read(out windows);
-            deserializer.Read(out systemRoot);
             deserializer.Goto(endOfKernelNameMap);      // Skip any fields added in later versions.  
 
             int count; deserializer.Read(out count);
@@ -2416,7 +2482,7 @@ namespace Diagnostics.Eventing
         {
             Prefix(sb);
             sb.XmlAttrib("BufferSize", BufferSize);
-            sb.XmlAttrib("Version", Version);
+            sb.XmlAttribHex("Version", Version);
             sb.XmlAttrib("ProviderVersion", ProviderVersion);
             sb.XmlAttrib("NumberOfProcessors", NumberOfProcessors);
             sb.XmlAttrib("EndTime", EndTime);
@@ -2679,11 +2745,8 @@ namespace Diagnostics.Eventing
         {
             // We wish to create the illusion that the events are reported by the process being started.   
             eventRecord->EventHeader.ProcessId = GetInt32At(HostOffset(4, 1));
-            if (Opcode != TraceEventOpcode.Stop)             // Stop events do have the correct ThreadID, so keep it
-            {
-                ParentThread = eventRecord->EventHeader.ThreadId;
-                eventRecord->EventHeader.ThreadId = -1;
-            }
+            ParentThread = eventRecord->EventHeader.ThreadId;
+            eventRecord->EventHeader.ThreadId = -1;
         }
         #endregion
     }
@@ -2693,17 +2756,17 @@ namespace Diagnostics.Eventing
         public int PageFaultCount { get { return GetInt32At(4); } }
         public int HandleCount { get { return GetInt32At(8); } }
         // Skipping Reserved
-        public Address PeakVirtualSize { get { return GetHostPointer(16); } }
-        public Address PeakWorkingSetSize { get { return GetHostPointer(HostOffset(20, 1)); } }
-        public Address PeakPagefileUsage { get { return GetHostPointer(HostOffset(24, 2)); } }
-        public Address QuotaPeakPagedPoolUsage { get { return GetHostPointer(HostOffset(28, 3)); } }
-        public Address QuotaPeakNonPagedPoolUsage { get { return GetHostPointer(HostOffset(32, 4)); } }
-        public Address VirtualSize { get { return GetHostPointer(HostOffset(36, 5)); } }
-        public Address WorkingSetSize { get { return GetHostPointer(HostOffset(40, 6)); } }
-        public Address PagefileUsage { get { return GetHostPointer(HostOffset(44, 7)); } }
-        public Address QuotaPagedPoolUsage { get { return GetHostPointer(HostOffset(48, 8)); } }
-        public Address QuotaNonPagedPoolUsage { get { return GetHostPointer(HostOffset(52, 9)); } }
-        public Address PrivatePageCount { get { return GetHostPointer(HostOffset(56, 10)); } }
+        public long PeakVirtualSize { get { return (long)GetHostPointer(16); } }
+        public long PeakWorkingSetSize { get { return (long)GetHostPointer(HostOffset(20, 1)); } }
+        public long PeakPagefileUsage { get { return (long)GetHostPointer(HostOffset(24, 2)); } }
+        public long QuotaPeakPagedPoolUsage { get { return (long)GetHostPointer(HostOffset(28, 3)); } }
+        public long QuotaPeakNonPagedPoolUsage { get { return (long)GetHostPointer(HostOffset(32, 4)); } }
+        public long VirtualSize { get { return (long)GetHostPointer(HostOffset(36, 5)); } }
+        public long WorkingSetSize { get { return (long)GetHostPointer(HostOffset(40, 6)); } }
+        public long PagefileUsage { get { return (long)GetHostPointer(HostOffset(44, 7)); } }
+        public long QuotaPagedPoolUsage { get { return (long)GetHostPointer(HostOffset(48, 8)); } }
+        public long QuotaNonPagedPoolUsage { get { return (long)GetHostPointer(HostOffset(52, 9)); } }
+        public long PrivatePageCount { get { return (long)GetHostPointer(HostOffset(56, 10)); } }
 
         #region Private
         internal ProcessCtrTraceData(Action<ProcessCtrTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
@@ -3545,15 +3608,41 @@ namespace Diagnostics.Eventing
         public int IrpFlags { get { return GetInt32At(4); } }
         public int TransferSize { get { return GetInt32At(8); } }
         // Skipping Reserved
+        public int Reserved { get { return GetInt32At(12); } }
         public long ByteOffset { get { return GetInt64At(16); } }
         public Address FileObject { get { return GetHostPointer(24); } }
         public string KernelFileName { get { return state.FileIDToName(FileObject, TimeStamp100ns); } }
         public string FileName { get { return state.KernelToUser(KernelFileName); } }
-
+        /// <summary>
+        /// The I/O Responce Packet address.  This represents the 'identity' of this particular I/O
+        /// </summary>
         public Address Irp { get { return GetHostPointer(HostOffset(28, 1)); } }
-        public long HighResResponseTime100ns { get { return GetInt64At(HostOffset(32, 2)); } }
-        public DateTime HighResResponseTime { get { return DateTime.FromFileTime(HighResResponseTime100ns); } }
-
+        /// <summary>
+        /// This is the time since the I/O was initiated, in source.PerfFreq (QPC) ticks.  
+        /// </summary>
+        private long HighResResponseTime { get { return GetInt64At(HostOffset(32, 2)); } }
+        /// <summary>
+        /// The time since the I/O was initiated.  
+        /// </summary>
+        public double ElapsedTimeMSec
+        {
+            get
+            {
+                return HighResResponseTime * 1000.0 / source.PerfFreq;
+            }
+        }
+        /// <summary>
+        /// The time since the I/O was initiated.  
+        /// </summary>
+        public long ElapsedTime100ns
+        {
+            get
+            {
+                return HighResResponseTime * 10000000 / source.PerfFreq;
+            }
+        }
+        // TODO you can get service time (what XPERF gives) by taking the minimum of 
+        // the Elapsed time and the time of the completion of the last Disk event.  
         #region Private
         internal DiskIoTraceData(Action<DiskIoTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
             : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
@@ -3563,6 +3652,7 @@ namespace Diagnostics.Eventing
         }
         protected internal override void Dispatch()
         {
+
             Debug.Assert(!(Version == 0 && EventDataLength != HostOffset(40, 2)));
             Debug.Assert(!(Version > 0 && EventDataLength < HostOffset(40, 2)));
             Action(this);
@@ -3572,11 +3662,11 @@ namespace Diagnostics.Eventing
             Prefix(sb);
             sb.XmlAttrib("DiskNumber", DiskNumber);
             sb.XmlAttribHex("IrpFlags", IrpFlags);
-            sb.XmlAttrib("TransferSize", TransferSize);
-            sb.XmlAttrib("ByteOffset", ByteOffset);
+            sb.XmlAttribHex("TransferSize", TransferSize);
+            sb.XmlAttribHex("ByteOffset", ByteOffset);
             sb.XmlAttribHex("FileObject", FileObject);
             sb.XmlAttribHex("Irp", Irp);
-            sb.XmlAttrib("HighResResponseTime", HighResResponseTime);
+            sb.XmlAttrib("ElapsedTimeMSec", ElapsedTimeMSec.ToString("f4"));
             sb.Append("/>");
             return sb;
         }
@@ -3586,7 +3676,7 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "DiskNumber", "IrpFlags", "TransferSize", "ByteOffset", "FileObject", "Irp", "HighResResponseTime" };
+                    payloadNames = new string[] { "DiskNumber", "IrpFlags", "TransferSize", "ByteOffset", "FileObject", "Irp", "ElapsedTime100ns" };
                 return payloadNames;
             }
         }
@@ -3608,7 +3698,7 @@ namespace Diagnostics.Eventing
                 case 5:
                     return Irp;
                 case 6:
-                    return HighResResponseTime;
+                    return ElapsedTime100ns;
                 default:
                     Debug.Assert(false, "Bad field index");
                     return null;
@@ -4505,8 +4595,8 @@ namespace Diagnostics.Eventing
 
         private unsafe void FixupData()
         {
-            Debug.Assert(eventRecord->EventHeader.ThreadId == -1 || eventRecord->EventHeader.ThreadId == GetInt32At(HostOffset(4, 1)));
-            eventRecord->EventHeader.ThreadId = GetInt32At(HostOffset(4, 1));
+            Debug.Assert(eventRecord->EventHeader.ThreadId == -1 || eventRecord->EventHeader.ThreadId == GetInt32At(HostOffset(12, 1)));
+            eventRecord->EventHeader.ThreadId = GetInt32At(HostOffset(12, 1));
         }
         private event Action<FileIoReadWriteTraceData> Action;
         private KernelTraceEventParserState state;
@@ -5726,8 +5816,9 @@ namespace Diagnostics.Eventing
     }
     public sealed class PageFaultHardFaultTraceData : TraceEvent
     {
-        public long InitialTime100ns { get { return GetInt64At(0); } }
-        public DateTime InitialTime { get { return DateTime.FromFileTime(InitialTime100ns); } }
+        // This seems to be in PerfFreq units, but that does not help us that  much because
+        // we need to know the absolute time.   
+        public long InitialTime { get { return GetInt64At(0); } }
         public long ReadOffset { get { return GetInt64At(8); } }
         public Address VirtualAddress { get { return GetHostPointer(16); } }
         public Address FileObject { get { return GetHostPointer(HostOffset(20, 1)); } }
@@ -6108,6 +6199,61 @@ namespace Diagnostics.Eventing
         private KernelTraceEventParserState state;
         #endregion
     }
+
+
+    public sealed class PageFaultMemInfoTraceData : TraceEvent
+    {
+        // TODO complete: MemInfo,   TimeDateStamp, FreePages, Standby7, Standby6, Standby5, Standby4, Standby3, Standby2, Standby1, Standby0, TotalStandby, ModifiedPages, InUsePages, RepurposedPages
+
+        public long FreePages { get { return (long)GetHostPointer(0); } }
+
+        #region Private
+        internal PageFaultMemInfoTraceData(Action<PageFaultMemInfoTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
+            : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
+        {
+            this.Action = action;
+            this.state = state;
+        }
+        protected internal override void Dispatch()
+        {
+            //Debug.Assert(!(Version > 0 && EventDataLength < HostOffset(12, 1)));
+            Action(this);
+        }
+        public override StringBuilder ToXml(StringBuilder sb)
+        {
+            Prefix(sb);
+            sb.XmlAttribHex("FreePages", FreePages);
+            sb.Append("/>");
+            return sb;
+        }
+
+        public override string[] PayloadNames
+        {
+            get
+            {
+                if (payloadNames == null)
+                    payloadNames = new string[] { "FreePages" };
+                return payloadNames;
+            }
+        }
+
+        public override object PayloadValue(int index)
+        {
+            switch (index)
+            {
+                case 0:
+                    return FreePages;
+                default:
+                    Debug.Assert(false, "Bad field index");
+                    return null;
+            }
+        }
+
+        private event Action<PageFaultMemInfoTraceData> Action;
+        private KernelTraceEventParserState state;
+        #endregion
+    }
+
     public sealed class SampledProfileTraceData : TraceEvent
     {
         public Address InstructionPointer { get { return GetHostPointer(0); } }
@@ -7821,7 +7967,7 @@ namespace Diagnostics.Eventing
         };
 
         public Address BaseAddr { get { return GetHostPointer(0); } }
-        public long Length { get { return (long) GetHostPointer(HostOffset(4, 1)); } }
+        public long Length { get { return (long)GetHostPointer(HostOffset(4, 1)); } }
         // Process ID is next (we fix it up). 
         public VirtualAllocFlags Flags { get { return (VirtualAllocFlags)GetInt32At(HostOffset(0xC, 2)); } }
 
@@ -7836,7 +7982,7 @@ namespace Diagnostics.Eventing
         protected internal override void Dispatch()
         {
             Debug.Assert(EventDataLength == HostOffset(0x10, 2), "Unexpected data length");
-            Action(this);   
+            Action(this);
         }
 
         private unsafe void FixupData()
@@ -9260,6 +9406,190 @@ namespace Diagnostics.Eventing
 
         private event Action<CritSecInitTraceData> Action;
         private CritSecTraceProviderState state;
+        #endregion
+    }
+
+    public sealed class BuildInfoTraceData : TraceEvent
+    {
+        public DateTime InstallDate { get { return DateTime.FromFileTimeUtc(GetInt64At(0)); } }
+        public string BuildLab { get { return GetUnicodeStringAt(8); } }
+        public string ProductName { get { return GetUnicodeStringAt(SkipUnicodeString(8)); } }
+        #region Private
+        internal BuildInfoTraceData(Action<BuildInfoTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opCode, string opCodeName, Guid providerGuid, string providerName) :
+            base(eventID, task, taskName, taskGuid, opCode, opCodeName, providerGuid, providerName)
+        {
+            this.action = action;
+        }
+
+        protected internal override void Dispatch()
+        {
+            action(this);
+        }
+        protected internal override void Validate()
+        {
+            Debug.Assert(EventDataLength == SkipUnicodeString(8, 2));
+        }
+
+        public override string[] PayloadNames
+        {
+            get
+            {
+                if (payloadNames == null)
+                {
+                    payloadNames = new string[] { "InstallDate", "BuildLab", "ProductName" };
+                }
+                return payloadNames;
+            }
+        }
+
+        public override object PayloadValue(int index)
+        {
+            switch (index)
+            {
+                case 0:
+                    return InstallDate;
+                case 1:
+                    return BuildLab;
+                case 2:
+                    return ProductName;
+                default:
+                    Debug.Assert(false, "invalid index");
+                    return null;
+            }
+        }
+
+        public override StringBuilder ToXml(StringBuilder sb)
+        {
+            Prefix(sb);
+            sb.XmlAttrib("InstallDate", InstallDate);
+            sb.XmlAttrib("BuildLab", BuildLab);
+            sb.XmlAttrib("ProductName", ProductName);
+            sb.Append("/>");
+            return sb;
+        }
+        private Action<BuildInfoTraceData> action;
+        #endregion
+    }
+
+    public sealed class SystemPathsTraceData : TraceEvent
+    {
+        /// <summary>
+        /// e.g. c:\windows\system32
+        /// </summary>
+        public string SystemDirectory { get { return GetUnicodeStringAt(0); } }
+        /// <summary>
+        /// .e.g c:\windows
+        /// </summary>
+        public string SystemWindowsDirectory { get { return GetUnicodeStringAt(SkipUnicodeString(0)); } }
+        #region Private
+        internal SystemPathsTraceData(Action<SystemPathsTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opCode, string opCodeName, Guid providerGuid, string providerName) :
+            base(eventID, task, taskName, taskGuid, opCode, opCodeName, providerGuid, providerName)
+        {
+            this.action = action;
+        }
+
+        protected internal override void Dispatch()
+        {
+            action(this);
+        }
+        protected internal override void Validate()
+        {
+            Debug.Assert(EventDataLength == SkipUnicodeString(0, 2));
+        }
+
+        public override string[] PayloadNames
+        {
+            get
+            {
+                if (payloadNames == null)
+                {
+                    payloadNames = new string[] { "SystemDirectory", "SystemWindowsDirectory" };
+                }
+                return payloadNames;
+            }
+        }
+
+        public override object PayloadValue(int index)
+        {
+            switch (index)
+            {
+                case 0:
+                    return SystemDirectory;
+                case 1:
+                    return SystemWindowsDirectory;
+                default:
+                    Debug.Assert(false, "invalid index");
+                    return null;
+            }
+        }
+
+        public override StringBuilder ToXml(StringBuilder sb)
+        {
+            Prefix(sb);
+            sb.XmlAttrib("SystemDirectory", SystemDirectory);
+            sb.XmlAttrib("SystemWindowsDirectory", SystemWindowsDirectory);
+            sb.Append("/>");
+            return sb;
+        }
+        private Action<SystemPathsTraceData> action;
+        #endregion
+    }
+
+    public sealed class VolumeMappingTraceData : TraceEvent
+    {
+        public string NtPath { get { return GetUnicodeStringAt(0); } }
+        public string DosPath { get { return GetUnicodeStringAt(SkipUnicodeString(0)); } }
+        #region Private
+        internal VolumeMappingTraceData(Action<VolumeMappingTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opCode, string opCodeName, Guid providerGuid, string providerName) :
+            base(eventID, task, taskName, taskGuid, opCode, opCodeName, providerGuid, providerName)
+        {
+            this.action = action;
+        }
+
+        protected internal override void Dispatch()
+        {
+            action(this);
+        }
+        protected internal override void Validate()
+        {
+            Debug.Assert(EventDataLength == SkipUnicodeString(0, 2));
+        }
+
+        public override string[] PayloadNames
+        {
+            get
+            {
+                if (payloadNames == null)
+                {
+                    payloadNames = new string[] { "NtPath", "DosPath" };
+                }
+                return payloadNames;
+            }
+        }
+
+        public override object PayloadValue(int index)
+        {
+            switch (index)
+            {
+                case 0:
+                    return NtPath;
+                case 1:
+                    return DosPath;
+                default:
+                    Debug.Assert(false, "invalid index");
+                    return null;
+            }
+        }
+
+        public override StringBuilder ToXml(StringBuilder sb)
+        {
+            Prefix(sb);
+            sb.XmlAttrib("NtPath", NtPath);
+            sb.XmlAttrib("DosPath", DosPath);
+            sb.Append("/>");
+            return sb;
+        }
+        private Action<VolumeMappingTraceData> action;
         #endregion
     }
 }

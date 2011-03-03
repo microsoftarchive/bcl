@@ -2,7 +2,7 @@
 /* This file is best viewed using outline mode (Ctrl-M Ctrl-O) */
 // This program uses code hyperlinks available as part of the HyperAddin Visual Studio plug-in.
 // It is available from http://www.codeplex.com/hyperAddin 
-/* If you uncomment this line, log.serialize.xml and log.deserialize.xml are created, which allow debugging */ 
+/* If you uncomment this line, log.serialize.xml and log.deserialize.xml are created, which allow debugging */
 // #define DEBUG_SERIALIZE
 using System;
 using System.Text;      // For StringBuilder.
@@ -104,13 +104,17 @@ namespace FastSerialization
     // TODO do we want these?
     public static class IStreamWriterExentions
     {
+        public static StreamLabel AddOffset(this IStreamReader reader, StreamLabel baseLabel, int offset)
+        {
+            return (StreamLabel)((int)baseLabel + offset);
+        }
+
         public static void Write(this IStreamWriter writer, Guid guid)
         {
             byte[] bytes = guid.ToByteArray();
             for (int i = 0; i < bytes.Length; i++)
                 writer.Write(bytes[i]);
         }
-
         public static Guid ReadGuid(this IStreamReader reader)
         {
             byte[] bytes = new byte[16];
@@ -557,7 +561,7 @@ namespace FastSerialization
         /// implies its lifetime is strictly less than its owners), then the serialzation system does not
         /// need to put the object in the 'interning' table. This saves a space (entries in the intern table
         /// as well as 'SyncEntry' overhead of creating hash codes for object) as well as time (to create
-        /// that bookkeeping) for each object that is treated as private (which can add up if becasuse it is
+        /// that bookkeeping) for each object that is treated as private (which can add up if because it is
         /// common that many objects are private).  The private instances are also marked in the serialized
         /// format so on reading there is a simmilar bookeeping savings. 
         /// 
@@ -689,7 +693,7 @@ namespace FastSerialization
                     ObjectsWithForwardReferences.Add(obj, forwardReference);
                 }
                 Log("<WriteForwardReference indexRef=\"0x" + ((int)forwardReference).ToString("x") +
-                    "\" objRef=\"0x" + obj.GetHashCode().ToString("x") + 
+                    "\" objRef=\"0x" + obj.GetHashCode().ToString("x") +
                     "\" type=\"" + obj.GetType().Name + "\">");
                 WriteTag(Tags.ForwardReference);
 
@@ -812,8 +816,8 @@ namespace FastSerialization
                 if (reader.ReadByte() != expectedSig[i])
                     goto ThrowException;
             return;
-            ThrowException:
-                throw new SerializationException("Not an ETLX file: " + streamName);
+        ThrowException:
+            throw new SerializationException("Not an ETLX file: " + streamName);
         }
         /// <summary>
         /// 
@@ -1020,6 +1024,17 @@ namespace FastSerialization
             byte ret = reader.ReadByte();
 #if DEBUG
             Log("<ReadByte Value=\"" + ret.ToString() + "\" StreamLabel=\"0x" + label.ToString("x") + "\"/>");
+#endif
+            return ret;
+        }
+        public short ReadInt16()
+        {
+#if DEBUG
+            StreamLabel label = reader.Current;
+#endif
+            short ret = reader.ReadInt16();
+#if DEBUG
+            Log("<ReadInt16 Value=\"" + ret.ToString() + "\" StreamLabel=\"0x" + label.ToString("x") + "\"/>");
 #endif
             return ret;
         }
@@ -1379,7 +1394,7 @@ namespace FastSerialization
                             goto done;
                         break;
                     default:
-                        throw new SerializationException("Could not find object end tag for object of type " + objectBeingDeserialized.GetType().Name + " at stream offset 0x" + ((int) objectLabel).ToString("x"));
+                        throw new SerializationException("Could not find object end tag for object of type " + objectBeingDeserialized.GetType().Name + " at stream offset 0x" + ((int)objectLabel).ToString("x"));
                 }
                 i++;
             }
@@ -1442,6 +1457,8 @@ namespace FastSerialization
                 return ret;
 
             Type type = Type.GetType(fullName);      // TODO need assembly Info
+            if (type == null)
+                throw new TypeLoadException("Could not find type " + fullName);
             return delegate
             {
                 // If we have a default factory, use it.  
@@ -1465,7 +1482,7 @@ namespace FastSerialization
         }
     };
 
-    
+
     /// <summary>
     /// #DeferedRegionOverview. 
     /// 
@@ -1629,7 +1646,8 @@ namespace FastSerialization
 
     public class SerializationException : Exception
     {
-        public SerializationException(string message) : base (message)
+        public SerializationException(string message)
+            : base(message)
         {
         }
     }

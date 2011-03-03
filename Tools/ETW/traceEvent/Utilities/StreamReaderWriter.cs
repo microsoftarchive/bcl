@@ -124,9 +124,9 @@ namespace FastSerialization
     public class MemoryStreamWriter : IStreamWriter
     {
         public MemoryStreamWriter() : this(64) { }
-        public MemoryStreamWriter(int size)
+        public MemoryStreamWriter(int initialSize)
         {
-            bytes = new byte[size];
+            bytes = new byte[initialSize];
         }
 
         public virtual long Length { get { return endPosition; } }

@@ -20,6 +20,9 @@ class EventStats
         source.Clr.All += StatsCollector;
         source.Kernel.All += StatsCollector;
         new ClrRundownTraceEventParser(source).All += StatsCollector;
+        new ClrStressTraceEventParser(source).All += StatsCollector;
+        new SymbolTraceEventParser(source).All += StatsCollector;
+        new WPFTraceEventParser(source).All += StatsCollector;
 
         source.UnhandledEvent += StatsCollector;
         source.Process();

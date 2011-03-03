@@ -70,7 +70,7 @@ public class TraceEventStackSource : StackSource
             callback(m_curSample);
         }
     }
-    public override double MaxSampleTimeRelMSec
+    public override double SampleTimeRelMSecLimit
     {
         get
         {
@@ -234,7 +234,7 @@ public class TraceEventStackSource : StackSource
         return moduleName + "!" + methodName;
     }
 
-    public override int MaxCallStackIndex
+    public override int CallStackIndexLimit
     {
         get
         {
@@ -242,7 +242,7 @@ public class TraceEventStackSource : StackSource
                 2 * m_log.Threads.MaxThreadIndex + m_log.Processes.MaxProcessIndex;     // *2 one for normal threads, one for broken threads.  
         }
     }
-    public override int MaxCallFrameIndex
+    public override int CallFrameIndexLimit
     {
         get
         {

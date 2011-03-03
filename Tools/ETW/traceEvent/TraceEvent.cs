@@ -24,7 +24,7 @@ using Diagnostics.Eventing;
 //         
 //     * code:TraceEvent is a base class that represents an individual event payload. Because different
 //         events have different fields, this is actually the base of a class hierarchy. code:TraceEvent
-//         itself holds all properties that are common to all events (like TimeStamp, ProcessID,
+//         itself holds all properties that are common to all events (like TimeDateStamp, ProcessID,
 //         ThreadID, etc). Subclasses then add properties that know how to parse that specific event
 //         type.
 //         
@@ -250,6 +250,11 @@ namespace Diagnostics.Eventing
         /// </summary>
         public int CpuSpeedMHz { get { return cpuSpeedMHz; } }
         /// <summary>
+        /// This is the high frequency tick clock on the processor (what QueryPerformanceCounter uses).  
+        /// </summary>
+        public long PerfFreq { get { return perfFreq; } }
+
+        /// <summary>
         /// Should be called when you are done with the source.  
         /// </summary>
         [SecuritySafeCritical]
@@ -313,6 +318,7 @@ namespace Diagnostics.Eventing
         protected int eventsLost;
         protected int numberOfProcessors;
         protected int cpuSpeedMHz;
+        protected long perfFreq;
 
         protected bool useClassicETW;
         protected KernelTraceEventParser _Kernel;
@@ -533,7 +539,7 @@ namespace Diagnostics.Eventing
             }
         }
         /// <summary>
-        /// The time of the event, represented in 100ns units from the year 1601.  See also code:TimeStamp
+        /// The time of the event, represented in 100ns units from the year 1601.  See also code:TimeDateStamp
         /// </summary>
         public long TimeStamp100ns
         {
@@ -740,9 +746,14 @@ namespace Diagnostics.Eventing
             Prefix(sb);
             if (ProviderGuid != Guid.Empty)
                 sb.XmlAttrib("ProviderName", ProviderName);
+            string message = FormattedMessage;
+            if (message != null)
+                sb.XmlAttrib("FormattedMessage", message);                
             string[] payloadNames = PayloadNames;
             for (int i = 0; i < payloadNames.Length; i++)
-                sb.XmlAttrib(payloadNames[i], PayloadValue(i));
+            {
+                sb.XmlAttrib(payloadNames[i], PayloadString(i));
+            }
             sb.Append("/>");
             return sb;
         }
@@ -751,7 +762,6 @@ namespace Diagnostics.Eventing
         /// returns the names of all the manifest declared field names for the event.  
         /// </summary>
         public abstract string[] PayloadNames { get; }
-
         protected internal string[] payloadNames;
 
         /// <summary>
@@ -759,6 +769,26 @@ namespace Diagnostics.Eventing
         /// as an object (boxed if necessary).  
         /// </summary>
         public abstract object PayloadValue(int index);
+
+        /// <summary>
+        /// PayloadString is like PayloadValue(index).ToString(), however it allows the subclasses to do a better
+        /// job of doing a toString (in particular using symbolic names for enumerations.  
+        /// </summary>
+        public virtual string PayloadString(int index)
+        {
+            var value = PayloadValue(index);
+            if (value == null)
+                return null;
+            if (value is Address)
+                return "0x" + ((Address)value).ToString("x");
+            return value.ToString();
+        }
+
+        /// <summary>
+        /// Return a formatted string for the entire event, fit for human consumption.   It will return null if the event does not 
+        /// define a 'message' string that defines the formatting.  
+        /// </summary>
+        public virtual string FormattedMessage { get { return null; } } 
 
         /// <summary>
         /// Only use this if you don't care about performance.  It fetches a field by name.  Will return
@@ -772,7 +802,6 @@ namespace Diagnostics.Eventing
                     return PayloadValue(i);
             return null;
         }
-
 
         /// <summary>
         /// Used for binary searching of event IDs.    Abstracts the size (currently a int, could go to long) 
@@ -814,6 +843,14 @@ namespace Diagnostics.Eventing
             get { return (eventRecord->EventHeader.Flags & TraceEventNativeMethods.EVENT_HEADER_FLAG_CLASSIC_HEADER) != 0; }
         }
         /// <summary>
+        /// Was this written with WriteMessage?
+        /// </summary>
+        internal protected bool StringOnly
+        {
+            [SecuritySafeCritical]
+            get { return (eventRecord->EventHeader.Flags & TraceEventNativeMethods.EVENT_HEADER_FLAG_STRING_ONLY) != 0; }
+        }
+        /// <summary>
         /// Returns the raw IntPtr pointer to the data blob associated with the event.  This is the way the
         /// subclasses of TraceEvent get at the data to display it in a reasonable fashion.
         /// </summary>
@@ -848,6 +885,16 @@ namespace Diagnostics.Eventing
             offset += 2;
             return offset;
         }
+        protected int SkipUnicodeString(int offset, int stringCount)
+        {
+            while (stringCount > 0)
+            {
+                offset = SkipUnicodeString(offset);
+                --stringCount;
+            }
+            return offset;
+        }        
+
         /// <summary>
         /// Assume that  'offset' bytes into the 'mofData' is SID.
         /// Return the Offset after it is skipped.  This is intended
@@ -1036,7 +1083,7 @@ namespace Diagnostics.Eventing
             if (myBuffer != IntPtr.Zero)
                 TraceEventNativeMethods.FreeHGlobal(myBuffer);
         }
-        private static void DumpBytes(byte[] bytes, TextWriter output, string indent)
+        internal static void DumpBytes(byte[] bytes, TextWriter output, string indent)
         {
             int row = 0;
             while (row < bytes.Length)
@@ -1171,8 +1218,8 @@ namespace Diagnostics.Eventing
         /// </summary>
         internal TraceEvent next;
         internal bool indexInDispatcherAsClassic;       // Did we put ourselves in the table using Classic conventions
-                                                        // If true we are using TaskGuid and Opcode
-                                                        // If False we are using ProviderGuid and EventId
+        // If true we are using TaskGuid and Opcode
+        // If False we are using ProviderGuid and EventId
 
         // These are constant over the TraceEvent's lifetime (after setup) (except for the UnhandledTraceEvent
         internal TraceEventID eventID;          // The ID you should switch on.  
@@ -1536,29 +1583,29 @@ namespace Diagnostics.Eventing
             try
             {
 #endif
-            anEvent.Dispatch();
-            if (anEvent.next != null)
-            {
-                TraceEvent nextEvent = anEvent;
-                for (; ; )
+                anEvent.Dispatch();
+                if (anEvent.next != null)
                 {
-                    nextEvent = nextEvent.next;
-                    if (nextEvent == null)
-                        break;
-                    nextEvent.eventRecord = anEvent.eventRecord;
-                    nextEvent.userData = anEvent.userData;
-                    nextEvent.eventIndex = anEvent.eventIndex;
-                    nextEvent.Dispatch();
-                    nextEvent.eventRecord = null;      // Technically not needed but detects user errors sooner. 
+                    TraceEvent nextEvent = anEvent;
+                    for (; ; )
+                    {
+                        nextEvent = nextEvent.next;
+                        if (nextEvent == null)
+                            break;
+                        nextEvent.eventRecord = anEvent.eventRecord;
+                        nextEvent.userData = anEvent.userData;
+                        nextEvent.eventIndex = anEvent.eventIndex;
+                        nextEvent.Dispatch();
+                        nextEvent.eventRecord = null;      // Technically not needed but detects user errors sooner. 
+                    }
                 }
-            }
-            if (EveryEvent != null)
-            {
-                if (unhandledEventTemplate == anEvent)
-                    unhandledEventTemplate.PrepForCallback();
-                EveryEvent(anEvent);
-            }
-            anEvent.eventRecord = null;      // Technically not needed but detects user errors sooner. 
+                if (EveryEvent != null)
+                {
+                    if (unhandledEventTemplate == anEvent)
+                        unhandledEventTemplate.PrepForCallback();
+                    EveryEvent(anEvent);
+                }
+                anEvent.eventRecord = null;      // Technically not needed but detects user errors sooner. 
 #if DEBUG
             }
             catch (Exception e)
@@ -1579,8 +1626,10 @@ namespace Diagnostics.Eventing
             ushort eventID = eventRecord->EventHeader.Id;
 
             // Classic events use the opcode field as the discrimator instead of the event ID
+            var isClassic = false;
             if ((eventRecord->EventHeader.Flags & TraceEventNativeMethods.EVENT_HEADER_FLAG_CLASSIC_HEADER) != 0)
             {
+                isClassic = true;
                 Debug.Assert(eventID == 0);     // old style events don't use the eventIndex field.  
                 eventID = eventRecord->EventHeader.Opcode;
             }
@@ -1596,7 +1645,8 @@ namespace Diagnostics.Eventing
                     tableGuidPtr[2] == guidPtr[2] && tableGuidPtr[3] == guidPtr[3])
                 {
                     TraceEvent ret = templates[hash];
-                    if (eventID == templatesInfo[hash].eventID)
+                    if (eventID == templatesInfo[hash].eventID && templates[hash] != null && 
+                        isClassic == templates[hash].indexInDispatcherAsClassic)
                     {
                         if (ret != null)
                         {
@@ -1730,7 +1780,8 @@ namespace Diagnostics.Eventing
                 if (tableGuidPtr[0] == guidPtr[0] && tableGuidPtr[1] == guidPtr[1] &&
                     tableGuidPtr[2] == guidPtr[2] && tableGuidPtr[3] == guidPtr[3])
                 {
-                    if (eventID == templatesInfo[hash].eventID)
+                    if (eventID == templatesInfo[hash].eventID && templates[hash] != null && 
+                        template.indexInDispatcherAsClassic == templates[hash].indexInDispatcherAsClassic)
                     {
                         TraceEvent existingTemplate = templates[hash];
                         if (existingTemplate != null)
@@ -2104,6 +2155,13 @@ namespace Diagnostics.Eventing
             {
                 var providerName = anEvent.ProviderName;
                 sb.XmlAttrib("ProviderName", providerName);
+                if (anEvent.StringOnly)
+                {
+                    sb.XmlAttrib("Message", anEvent.EventDataAsString());
+                    sb.Append("/>");
+                    return sb;
+                }
+
                 if (!providerName.StartsWith("Provider("))
                     sb.XmlAttrib("ProviderGuid", anEvent.providerGuid);
                 sb.XmlAttrib("eventID", (int)anEvent.ID);
@@ -2118,29 +2176,17 @@ namespace Diagnostics.Eventing
             sb.XmlAttrib("Level", (int)anEvent.Level);
             sb.XmlAttrib("PointerSize", anEvent.PointerSize);
             sb.XmlAttrib("EventDataLength", anEvent.EventDataLength);
-            string dataAsString = anEvent.EventDataAsString();
-            if (dataAsString != null)
-                sb.XmlAttrib("EventDataString", dataAsString);
-
-            // Is this a manifest event?
-            if (anEvent.Opcode == (TraceEventOpcode)0xFE && (anEvent.ID == 0 || (byte)anEvent.ID == 0xFE))
+            if (anEvent.EventDataLength > 0)
             {
                 sb.AppendLine(">");
-                try
-                {
-                    byte[] rawData = anEvent.EventData();
-                    if (rawData.Length > sizeof(ManifestEnvelope) && (ManifestEnvelope.ManifestFormats)rawData[0] == ManifestEnvelope.ManifestFormats.SimpleXmlFormat)
-                    {
-                        string str = System.Text.Encoding.UTF8.GetString(rawData, sizeof(ManifestEnvelope), rawData.Length - sizeof(ManifestEnvelope));
-                        if (str.StartsWith("<provider"))
-                            sb.Append(str);
-                    }
-                }
-                catch (Exception) { }
-                sb.Append("</Event>");
+                StringWriter dumpSw = new StringWriter();
+                TraceEvent.DumpBytes(anEvent.EventData(), dumpSw, "  ");
+                sb.Append(XmlUtilities.XmlEscape(dumpSw.ToString(), false));
+                sb.AppendLine("</Event>");
             }
             else
                 sb.Append("/>");
+
             return sb;
         }
 
@@ -2262,7 +2308,7 @@ namespace Diagnostics.Eventing
             for (int i = 0; i < str.Length; i++)
             {
                 char c = str[i];
-                if ((c < ' ' || c > '~') && !char.IsWhiteSpace(c))
+                if ((c < ' ' || c > '~') && !char.IsWhiteSpace(c) && c != 174 && c != 8482) // 174 = (R),  8482 = TM 
                 {
                     string trunStr = str.Substring(0, i);
                     Console.WriteLine("Warning: truncating " + (str.Length - i).ToString() + " non-ascii name characters: resulting string: " + trunStr);

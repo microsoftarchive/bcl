@@ -14,6 +14,7 @@ using System.Runtime.InteropServices;
 using FastSerialization;
 using System.Reflection;
 using Diagnostics.Eventing;
+using Symbols;
 
 /* TODO current interesting places */
 /* code:#UniqueAddress code:TraceCodeAddresses.LookupSymbols */
@@ -151,7 +152,7 @@ namespace Diagnostics.Eventing
             // TODO copy the additional data from a ETLX file if the source is ETLX 
 
             // TODO handle this for real.  
-            Debug.Assert(source.EventsLost == 0);
+            Debug.Assert(source.EventsLost == 0, "There were " + source.EventsLost + " Events lost (can ignore)");
 
             TraceLog newLog = new TraceLog();
             newLog.rawEventSourceToConvert = source;
@@ -412,8 +413,8 @@ namespace Diagnostics.Eventing
                 this.sessionEndTime100ns = rawEvents.SessionEndTime100ns;
                 this.sessionStartTime100ns = rawEvents.SessionStartTime100ns;
                 this.cpuSpeedMHz = rawEvents.CpuSpeedMHz;
+                this.perfFreq = rawEvents.PerfFreq;
                 this.numberOfProcessors = rawEvents.NumberOfProcessors;
-                this.cpuSpeedMHz = rawEvents.CpuSpeedMHz;
                 this.eventsLost = rawEvents.EventsLost;
 
                 // TODO need all events that might have Addresses in them, can we be more efficient.  
@@ -487,9 +488,28 @@ namespace Diagnostics.Eventing
                 };
 
                 // ModuleFile level events
+                DbgIDRSDSTraceData lastDbgData = null;
+                ImageIDTraceData lastImageIDData = null;
+                FileVersionTraceData lastFileVersionData = null;
+
                 rawEvents.Kernel.ImageLoadGroup += delegate(ImageLoadTraceData data)
                 {
-                    this.processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns).LoadedModules.ImageLoadOrUnload(data, true);
+                    var moduleFile = this.processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns).LoadedModules.ImageLoadOrUnload(data, true);
+                    if (lastDbgData != null && data.TimeStamp100ns == lastDbgData.TimeStamp100ns)
+                    {
+                        moduleFile.pdbName = lastDbgData.PdbFileName;
+                        moduleFile.pdbSignature = lastDbgData.GuidSig;
+                        moduleFile.pdbAge = lastDbgData.Age;
+                    }
+                    if (lastImageIDData != null && data.TimeStamp100ns == lastImageIDData.TimeStamp100ns)
+                    {
+                        moduleFile.timeDateStamp = lastImageIDData.TimeDateStamp;
+                    }
+                    if (lastFileVersionData != null && data.TimeStamp100ns == lastFileVersionData.TimeStamp100ns)
+                    {
+                        moduleFile.fileVersion = lastFileVersionData.FileVersion;
+                    }
+
                     if (data.Opcode == TraceEventOpcode.DataCollectionStart)
                     {
                         removeEventFromStream = true;
@@ -504,6 +524,22 @@ namespace Diagnostics.Eventing
                         removeEventFromStream = true;
                     }
                 };
+                var symbolParser = new SymbolTraceEventParser(rawEvents);
+
+
+                symbolParser.DbgIDRSDS += delegate(DbgIDRSDSTraceData data)
+                {
+                    lastDbgData = (DbgIDRSDSTraceData)data.Clone();
+                };
+                symbolParser.ImageID += delegate(ImageIDTraceData data)
+                {
+                    lastImageIDData = (ImageIDTraceData)data.Clone();
+                };
+                symbolParser.FileVersion += delegate(FileVersionTraceData data)
+                {
+                    lastFileVersionData = (FileVersionTraceData)data.Clone();
+                };
+
 
                 rawEvents.Kernel.FileIoName += delegate(FileIoNameTraceData data)
                 {
@@ -533,11 +569,15 @@ namespace Diagnostics.Eventing
                 rawEvents.Clr.MethodUnloadVerbose += delegate(MethodLoadUnloadVerboseTraceData data)
                 {
                     codeAddresses.AddMethod(data);
-                    // Only keep the first of these per process.  This lets us see where rundown starts but otherwise
-                    // does not bloat the file. 
-                    if (data.ProcessID == lastRundownPID)
-                        removeEventFromStream = true;
-                    lastRundownPID = data.ProcessID;
+
+                    if (!data.IsJitted)
+                    {
+                        // Only keep the first of these per process.  This lets us see where rundown starts but otherwise
+                        // does not bloat the file. 
+                        if (data.ProcessID == lastRundownPID)
+                            removeEventFromStream = true;
+                        lastRundownPID = data.ProcessID;
+                    }
                 };
                 rawEvents.Clr.MethodDCStopVerboseV2 += delegate(MethodLoadUnloadVerboseTraceData data)
                 {
@@ -1056,6 +1096,7 @@ namespace Diagnostics.Eventing
             serializer.Write(pointerSize);
             serializer.Write(numberOfProcessors);
             serializer.Write(cpuSpeedMHz);
+            serializer.Write(perfFreq);
             serializer.Write(eventsLost);
             serializer.Write(machineName);
             serializer.Write(memorySizeMeg);
@@ -1158,6 +1199,7 @@ namespace Diagnostics.Eventing
             deserializer.Read(out pointerSize);
             deserializer.Read(out numberOfProcessors);
             deserializer.Read(out cpuSpeedMHz);
+            deserializer.Read(out perfFreq);
             deserializer.Read(out eventsLost);
             deserializer.Read(out machineName);
             deserializer.Read(out memorySizeMeg);
@@ -2158,13 +2200,13 @@ namespace Diagnostics.Eventing
         internal void ProcessStart(ProcessTraceData data)
         {
             Log.DebugWarn(StartTime100ns == 0, "Events for process happen before process start.  PrevEventTime: " + Log.RelativeTimeMSec(StartTime100ns), data);
-            Debug.Assert(EndTime100ns == ETWTraceEventSource.MaxTime100ns); // We would create a new Process record otherwise 
 
             if (data.Opcode == TraceEventOpcode.DataCollectionStart)
                 this.startTime100ns = log.SessionStartTime100ns;
             else
             {
                 Debug.Assert(data.Opcode == TraceEventOpcode.Start);
+                Debug.Assert(EndTime100ns == ETWTraceEventSource.MaxTime100ns); // We would create a new Process record otherwise 
                 this.startTime100ns = data.TimeStamp100ns;
             }
             this.commandLine = data.CommandLine;
@@ -2563,7 +2605,7 @@ namespace Diagnostics.Eventing
         }
         #region Private
         // #ModuleHandlersCalledFromTraceLog
-        internal void ImageLoadOrUnload(ImageLoadTraceData data, bool isLoad)
+        internal TraceModuleFile ImageLoadOrUnload(ImageLoadTraceData data, bool isLoad)
         {
             int index;
             TraceLoadedModule module = FindModuleAndIndexContainingAddress(data.ImageBase, data.TimeStamp100ns, out index);
@@ -2615,6 +2657,7 @@ namespace Diagnostics.Eventing
                     process.Log.DebugWarn(module.loadTime100ns != 0, "Unloading image not loaded.", data);
             }
             CheckClassInvarients();
+            return moduleFile;
         }
         internal void ManagedModuleLoadOrUnload(ModuleLoadUnloadTraceData data, bool isLoad)
         {
@@ -2990,7 +3033,7 @@ namespace Diagnostics.Eventing
 
     /// <summary>
     /// code:CallStackIndex uniquely identifies a callstack within the log.  Valid values are between 0 and
-    /// code:TraceCallStacks.MaxCallStackIndex, Thus an array can be used to 'attach' data to a callstack.   
+    /// code:TraceCallStacks.CallStackIndexLimit, Thus an array can be used to 'attach' data to a callstack.   
     /// </summary>
     public enum CallStackIndex { Invalid = -1 };
 
@@ -3155,7 +3198,7 @@ namespace Diagnostics.Eventing
                 Debug.Assert(callerIndex != CallStackIndex.Invalid);        // We always end with the thread.  
                 int threadIndex = (int)GetThreadForRoot(callerIndex);
                 if (threadIndex >= threads.Count)
-                    threads.Expand(threadIndex - threads.Count + 1);
+                    threads.Count = threadIndex + 1;
                 frameCallees = threads[threadIndex];
                 if (frameCallees == null)
                     threads[threadIndex] = frameCallees = new List<CallStackIndex>();
@@ -3772,7 +3815,7 @@ namespace Diagnostics.Eventing
             else
                 options.ConversionLog.WriteLine("Looking up symbolic information for just methods.");
 
-            TracePdbReader reader = null;
+            SymbolReader reader = null;
             int totalAddressCount = 0;
             int noModuleAddressCount = 0;
             IEnumerator<CodeAddressIndex> codeAddressIndexCursor = GetSortedCodeAddressIndexes().GetEnumerator();
@@ -3786,7 +3829,8 @@ namespace Diagnostics.Eventing
                     {
                         if (reader == null)
                         {
-                            reader = new TracePdbReader(options.ConversionLog, options.LocalSymbolsOnly);
+                            SymPath.Clean_NT_SYMBOL_PATH(options.LocalSymbolsOnly, options.ConversionLog);
+                            reader = new SymbolReader(options.ConversionLog);
                         }
                         int moduleAddressCount = 0;
                         try
@@ -3840,7 +3884,7 @@ namespace Diagnostics.Eventing
         /// each address it finds.   It will return 'true' if the updated cursor is not at the end
         /// of the enumeration (that is Current is valid), and false otherwise.
         /// </summary>
-        private bool LookupSymbolsForModule(TracePdbReader reader, TraceModuleFile moduleFile, IEnumerator<CodeAddressIndex> codeAddressIndexCursor, TraceLogOptions options, out int totalAddressCount)
+        private bool LookupSymbolsForModule(SymbolReader reader, TraceModuleFile moduleFile, IEnumerator<CodeAddressIndex> codeAddressIndexCursor, TraceLogOptions options, out int totalAddressCount)
         {
             Debug.Assert(moduleFiles[ModuleFileIndex(codeAddressIndexCursor.Current)] == moduleFile);
             totalAddressCount = 0;
@@ -3850,7 +3894,8 @@ namespace Diagnostics.Eventing
             int repeats = 0;
 
             options.ConversionLog.WriteLine("[Loading symbols for " + Path.GetFileName(moduleFile.FileName) + "]");
-            using (TracePdbModuleReader moduleReader = reader.LoadSymbolsForModule(moduleFile.FileName, moduleFile.ImageBase))
+
+            using (SymbolReaderModule moduleReader = OpenModuleFile(reader, moduleFile))
             {
                 options.ConversionLog.WriteLine("Loaded, resolving symbols");
                 string currentMethodName = "";
@@ -3881,7 +3926,7 @@ namespace Diagnostics.Eventing
                         }
                         else
                         {
-                            var newMethodName = moduleReader.FindMethodForAddress(address, out currentMethodEnd);
+                            var newMethodName = moduleReader.FindSymbolForAddress(address, out currentMethodEnd);
                             if (newMethodName.Length > 0)
                             {
 
@@ -3933,6 +3978,20 @@ namespace Diagnostics.Eventing
                 options.ConversionLog.WriteLine("        Unmatched Symbols " + (totalAddressCount - (distinctSymbols + repeats)));
             }
             return true;
+        }
+
+        private unsafe SymbolReaderModule OpenModuleFile(SymbolReader reader, TraceModuleFile moduleFile)
+        {
+            if (moduleFile.PdbSignature != Guid.Empty)
+            {
+                var pdbFile = reader.FindSymbolFilePath(moduleFile.PdbName, moduleFile.PdbSignature, moduleFile.PdbAge);
+                if (pdbFile == null)
+                    throw new Exception("Could not find PDB file " + moduleFile.PdbName + 
+                        " with signature " + moduleFile.PdbSignature + " and age " + moduleFile.PdbAge + ".");
+                return reader.OpenSymbolFile(pdbFile, moduleFile.ImageBase);
+            }
+            // TODO FIX NOW Only do this if the trace is on the same machine.  
+            return reader.OpenSymbolsForModule(moduleFile.FileName, moduleFile.ImageBase);
         }
 
         void IFastSerializable.ToStream(Serializer serializer)
@@ -4090,6 +4149,9 @@ namespace Diagnostics.Eventing
                     return codeAddresses.ModuleFiles[moduleFileIndex];
             }
         }
+        /// <summary>
+        /// ModuleName is the name of the file without path or extension. 
+        /// </summary>
         public string ModuleName
         {
             get
@@ -4200,7 +4262,7 @@ namespace Diagnostics.Eventing
                 {
                     if (moduleFile.ImageBase == imageBase)
                         return moduleFile;
-                    //                    options.ConversionLog.WriteLine("WARNING: " + fileName + " loaded with two base addresses 0x" + imageBase.ToString("x") + " and 0x" + moduleFile.imageBase.ToString("x"));
+                    //                    options.ConversionLog.WriteLine("WARNING: " + fileName + " loaded with two base addresses 0x" + moduleImageBase.ToString("x") + " and 0x" + moduleFile.moduleImageBase.ToString("x"));
                     moduleFile = moduleFile.next;
                 } while (moduleFile != null);
             }
@@ -4225,7 +4287,7 @@ namespace Diagnostics.Eventing
         }
         /// <summary>
         /// We cache information about a native image load in a code:TraceModuleFile.  Retrieve or create a new
-        /// cache entry associated with 'nativePath' and 'imageBase'.  'imageBase' can be 0 for managed assemblies
+        /// cache entry associated with 'nativePath' and 'moduleImageBase'.  'moduleImageBase' can be 0 for managed assemblies
         /// that were not loaded with LoadLibrary.  
         /// </summary>
         internal TraceModuleFile GetOrCreateModuleFile(string nativePath, Address imageBase)
@@ -4324,6 +4386,14 @@ namespace Diagnostics.Eventing
         public Address ImageBase { get { return imageBase; } }
         public int ImageSize { get { return imageSize; } }
         public Address ImageEnd { get { return (Address)((ulong)imageBase + (uint)imageSize); } }
+
+        public string PdbName { get { return pdbName; } }
+        public Guid PdbSignature { get { return pdbSignature; } }
+        public int PdbAge { get { return pdbAge; } }
+
+        public string FileVersion { get { return fileVersion; } }
+        public int TimeDateStamp { get { return timeDateStamp; } }
+
         // If the module file was a managed module, this is the moduleID that the CLR associates with it.  
         public override string ToString()
         {
@@ -4333,6 +4403,11 @@ namespace Diagnostics.Eventing
                     "ImageSize=" + XmlUtilities.XmlQuoteHex(ImageSize) + " " +
                     "FileName=" + XmlUtilities.XmlQuote(FileName) + " " +
                     "ImageBase=" + XmlUtilities.XmlQuoteHex((ulong)ImageBase) + " " +
+                    "TimeDateStamp=" + XmlUtilities.XmlQuote(TimeDateStamp) + " " +
+                    "PdbName=" + XmlUtilities.XmlQuote(PdbName) + " " +
+                    "PdbSignature=" + XmlUtilities.XmlQuote(PdbSignature) + " " +
+                    "PdbAge=" + XmlUtilities.XmlQuote(PdbAge) + " " +
+                    "FileVersion=" + XmlUtilities.XmlQuote(FileVersion) + " " +
                    "/>";
         }
 
@@ -4342,6 +4417,8 @@ namespace Diagnostics.Eventing
             this.fileName = fileName;
             this.imageBase = imageBase;
             this.moduleFileIndex = moduleFileIndex;
+            this.fileVersion = "";
+            this.pdbName = "";
         }
 
         internal string fileName;
@@ -4352,12 +4429,24 @@ namespace Diagnostics.Eventing
         private ModuleFileIndex moduleFileIndex;
         internal TraceModuleFile next;          // Chain of modules that have the same name (But different image bases)
 
+        internal string pdbName;
+        internal Guid pdbSignature;
+        internal int pdbAge;
+        internal string fileVersion;
+        internal int timeDateStamp;
+
         void IFastSerializable.ToStream(Serializer serializer)
         {
             serializer.Write(fileName);
             serializer.Write(imageSize);
             serializer.WriteAddress(imageBase);
             serializer.WriteAddress(defaultBase);
+
+            serializer.Write(pdbName);
+            serializer.Write(pdbSignature);
+            serializer.Write(pdbAge);
+            serializer.Write(fileVersion);
+            serializer.Write(timeDateStamp);
         }
         void IFastSerializable.FromStream(Deserializer deserializer)
         {
@@ -4365,6 +4454,12 @@ namespace Diagnostics.Eventing
             deserializer.Read(out imageSize);
             deserializer.ReadAddress(out imageBase);
             deserializer.ReadAddress(out defaultBase);
+
+            deserializer.Read(out pdbName);
+            deserializer.Read(out pdbSignature);
+            deserializer.Read(out pdbAge);
+            deserializer.Read(out fileVersion);
+            deserializer.Read(out timeDateStamp);
         }
         #endregion
     }
@@ -4534,473 +4629,7 @@ namespace Diagnostics.Eventing
         }
     }
 
-    /// <summary>
-    /// Default Implementation of symbol resolver.
-    /// This implementation assume it the symbol resolution is happening on the same machine the trace is taken on.
-    /// this symbol resolve relies on the image information in the image to resolve the symbols.
-    /// </summary>
-    public struct SymbolResolverContextInfo
-    {
-        public IntPtr currentProcessHandle;
-        internal TraceEventNativeMethods.IMAGEHLP_LINE64 lineInfo;
-    }
-    internal interface ISymbolResolver
-    {
-        bool InitSymbolResolver(SymbolResolverContextInfo context);
-        bool GetLineFromAddr(Address address);
-        void CleanUp();
-        ulong LoadSymModule(string moduleName, ulong moduleBase);
-        IntPtr CurrentProcessHandle { get; }
-    }
-    internal interface ISymbolReader
-    {
-        bool GetLineFromAddr(Address address, ref TraceEventNativeMethods.IMAGEHLP_LINE64 lineInfo);
-    }
 
-    internal class DefaultSymbolReader : ISymbolReader
-    {
-        public DefaultSymbolReader(SymbolResolverContextInfo contextInfo)
-        {
-            context = contextInfo;
-        }
-        public bool GetLineFromAddr(Address address, ref TraceEventNativeMethods.IMAGEHLP_LINE64 lineInfo)
-        {
-            int displacement = 0;
-            return (!TraceEventNativeMethods.SymGetLineFromAddrW64(context.currentProcessHandle, (ulong)address,
-                ref displacement, ref lineInfo));
-        }
-
-        private SymbolResolverContextInfo context;
-    }
-
-    internal unsafe class TracePdbReader : IDisposable
-    {
-        public TracePdbReader(TextWriter log, bool localSymbolsOnly)
-        {
-            this.log = log;
-            TraceEventNativeMethods.SymOptions options = TraceEventNativeMethods.SymGetOptions();
-            TraceEventNativeMethods.SymSetOptions(
-                TraceEventNativeMethods.SymOptions.SYMOPT_DEBUG |
-                // TraceEventNativeMethods.SymOptions.SYMOPT_DEFERRED_LOADS |
-                TraceEventNativeMethods.SymOptions.SYMOPT_LOAD_LINES |
-                TraceEventNativeMethods.SymOptions.SYMOPT_EXACT_SYMBOLS |
-                TraceEventNativeMethods.SymOptions.SYMOPT_UNDNAME
-                );
-            TraceEventNativeMethods.SymOptions options1 = TraceEventNativeMethods.SymGetOptions();
-
-            currentProcess = Process.GetCurrentProcess();  // Only here to insure processHandle does not die.  TODO get on safeHandles. 
-            currentProcessHandle = currentProcess.Handle;
-            string symPath = Environment.GetEnvironmentVariable("_NT_SYMBOL_PATH");
-            if (symPath == null)
-            {
-                string temp = Environment.GetEnvironmentVariable("TEMP");
-                if (temp == null)
-                    temp = ".";
-                string symCache = Path.Combine(temp, "symbols");
-                symPath = "SRV*" + symCache + "*http://msdl.microsoft.com/download/symbols";
-                Environment.SetEnvironmentVariable("_NT_SYMBOL_PATH", symPath);
-                log.WriteLine("No symbol path set. Setting to:" + symPath);
-            }
-            if (localSymbolsOnly)
-                symPath = MakeSymPathLocal(symPath, log);
-
-            log.WriteLine("Looking up Symbols: _NT_SYMBOL_PATH=[\r\n    {0}\r\n    ]", symPath.Replace(";", ";\r\n    "));
-
-            bool success = TraceEventNativeMethods.SymInitializeW(currentProcessHandle, null, false);
-            if (!success)
-            {
-                // This captures the GetLastEvent (and has to happen before calling CloseHandle()
-                currentProcessHandle = IntPtr.Zero;
-                throw new Win32Exception();
-            }
-            callback = new TraceEventNativeMethods.SymRegisterCallbackProc(this.StatusCallback);
-            success = TraceEventNativeMethods.SymRegisterCallbackW64(currentProcessHandle, callback, 0);
-
-            Debug.Assert(success);
-
-            // TODO remove when we are sure we won't use SymFromAddr
-            // const int maxNameLen = 512;
-            // int bufferSize = sizeof(TraceEventNativeMethods.SYMBOL_INFO) + maxNameLen*2;
-            // buffer = (byte*)Marshal.AllocHGlobal(bufferSize);
-            // TraceEventNativeMethods.ZeroMemory((IntPtr)buffer, (uint)bufferSize);
-            // symbolInfo = (TraceEventNativeMethods.SYMBOL_INFO*)buffer;
-            // symbolInfo->SizeOfStruct = (uint)sizeof(TraceEventNativeMethods.SYMBOL_INFO);
-            // symbolInfo->MaxNameLen = maxNameLen - 1;
-
-            lineInfo.SizeOfStruct = (uint)sizeof(TraceEventNativeMethods.IMAGEHLP_LINE64);
-            messages = new StringBuilder();
-        }
-
-        /// <summary>
-        /// Sets up the _NT_SYMBOL_PATH so it works well even without _NT_SYMBOL_PATH set and that
-        /// unless /PrimeSymbols is set, does NOT use symbol servers (because it is needlessly 
-        /// expensive in the common case where you already have the symbols you need.  
-        /// </summary>
-        private static string MakeSymPathLocal(string symPath, TextWriter log)
-        {
-            log.WriteLine();
-            log.WriteLine("To speed up processing, by default only symbols local to the machine are used.");
-            log.WriteLine("Thus symbols from symbols servers will not be found by default.");
-            log.WriteLine();
-            log.WriteLine("Use /primeSymbols to allow non-local symbols paths to be searched.");
-            log.WriteLine("Because xperf caches symbols locally, after using /primeSymbols you need not");
-            log.WriteLine("do it again unless DLLS were updated (or you are profiling a new scenario).");
-            log.WriteLine();
-            if (symPath != null)
-            {
-                log.WriteLine("    _NT_SYMBOL_PATH used for lookup =");
-                string[] symLocations = symPath.Split(';');
-                StringBuilder sb = new StringBuilder();
-                foreach (var symLocation in symLocations)
-                {
-                    bool hadSrvPrefix = false;
-                    var trimmedSymLocation = symLocation.Trim();
-                    if (trimmedSymLocation.Length == 0)
-                        continue;
-                    if (trimmedSymLocation.StartsWith("srv*", StringComparison.OrdinalIgnoreCase))
-                    {
-                        hadSrvPrefix = true;
-                        // If there is a local cache specification, just use that.  
-                        int starIdx = trimmedSymLocation.IndexOf('*', 4);
-                        if (starIdx < 0)
-                            continue;
-                        trimmedSymLocation = trimmedSymLocation.Substring(4, starIdx - 4);
-                    }
-                    if (trimmedSymLocation.StartsWith(@"\\", StringComparison.OrdinalIgnoreCase))
-                        continue;
-                    try
-                    {
-                        trimmedSymLocation = Path.GetFullPath(trimmedSymLocation);
-                    }
-                    catch (Exception)
-                    {
-                        log.WriteLine("Error getting full path of '{0}'", trimmedSymLocation);
-                        continue;
-                    }
-                    if (trimmedSymLocation.Length > 2 && trimmedSymLocation[1] == ':')
-                    {
-                        // Don't do network drives. 
-                        char c = char.ToLower(trimmedSymLocation[0]);
-                        if ('a' <= c && c != 'z')
-                        {
-                            DriveInfo driveInfo = new DriveInfo(new string(c, 1));
-                            if (driveInfo.DriveType == DriveType.Fixed)
-                            {
-                                if (hadSrvPrefix)
-                                    trimmedSymLocation = "srv*" + trimmedSymLocation;
-                                sb.Append(trimmedSymLocation).Append(';');
-                            }
-                            log.WriteLine("        {0}", trimmedSymLocation);
-                        }
-                    }
-                }
-                symPath = sb.ToString();
-                Environment.SetEnvironmentVariable("_NT_SYMBOL_PATH", symPath);     // TODO do we need to so this?
-            }
-            return symPath;
-        }
-
-        public TracePdbModuleReader LoadSymbolsForModule(string moduleFilepath, Address moduleImageBase)
-        {
-            return new TracePdbModuleReader(this, moduleFilepath, moduleImageBase);
-        }
-        public void Dispose()
-        {
-            if (currentProcessHandle != IntPtr.Zero)
-            {
-                // Can't do this in the finalizer as the handle may not be valid then.  
-                TraceEventNativeMethods.SymCleanup(currentProcessHandle);
-                currentProcessHandle = IntPtr.Zero;
-                currentProcess.Close();
-                currentProcess = null;
-                callback = null;
-                messages = null;
-            }
-        }
-
-        #region private
-        ~TracePdbReader()
-        {
-            /*** TODO remove
-            if (buffer != null)
-            {
-                Marshal.FreeHGlobal((IntPtr)buffer);
-                buffer = null;
-            }
-             * ***/
-        }
-
-        private bool StatusCallback(
-            IntPtr hProcess,
-            TraceEventNativeMethods.SymCallbackActions ActionCode,
-            ulong UserData,
-            ulong UserContext)
-        {
-            bool ret = false;
-            switch (ActionCode)
-            {
-                case TraceEventNativeMethods.SymCallbackActions.CBA_DEBUG_INFO:
-                    lastLine = new String((char*)UserData);
-                    messages.Append(lastLine);
-                    ret = true;
-                    break;
-                default:
-                    // log.WriteLine("In status callback Code = " + ActionCode);
-                    break;
-            }
-            return ret;
-        }
-
-        internal Process currentProcess;      // keep to insure currentProcessHandle stays alive
-        internal IntPtr currentProcessHandle; // TODO really need to get on safe handle plan 
-        internal string lastLine;
-        internal StringBuilder messages;
-        internal TraceEventNativeMethods.SymRegisterCallbackProc callback;
-        internal TextWriter log;
-
-        // TODO put these in TracePdbModuleReader
-        // internal TraceEventNativeMethods.SYMBOL_INFO* symbolInfo;
-        // internal byte* buffer;
-        internal TraceEventNativeMethods.IMAGEHLP_LINE64 lineInfo;
-        #endregion
-    }
-
-    internal unsafe class TracePdbModuleReader : IDisposable
-    {
-        public string FindMethodForAddress(Address address, out Address endOfSymbol)
-        {
-            int amountLeft;
-            int rva = MapToOriginalRva(address, out amountLeft);
-
-            if (syms.Count > 0 && syms[0].StartRVA <= rva)
-            {
-                int high = syms.Count;
-                int low = 0;
-                for (; ; )
-                {
-                    int mid = (low + high) / 2;
-                    if (mid == low)
-                        break;
-                    if (syms[mid].StartRVA <= rva)
-                        low = mid;
-                    else
-                        high = mid;
-                }
-                Debug.Assert(low < syms.Count);
-                Debug.Assert(low + 1 == high);
-                Debug.Assert(syms[low].StartRVA <= rva);
-                Debug.Assert(low >= syms.Count - 1 || rva < syms[low + 1].StartRVA);
-                Sym sym = syms[low];
-                if (sym.Size == 0)
-                {
-                    endOfSymbol = (Address)((long)address + amountLeft);
-                    return sym.MethodName;
-                }
-                if (rva < sym.StartRVA + sym.Size)
-                {
-                    int symbolLeft = (int)sym.Size - (rva - sym.StartRVA);
-                    amountLeft = Math.Min(symbolLeft, amountLeft);
-                    Debug.Assert(0 <= amountLeft && amountLeft < 0x10000);      // Not true but useful for unit testing
-                    endOfSymbol = (Address)((long)address + amountLeft);
-                    return sym.MethodName;
-                }
-                // log.WriteLine("No match");
-            }
-            endOfSymbol = Address.Null;
-            return "";
-        }
-        public void FindSourceLineForAddress(Address address, out int lineNum, ref string sourceFile)
-        {
-            int displacement = 0;
-            if (!TraceEventNativeMethods.SymGetLineFromAddrW64(reader.currentProcessHandle, (ulong)address, ref displacement, ref reader.lineInfo))
-            {
-                lineNum = 0;
-                sourceFile = "";
-                return;
-            }
-            lineNum = (int)reader.lineInfo.LineNumber;
-
-            // Try to reuse the source file name as much as we can.  Don't create a new string unless we
-            // have to. 
-            for (int i = 0; ; i++)
-            {
-                if (reader.lineInfo.FileName[i] == 0 && i == sourceFile.Length)
-                    return;
-                if (i >= sourceFile.Length)
-                    break;
-                if (reader.lineInfo.FileName[i] != sourceFile[i])
-                    break;
-            }
-            sourceFile = new String((char*)reader.lineInfo.FileName);
-        }
-        public void Dispose()
-        {
-            if (!TraceEventNativeMethods.SymUnloadModule64(reader.currentProcessHandle, (ulong)moduleImageBase))
-            {
-#if DEBUG
-                reader.log.WriteLine("Error unloading module with image base " + ((ulong)moduleImageBase).ToString("x"));
-#endif
-            }
-        }
-
-        #region private
-        internal TracePdbModuleReader(TracePdbReader reader, string moduleFilepath, Address imageBase)
-        {
-            this.reader = reader;
-            reader.messages.Length = 0;
-            reader.lastLine = "";
-            ulong imageBaseRet = TraceEventNativeMethods.SymLoadModuleExW(reader.currentProcessHandle, IntPtr.Zero,
-                moduleFilepath, null, (ulong)imageBase, 0, null, 0);
-
-            if (imageBaseRet == 0)
-                throw new Exception("Fatal error loading symbols for " + moduleFilepath);
-            this.moduleImageBase = (Address)imageBaseRet;
-            Debug.Assert(moduleImageBase == imageBase);
-
-            if (reader.lastLine.IndexOf(" no symbols") >= 0 || reader.lastLine.IndexOf(" export symbols") >= 0)
-                throw new Exception(
-                    "   Could not find PDB file for " + moduleFilepath + "\r\n" +
-                    "   Detailed Diagnostic information.\r\n" +
-                    "      " + reader.messages.ToString().Replace("\n", "\r\n      "));
-            if (reader.lastLine.IndexOf(" public symbols") >= 0)
-                reader.log.WriteLine("Loaded only public symbols.");
-
-            // See if we have an object file map (created by BBT)
-            TraceEventNativeMethods.OMAP* fromMap = null;
-            toMap = null;
-            ulong toMapCount = 0;
-            ulong fromMapCount = 0;
-            if (!TraceEventNativeMethods.SymGetOmaps(reader.currentProcessHandle, (ulong)moduleImageBase, ref toMap, ref toMapCount, ref fromMap, ref fromMapCount))
-                reader.log.WriteLine("No Object maps found");
-            this.toMapCount = (int)toMapCount;
-            if (toMapCount <= 0)
-                toMap = null;
-
-            /*
-            log.WriteLine("Got ToMap");
-            for (int count = 0; count < (int) toMapCount; count++)
-                Console.WriteLine("Rva {0:x} -> {1:x}", toMap[count].rva, toMap[count].rvaTo);
-            log.WriteLine("Got FromMap");
-            for (int count = 0; count < (int) toMapCount; count++)
-                log.WriteLine("Rva {0:x} -> {1:x}", toMap[count].rva, toMap[count].rvaTo);
-            */
-
-            syms = new List<Sym>(5000);
-            TraceEventNativeMethods.SymEnumSymbolsW(reader.currentProcessHandle, (ulong)moduleImageBase, "*",
-                delegate(TraceEventNativeMethods.SYMBOL_INFO* symbolInfo, uint SymbolSize, IntPtr UserContext)
-                {
-                    int amountLeft;
-                    int mappedRVA = MapToOriginalRva((Address)symbolInfo->Address, out amountLeft);
-                    if (mappedRVA == 0)
-                        return true;
-                    Sym sym = new Sym();
-                    sym.MethodName = new String((char*)(&symbolInfo->Name));
-                    sym.StartRVA = mappedRVA;
-                    sym.Size = (int)symbolInfo->Size;
-                    syms.Add(sym);
-                    return true;
-                }, IntPtr.Zero);
-
-            reader.log.WriteLine("Got {0} symbols and {1} mappings ", syms.Count, toMapCount);
-            syms.Sort(delegate(Sym x, Sym y) { return x.StartRVA - y.StartRVA; });
-        }
-
-        /// <summary>
-        /// BBT splits up methods into many chunks.  Map the final RVA of a symbol back into its
-        /// pre-BBTed RVA.  
-        /// </summary>
-        private int MapToOriginalRva(Address finalAddress, out int amountLeft)
-        {
-            int rva = (int)(finalAddress - moduleImageBase);
-            if (toMap == null || rva < toMap[0].rva)
-            {
-                amountLeft = 0;
-                return rva;
-            };
-            Debug.Assert(toMapCount > 0);
-            int high = toMapCount;
-            int low = 0;
-
-            // Invarient toMap[low]rva <= rva < toMap[high].rva (or high == toMapCount)
-            for (; ; )
-            {
-                int mid = (low + high) / 2;
-                if (mid == low)
-                    break;
-                if (toMap[mid].rva <= rva)
-                    low = mid;
-                else
-                    high = mid;
-            }
-            Debug.Assert(toMap[low].rva <= rva);
-            Debug.Assert(low < toMapCount);
-            Debug.Assert(low + 1 == high);
-            Debug.Assert(toMap[low].rva <= rva && (low >= toMapCount - 1 || rva < toMap[low + 1].rva));
-
-            if (low + 1 < toMapCount)
-                amountLeft = toMap[low + 1].rva - rva;
-            else
-                amountLeft = 0;
-            int diff = rva - toMap[low].rva;
-
-            int ret = toMap[low].rvaTo + diff;
-#if false
-            int slowAmountLeft;
-            int slowRet = MapToOriginalRvaSlow(finalAddress, out slowAmountLeft);
-            Debug.Assert(slowRet == ret);
-            Debug.Assert(slowAmountLeft == amountLeft);
-#endif
-
-            return ret;
-        }
-
-#if DEBUG
-        private int MapToOriginalRvaSlow(Address finalAddress, out int amountLeft)
-        {
-            int rva = (int)(finalAddress - moduleImageBase);
-            Debug.Assert(toMapCount > 0);
-            if (toMap == null || rva < toMap[0].rva)
-            {
-                amountLeft = 0;
-                return rva;
-            };
-
-            int i = 0;
-            for (; ; )
-            {
-                if (i >= toMapCount)
-                {
-                    amountLeft = 0;
-                    return toMap[i - 1].rvaTo + (rva - toMap[i - 1].rva);
-                }
-                if (rva < toMap[i].rva)
-                {
-                    amountLeft = toMap[i].rva - rva;
-                    if (i != 0)
-                    {
-                        --i;
-                        rva = toMap[i].rvaTo + (rva - toMap[i].rva);
-                    }
-                    return rva;
-                }
-                i++;
-            }
-        }
-#endif
-        class Sym
-        {
-            public int StartRVA;
-            public int Size;
-            public string MethodName;
-        };
-
-        TracePdbReader reader;
-        Address moduleImageBase;
-        TraceEventNativeMethods.OMAP* toMap;
-        int toMapCount;
-        List<Sym> syms;
-        #endregion
-    }
 
     /// <summary>
     /// Represents a source for an ETLX file.  This is the class returned by the code:TraceEvents.GetSource

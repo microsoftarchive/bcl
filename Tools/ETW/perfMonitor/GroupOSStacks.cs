@@ -43,8 +43,8 @@ namespace Stacks
         }
         public override string GetFrameName(StackSourceFrameIndex frameIndex, bool fullName)
         { return m_baseStackSource.GetFrameName(frameIndex, fullName); }
-        public override int MaxCallStackIndex { get { return m_baseStackSource.MaxCallStackIndex; } }
-        public override int MaxCallFrameIndex { get { return m_baseStackSource.MaxCallFrameIndex; } }
+        public override int CallStackIndexLimit { get { return m_baseStackSource.CallStackIndexLimit; } }
+        public override int CallFrameIndexLimit { get { return m_baseStackSource.CallFrameIndexLimit; } }
         public override StackSource BaseStackSource { get { return m_baseStackSource; } }
 
         #region private
@@ -58,7 +58,7 @@ namespace Stacks
         private StackInfo GetStackInfo(StackSourceCallStackIndex stackIndex)
         {
             Debug.Assert(0 <= stackIndex);                              // No illegal stacks, or other special stacks.  
-            Debug.Assert((int)stackIndex < MaxCallStackIndex);         // And in range.  
+            Debug.Assert((int)stackIndex < CallStackIndexLimit);         // And in range.  
 
             // Check the the cache, otherwise create it.  
             int hash = (((int)stackIndex) & (StackInfoCacheSize - 1));

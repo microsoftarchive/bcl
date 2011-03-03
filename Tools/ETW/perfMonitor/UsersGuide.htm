@@ -42,7 +42,7 @@
         PerfMonitor simply copy the PerfMonitor.exe to the computer you wish to use it 
         on.&nbsp;&nbsp;&nbsp; No additional files or installation step is needed.&nbsp;&nbsp; 
         You can get the latest copy of PerfMonitor.exe from the
-<a href="http://bcl.codeplex.com/wikipage?title=PerfMonitor&referringTitle=Home">PerfMonitor download page</a>.&nbsp;&nbsp; 
+        <a href="http://bcl.codeplex.com/wikipage?title=PerfMonitor&referringTitle=Home">PerfMonitor download page</a>.&nbsp;&nbsp; 
         Simply click in the PerfMonitor.bin.zip file to download it,&nbsp; click through 
         the dialog boxes, and then copy the exe to your hard drive.&nbsp;&nbsp; You are 
         then ready to go!</p>
@@ -698,8 +698,142 @@ The start command turns on (machine wide) logging, and the stop command turns
         turns on the silverlight provider passing it the bitset 0xFFFFFFF and a verbose 
         level (5).&nbsp;&nbsp; This is relatively advanced scenario as you need to know 
         what each bit in the bitset means, and how to decode the events once they are 
-        collected.&nbsp;&nbsp;&nbsp;&nbsp;
+        collected.&nbsp;&nbsp;&nbsp;</p>
+    <p>
+        You can find the list of providers available in the system by issuing the 
+        following &#39;logman&#39; windows command</p>
+    <ul>
+        <li>logman query providers</li>
+    </ul>
+    <p>
+        However this list is very large and overwelming.&nbsp;&nbsp; It is typically 
+        more intersting to find out the set of providers that are available for your 
+        particular application.&nbsp; You can do this with the command
     </p>
+    <ul>
+        <li>logman query providers –pid PID_OF_PROCESS</li>
+    </ul>
+    <p>
+        Where PID_OF_PROCESS is the process id for your applciation.&nbsp;&nbsp; This 
+        restricts the providers to just those that are currently active for that 
+        process.&nbsp;&nbsp; This is a far smaller list, and much more likely to be 
+        relevant to you.&nbsp;&nbsp; Once you have an interesting provider you can 
+        learmn about what keywords and levels it has by issueing</p>
+    <ul>
+        <li>logman query providers PROVIDER_NAME_OR_GUID</li>
+    </ul>
+    <p>
+        This will give details on what keywords and levels can be given.&nbsp;&nbsp; You 
+        now hav the GUID, Keyword, and level information that you can then pass to the 
+        /providers: qualifer of PerfMonitor.
+    </p>
+    <h4>
+        Finding and using EventSource providers</h4>
+    <p>
+        In version 4.5 of the .NET Runtime, the System.Diagnostics.Eventing.EventSource 
+        class was added to the runtime that makes it very easy to create your own ETW 
+        provider and generate your own events.&nbsp;&nbsp; PerfMonitor has support for 
+        during these providers on and off very easily.&nbsp;&nbsp; The first piece of 
+        this support is the ability to discover what EventSources a given application 
+        (or DLL).&nbsp; For example</p>
+    <ul>
+        <li>perfMonitor listSources MyApp.exe&nbsp; </li>
+    </ul>
+    <p>
+        Will list all eventSources in &#39;MyApp.exe&#39; (or any DLL that is statically 
+        reachable from Mypp.exe&#39;) and list them.&nbsp; For example the output might 
+        be</p>
+    <pre>Event sources in eventProvider.exe.
+
+EventSource Name                 EventSource Guid
+-------------------------------------------------------------------------
+MinimalEventSource            : 7370a335-9b9a-5ba0-63c2-8ce045c35503
+MyCompany-MyApp               : 74cf8ddb-febf-5c1c-67c4-c721006bace0
+AnotherEventSource            : a217696f-5896-584d-31d5-8c90e8d3483e</pre>
+    <p>
+        The /dumpManifests qualifer can be used to specify a directory to dump all the 
+        eventSource manifests found.&nbsp; For example</p>
+    <ul>
+        <li>perfMonitor /dumpManifests:. listSources MyApp.exe</li>
+    </ul>
+    <p>
+        Will dump three .manifest.xml files into &#39;.&#39; (the current directory), one for 
+        each of the event sources.&nbsp; This gives detailed information about the 
+        keywords available in the eventSource as well as all the events and their 
+        payload schmeas.&nbsp;
+    </p>
+    <p>
+        Once you have determined which EventSource you are interested in, perfMonitor 
+        supports the syntax @filename#EventSourceName to specify eventSources in the 
+        /provider: qualifer.&nbsp;&nbsp; For example you can turn on the 
+        &#39;MinimalEventSource&#39; by specifying
+    </p>
+    <ul>
+        <li>perfMonitor /providers:@MyApp.exe#MinimalEventSource&nbsp;runDump MyApp.exe </li>
+    </ul>
+    <p>
+        Which runs &#39;MyApp.exe&#39; with the MinimalEventSource turned on.&nbsp;&nbsp; If you 
+        don&#39;t specify the # syntax, PerfMonitor assumes you want all EventsSources 
+        turned on.&nbsp; Thus</p>
+    <ul>
+        <li>perfMonitor /providers:@MyApp.exe&nbsp; runDump MyApp.exe </li>
+    </ul>
+    <p>
+    Turns on all three EvenSources in MyApp.exe. and runs the application 
+        and .&nbsp;&nbsp; 
+    When using the &#39;run&#39; command, you can event exclude the Filename (it is assumed 
+    to be the exe that is run).&nbsp; Thus </p>
+    <ul>
+        <li>perfMonitor /providers:@&nbsp; run MyApp.exe </li>
+    </ul>
+    <p>
+        Is equivalent to the previous example.&nbsp;&nbsp;&nbsp; The command above will 
+        turn on the Kernel and CLR events asl well as the EventSources.&nbsp; You would 
+        need to specify the /clrEvents:None and /kernelEvents:Process,Image qualifiers to 
+        suppress all but the least verbose events.&nbsp;&nbsp; This is common enough that PerfMonitor has a special 
+        command called &#39;monitorRun&#39; that does just this.&nbsp; Thus</p>
+    <ul>
+        <li>perfMonitor monitor MyApp.exe </li>
+    </ul>
+    <p>Is really shorthand for</p>
+    <ul>
+        <li>perfMonitor /providers:@&nbsp; /clrEvents=None /kernelEvents:Process&nbsp; run MyApp.exe
+        </li>
+    </ul>
+    <p>
+        Once you have created the ETL file, you can print out the formatted text from 
+        EventSources using the printSources command
+    </p>
+    <ul>
+        <li>perfMonitor printSources</li>
+    </ul>
+    <p>
+        Will pretty print the events in the PerfMonitorOutput.etl file to standard 
+        output.&nbsp;&nbsp; Use the /outputFile=FILE qualifer to send the output 
+        elsewhere.&nbsp;&nbsp; Monitoring and then printing the EventSources output&nbsp; 
+        as text is common enough that there is a shortcut &#39;monitorPrint&#39; command</p>
+    <ul>
+        <li>perfMonitor monitorPrint MyApp.exe</li>
+    </ul>
+    <p>
+        Will monitor the app (turn on all its eventSources), and then print the 
+        resulting output.&nbsp;&nbsp;&nbsp; If XML output is desired instead you can use 
+        the &#39;monitorDump&#39; shortcut.</p>
+    <ul>
+        <li>perfMonitor monitorDump MyApp.exe </li>
+    </ul>
+    <p>
+        Finally perfMonitor also supports realtime &#39;listening&#39; to event sources.&nbsp;&nbsp; 
+        For example</p>
+    <ul>
+        <li>perfMonitor listen @MyApp.exe</li>
+    </ul>
+    <p>
+        Will listen to all the eventSources in &#39;MyApp&#39; and print them out in &#39;real 
+        time&#39;.&nbsp;&nbsp; Control - C ends the session.&nbsp;
+    </p>
+    <p>
+        &nbsp;</p>
     <hr />
     <h3>
         <a id="SymbolResolution">Symbol Resolution</a></h3>
@@ -708,7 +842,7 @@ The start command turns on (machine wide) logging, and the stop command turns
         represented by an address in memory.&nbsp;&nbsp;&nbsp; This memory address needs 
         to be converted to symbolic form to be useful for analysis.&nbsp;&nbsp; This 
         happens in two steps.&nbsp;
-    </p>
+         </p>
     <ol>
         <li>&nbsp;First determine if the code belongs to a particular DLL (module) or not.&nbsp;
         </li>
