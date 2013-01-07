@@ -15,4 +15,3 @@ Sync the TOOLS\ETW directory
 
 In TOOLS\ETW you will find preparePerfMonitor.bat file.  This will create a 'Upload' directory 
 that has the ZIP files you want to make for a distribution.  
-
