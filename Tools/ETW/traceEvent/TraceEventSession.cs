@@ -168,10 +168,6 @@ namespace Diagnostics.Tracing
             const int stackTracingIdsMax = 96;
             int numIDs = 0;
             var stackTracingIds = stackalloc TraceEventNativeMethods.STACK_TRACING_EVENT_ID[stackTracingIdsMax];
-#if DEBUG
-            // Try setting all flags, if we overflow an assert in SetStackTraceIds will fire.  
-            SetStackTraceIds((KernelTraceEventParser.Keywords)(-1), stackTracingIds, stackTracingIdsMax);
-#endif
             if (stackCapture != KernelTraceEventParser.Keywords.None)
                 numIDs = SetStackTraceIds(stackCapture, stackTracingIds, stackTracingIdsMax);
 
@@ -944,10 +940,8 @@ namespace Diagnostics.Tracing
         {
             bool needExtensions = false;
             if ((((KernelTraceEventParser.Keywords)properties->EnableFlags) & KernelTraceEventParser.Keywords.PMCProfile) != 0)
-                needExtensions = true;
-
-            if (needExtensions)
                 throw new ApplicationException("CPU Counter profiling not supported.");
+
             properties->EnableFlags = properties->EnableFlags & (uint)~KernelTraceEventParser.Keywords.NonOSKeywords;
             return TraceEventNativeMethods.StartKernelTrace(out TraceHandle, properties, stackTracingEventIds, cStackTracingEventIds);
         }
