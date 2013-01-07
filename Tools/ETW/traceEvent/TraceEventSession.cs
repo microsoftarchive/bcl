@@ -1,3 +1,4 @@
+using Microsoft.Win32;
 //     Copyright (c) Microsoft Corporation.  All rights reserved.
 // This file is best viewed using outline mode (Ctrl-M Ctrl-O)
 //
@@ -6,16 +7,16 @@
 // 
 using System;
 using System.Collections.Generic;
-using System.Security;
+using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
-using System.Diagnostics;
-using Diagnostics.Eventing;
-using System.IO;
+using Utilities;
+using Diagnostics.Tracing.Parsers;
 
 // TraceEventSession defintions See code:#Introduction to get started.
-namespace Diagnostics.Eventing
+namespace Diagnostics.Tracing
 {
     /// <summary>
     /// #Introduction 
@@ -63,7 +64,7 @@ namespace Diagnostics.Eventing
     /// moduleFile.  Alternatively, you can use code:TraceLog.CreateFromETL to convert the ETL file into an ETLX file. 
     /// Once it is an ETLX file you have a much richer set of processing options availabe from code:TraceLog. 
     /// </summary>
-    [SecuritySafeCritical]
+    // [SecuritySafeCritical]
     unsafe public sealed class TraceEventSession : IDisposable
     {
         /// <summary>
@@ -79,11 +80,12 @@ namespace Diagnostics.Eventing
         /// </param>
         public TraceEventSession(string sessionName, string fileName)
         {
-            this.m_BufferSizeMB = 40;       // The default size.  
+            this.m_BufferSizeMB = Math.Max(64, System.Environment.ProcessorCount * 2);       // The default size.  
             this.m_SessionHandle = TraceEventNativeMethods.INVALID_HANDLE_VALUE;
             this.m_FileName = fileName;               // filename = null means real time session
             this.m_SessionName = sessionName;
             this.m_Create = true;
+            this.CpuSampleIntervalMSec = 1.0F;
         }
         /// <summary>
         /// Open an existing Windows Event Tracing Session, with name 'sessionName'. To create a new session,
@@ -94,6 +96,7 @@ namespace Diagnostics.Eventing
         {
             this.m_SessionHandle = TraceEventNativeMethods.INVALID_HANDLE_VALUE;
             this.m_SessionName = sessionName;
+            this.CpuSampleIntervalMSec = 1.0F;
 
             // Get the filename
             var propertiesBuff = stackalloc byte[PropertiesSize];
@@ -106,17 +109,6 @@ namespace Diagnostics.Eventing
             this.m_BufferSizeMB = (int)properties->MinimumBuffers;
             if ((properties->LogFileMode & TraceEventNativeMethods.EVENT_TRACE_FILE_MODE_CIRCULAR) != 0)
                 m_CircularBufferMB = (int)properties->MaximumFileSize;
-        }
-
-        /// <summary>
-        /// Start a kernel session (name is required to be NT Kernel Logger) and turn on 'eventsToEnable' events 
-        /// and 'eventStacksToEnable' stacks.  
-        /// </summary>
-        public TraceEventSession(string fileName, 
-            KernelTraceEventParser.Keywords eventsToEnable, 
-            KernelTraceEventParser.Keywords eventStacksToEnable) : this(KernelTraceEventParser.KernelSessionName, fileName)
-        {
-            EnableKernelProvider(eventsToEnable, eventStacksToEnable);
         }
 
         public bool EnableKernelProvider(KernelTraceEventParser.Keywords flags)
@@ -134,16 +126,43 @@ namespace Diagnostics.Eventing
         /// </summary>
         public unsafe bool EnableKernelProvider(KernelTraceEventParser.Keywords flags, KernelTraceEventParser.Keywords stackCapture)
         {
+            bool systemTraceProvider = false;
+            var version = Environment.OSVersion.Version.Major * 10 + Environment.OSVersion.Version.Minor;
             if (m_SessionName != KernelTraceEventParser.KernelSessionName)
-                throw new Exception("Cannot enable kernel events to a real time session unless it is named " + KernelTraceEventParser.KernelSessionName);
-            if (m_SessionHandle != TraceEventNativeMethods.INVALID_HANDLE_VALUE)
-                throw new Exception("The kernel provider must be enabled as the only provider.");
-            if (Environment.OSVersion.Version.Major < 6)
-                throw new NotSupportedException("Kernel Event Tracing is only supported on Windows 6.0 (Vista) and above.");
+            {
+                systemTraceProvider = true;
+                if (version < 62)
+                    throw new NotSupportedException("System Tracing is only supported on Windows 8 and above.");
+            }
+            else
+            {
+                if (m_SessionHandle != TraceEventNativeMethods.INVALID_HANDLE_VALUE)
+                    throw new Exception("The kernel provider must be enabled as the only provider.");
+                if (version < 60)
+                    throw new NotSupportedException("Kernel Event Tracing is only supported on Windows 6.0 (Vista) and above.");
+            }
+
+            // The Profile event requires the SeSystemProfilePrivilege to succeed, so set it.  
+            if ((flags & (KernelTraceEventParser.Keywords.Profile | KernelTraceEventParser.Keywords.PMCProfile)) != 0)
+            {
+                TraceEventNativeMethods.SetSystemProfilePrivilege();
+                // TODO FIX NOW never fails.  
+                if (CpuSampleIntervalMSec != 1)
+                {
+                    if (!TraceEventNativeMethods.CanSetCpuSamplingRate())
+                        throw new ApplicationException("Changing the CPU sampling rate is currently not supported on this OS.");
+                }
+                var cpu100ns = (CpuSampleIntervalMSec * 10000.0 + .5);
+                // The API seems to have an upper bound of 1 second.  
+                if (cpu100ns >= int.MaxValue || ((int)cpu100ns) > 10000000)
+                    throw new ApplicationException("CPU Sampling rate is too high.");
+                var succeeded = TraceEventNativeMethods.SetCpuSamplingRate((int)cpu100ns);       // Always try to set, since it may not be the default
+                if (!succeeded && CpuSampleIntervalMSec != 1.0F)
+                    throw new InvalidOperationException("Can't set CPU sampling to " + CpuSampleIntervalMSec.ToString("f3") + "Msec.");
+            }
 
             var propertiesBuff = stackalloc byte[PropertiesSize];
             var properties = GetProperties(propertiesBuff);
-            properties->Wnode.Guid = KernelTraceEventParser.ProviderGuid;
 
             // Initialize the stack collecting information
             const int stackTracingIdsMax = 96;
@@ -156,30 +175,51 @@ namespace Diagnostics.Eventing
             if (stackCapture != KernelTraceEventParser.Keywords.None)
                 numIDs = SetStackTraceIds(stackCapture, stackTracingIds, stackTracingIdsMax);
 
-            // The Profile event requires the SeSystemProfilePrivilege to succeed, so set it.  
-            if ((flags & KernelTraceEventParser.Keywords.Profile) != 0)
-                TraceEventNativeMethods.SetSystemProfilePrivilege();
-
             bool ret = false;
-            properties->EnableFlags = (uint)flags;
             int dwErr;
             try
             {
-                dwErr = TraceEventNativeMethods.StartKernelTrace(out m_SessionHandle, properties, stackTracingIds, numIDs);
-                if (dwErr == 0xB7) // STIERR_HANDLEEXISTS
+                if (systemTraceProvider)
                 {
+                    properties->LogFileMode = properties->LogFileMode | TraceEventNativeMethods.EVENT_TRACE_SYSTEM_LOGGER_MODE;
+                    InsureStarted(properties);
+
+                    dwErr = TraceEventNativeMethods.TraceSetInformation(m_SessionHandle,
+                                                                        TraceEventNativeMethods.TRACE_INFO_CLASS.TraceStackTracingInfo,
+                                                                        stackTracingIds,
+                                                                        (numIDs * sizeof(TraceEventNativeMethods.STACK_TRACING_EVENT_ID)));
+                    Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(dwErr));
+
+                    ulong* systemTraceFlags = stackalloc ulong[1];
+                    systemTraceFlags[0] = (ulong)(flags & ~KernelTraceEventParser.Keywords.NonOSKeywords);
+                    dwErr = TraceEventNativeMethods.TraceSetInformation(m_SessionHandle,
+                                                                        TraceEventNativeMethods.TRACE_INFO_CLASS.TraceSystemTraceEnableFlagsInfo,
+                                                                        systemTraceFlags,
+                                                                        sizeof(ulong));
+                    Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(dwErr));
                     ret = true;
-                    Stop();
-                    m_Stopped = false;
-                    Thread.Sleep(100);  // Give it some time to stop. 
-                    dwErr = TraceEventNativeMethods.StartKernelTrace(out m_SessionHandle, properties, stackTracingIds, numIDs);
+                }
+                else
+                {
+                    properties->Wnode.Guid = KernelTraceEventParser.ProviderGuid;
+                    properties->EnableFlags = (uint)flags;
+
+                    dwErr = StartKernelTrace(out m_SessionHandle, properties, stackTracingIds, numIDs);
+                    if (dwErr == 0xB7) // STIERR_HANDLEEXISTS
+                    {
+                        ret = true;
+                        Stop();
+                        m_Stopped = false;
+                        Thread.Sleep(100);  // Give it some time to stop. 
+                        dwErr = StartKernelTrace(out m_SessionHandle, properties, stackTracingIds, numIDs);
+                    }
                 }
             }
             catch (BadImageFormatException)
             {
                 // We use a small native DLL called KernelTraceControl that needs to be 
                 // in the same directory as the EXE that used TraceEvent.dll.  Unlike IL
-                // Native DLLs are specific to a processor type (32 or 64 bit) so the easiest
+                // Native DLLs are specific to a processor type (32 or 64 bit) so the easiestC:\Users\vancem\Documents\etw\traceEvent\TraceEventSession.cs
                 // way to insure this is that the EXE that uses TraceEvent is built for 32 bit
                 // and that you use the 32 bit version of KernelTraceControl.dll
                 throw new BadImageFormatException("Could not load KernelTraceControl.dll (likely 32-64 bit process mismatch)");
@@ -197,16 +237,61 @@ namespace Diagnostics.Eventing
             if (dwErr == 5 && Environment.OSVersion.Version.Major > 5)      // On Vista and we get a 'Accessed Denied' message
                 throw new UnauthorizedAccessException("Error Starting ETW:  Access Denied (Administrator rights required to start ETW)");
             Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(dwErr));
+            m_IsActive = true;
+
+            if (version >= 62 && StackCompression)
+                TraceEventNativeMethods.EnableStackCaching(m_SessionHandle);
             return ret;
         }
-        public bool EnableProvider(Guid providerGuid, TraceEventLevel providerLevel)
+
+        /// <summary>
+        /// EventSources have a convention for converting its name to a GUID.  Use this convention to 
+        /// convert 'name' to a GUID.  
+        public static Guid GetEventSourceGuidFromName(string name)
         {
-            return EnableProvider(providerGuid, providerLevel, 0, 0, null);
+            name = name.ToUpperInvariant();     // names are case insenstive.  
+
+            // The algorithm below is following the guidance of http://www.ietf.org/rfc/rfc4122.txt
+            // Create a blob containing a 16 byte number representing the namespace
+            // followed by the unicode bytes in the name.  
+            var bytes = new byte[name.Length * 2 + 16];
+            uint namespace1 = 0x482C2DB2;
+            uint namespace2 = 0xC39047c8;
+            uint namespace3 = 0x87F81A15;
+            uint namespace4 = 0xBFC130FB;
+            // Write the bytes most-significant byte first.  
+            for (int i = 3; 0 <= i; --i)
+            {
+                bytes[i] = (byte)namespace1;
+                namespace1 >>= 8;
+                bytes[i + 4] = (byte)namespace2;
+                namespace2 >>= 8;
+                bytes[i + 8] = (byte)namespace3;
+                namespace3 >>= 8;
+                bytes[i + 12] = (byte)namespace4;
+                namespace4 >>= 8;
+            }
+            // Write out  the name, most significant byte first
+            for (int i = 0; i < name.Length; i++)
+            {
+                bytes[2 * i + 16 + 1] = (byte)name[i];
+                bytes[2 * i + 16] = (byte)(name[i] >> 8);
+            }
+
+            // Compute the Sha1 hash 
+            var sha1 = System.Security.Cryptography.SHA1.Create();
+            byte[] hash = sha1.ComputeHash(bytes);
+
+            // Create a GUID out of the first 16 bytes of the hash (SHA-1 create a 20 byte hash)
+            int a = (((((hash[3] << 8) + hash[2]) << 8) + hash[1]) << 8) + hash[0];
+            short b = (short)((hash[5] << 8) + hash[4]);
+            short c = (short)((hash[7] << 8) + hash[6]);
+
+            c = (short)((c & 0x0FFF) | 0x5000);   // Set high 4 bits of octet 7 to 5, as per RFC 4122
+            Guid guid = new Guid(a, b, c, hash[8], hash[9], hash[10], hash[11], hash[12], hash[13], hash[14], hash[15]);
+            return guid;
         }
-        public bool EnableProvider(Guid providerGuid, TraceEventLevel providerLevel, ulong matchAnyKeywords)
-        {
-            return EnableProvider(providerGuid, providerLevel, matchAnyKeywords, 0, null);
-        }
+
         /// <summary>
         /// Add an additional USER MODE provider prepresented by 'providerGuid' (a list of
         /// providers is available by using 'logman query providers').
@@ -222,20 +307,34 @@ namespace Diagnostics.Eventing
         /// <param name="matchAllKeywords">A bitvector representing keywords of an event that must
         /// be on for a particular event for the event to be logged.  A value of zero means
         /// that no keyword must be on, which effectively ignores this value.  </param>
+        /// <param name="options">Additional options for the provider (e.g. taking a stack trace)</param>
         /// <param name="values">This is set of key-value strings that are passed to the provider
-        /// for provider-specific interpretation. Can be null if no additional args are needed.</param>
+        /// for provider-specific interpretation. Can be null if no additional args are needed.  
+        /// If the special key-value pair 'Command'='SendManifest' is provided, then the 'SendManifest'
+        /// command will be sent (which causes EventSources to redump their manifest to the ETW log.  </param>
         /// <returns>true if the session already existed and needed to be restarted.</returns>
-        public bool EnableProvider(Guid providerGuid, TraceEventLevel providerLevel, ulong matchAnyKeywords, ulong matchAllKeywords, IEnumerable<KeyValuePair<string, string>> values)
+        public bool EnableProvider(Guid providerGuid, TraceEventLevel providerLevel = TraceEventLevel.Verbose, ulong matchAnyKeywords = ulong.MaxValue, ulong matchAllKeywords = 0, TraceEventOptions options = 0, IEnumerable<KeyValuePair<string, string>> values = null)
         {
             byte[] valueData = null;
             int valueDataSize = 0;
             int valueDataType = 0;
             if (values != null)
             {
-                valueDataType = 0; // ControllerCommands.Start   // TODO use enumeration
+                valueDataType = 0; // ControllerCommand.Update  // TODO use enumeration
                 valueData = new byte[1024];
                 foreach (KeyValuePair<string, string> keyValue in values)
                 {
+                    if (keyValue.Key == "Command")
+                    {
+                        if (keyValue.Value == "SendManifest")
+                            valueDataType = -1; // ControllerCommand.SendManifest
+                        else
+                        {
+                            int val;
+                            if (int.TryParse(keyValue.Value, out val))
+                                valueDataType = val;
+                        }
+                    }
                     valueDataSize += Encoding.UTF8.GetBytes(keyValue.Key, 0, keyValue.Key.Length, valueData, valueDataSize);
                     if (valueDataSize >= 1023)
                         throw new Exception("Too much provider data");  // TODO better message. 
@@ -246,7 +345,37 @@ namespace Diagnostics.Eventing
                     valueData[valueDataSize++] = 0;
                 }
             }
-            return EnableProvider(providerGuid, providerLevel, matchAnyKeywords, matchAllKeywords, valueDataType, valueData, valueDataSize);
+            return EnableProvider(providerGuid, providerLevel, matchAnyKeywords, matchAllKeywords, options, valueDataType, valueData, valueDataSize);
+        }
+
+        /// <summary>
+        /// Disables a provider completely
+        /// </summary>
+        public void DisableProvider(Guid providerGuid)
+        {
+            int hr;
+            try
+            {
+                try
+                {
+                    // Try the Win7 API
+                    var parameters = new TraceEventNativeMethods.ENABLE_TRACE_PARAMETERS { Version = TraceEventNativeMethods.ENABLE_TRACE_PARAMETERS_VERSION };
+                    hr = TraceEventNativeMethods.EnableTraceEx2(
+                        m_SessionHandle, ref providerGuid, TraceEventNativeMethods.EVENT_CONTROL_CODE_DISABLE_PROVIDER,
+                        0, 0, 0, 0, ref parameters);
+                }
+                catch (EntryPointNotFoundException)
+                {
+                    // OK that did not work, try the VISTA API
+                    hr = TraceEventNativeMethods.EnableTraceEx(ref providerGuid, null, m_SessionHandle, 0, 0, 0, 0, 0, null);
+                }
+            }
+            catch (EntryPointNotFoundException)
+            {
+                // Try with the old pre-vista API
+                hr = TraceEventNativeMethods.EnableTrace(0, 0, 0, ref providerGuid, m_SessionHandle);
+            }
+            Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(hr));
         }
         /// <summary>
         /// Once started, event sessions will persist even after the process that created them dies. They are
@@ -257,16 +386,63 @@ namespace Diagnostics.Eventing
             if (m_Stopped)
                 return true;
             m_Stopped = true;
+            TraceEventNativeMethods.SetCpuSamplingRate(10000);      // Set sample rate back to default 1 Msec 
             var propertiesBuff = stackalloc byte[PropertiesSize];
             var properties = GetProperties(propertiesBuff);
             int hr = TraceEventNativeMethods.ControlTrace(0UL, m_SessionName, properties, TraceEventNativeMethods.EVENT_TRACE_CONTROL_STOP);
+
             if (hr != 4201)     // Instance name not found.  This means we did not start
             {
                 if (!noThrow)
                     Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(hr));
                 return false;   // Stop failed
             }
+
             return true;
+        }
+        /// <summary>
+        /// Sends the CAPUTURE_STATE command to the provider 
+        /// 
+        /// This routine only works Win7 and above, since previous versions don't have this concept.   The providers also has 
+        /// to support it.  
+        /// 
+        /// You can use KernelTraceEventParser.ProviderGuid here to cause rundown for the system.  
+        /// </summary>
+        /// <param name="providerGuid">The GUID that identifies the provider to send the CaptureState command to</param>
+        /// <param name="matchAnyKeywords">The Keywords to send as part of the command (can influnced what is sent back)</param>
+        /// <param name="filterType">if non-zero, this is passed along to the provider as type of the filter data.</param>
+        /// <param name="data">If non-null this is either an int, or a byte array and is passed along as filter data.</param>
+        public void CaptureState(Guid providerGuid, ulong matchAnyKeywords = ulong.MaxValue, int filterType = 0, object data = null)
+        {
+            var parameters = new TraceEventNativeMethods.ENABLE_TRACE_PARAMETERS();
+            var filter = new TraceEventNativeMethods.EVENT_FILTER_DESCRIPTOR();
+            parameters.Version = TraceEventNativeMethods.ENABLE_TRACE_PARAMETERS_VERSION;
+
+            byte[] asArray = data as byte[];
+            if (data is int)
+            {
+                int intVal = (int)data;
+                asArray = new byte[4];
+                asArray[0] = (byte)intVal;
+                asArray[1] = (byte)(intVal >> 8);
+                asArray[2] = (byte)(intVal >> 16);
+                asArray[3] = (byte)(intVal >> 24);
+            }
+            fixed (byte* filterDataPtr = asArray)
+            {
+                if (asArray != null)
+                {
+                    parameters.EnableFilterDesc = &filter;
+                    filter.Type = filterType;
+                    filter.Size = asArray.Length;
+                    filter.Ptr = filterDataPtr;
+                }
+                int hr = TraceEventNativeMethods.EnableTraceEx2(
+                    m_SessionHandle, ref providerGuid, TraceEventNativeMethods.EVENT_CONTROL_CODE_CAPTURE_STATE,
+                    (byte)TraceEventLevel.Verbose, matchAnyKeywords, 0, 0, ref parameters);
+
+                Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(hr));
+            }
         }
 
         /// <summary>
@@ -335,7 +511,220 @@ namespace Diagnostics.Eventing
                 return m_IsActive;
             }
         }
+        /// <summary>
+        /// The rate at which CPU samples are collected.  By default this is 1 (once a millisecond per CPU).
+        /// There is alower bound on this (typically .125 Msec)
+        /// </summary>
+        public float CpuSampleIntervalMSec { get; set; }
+        /// <summary>
+        /// Indicate that this session should use compress the stacks to save space.  
+        /// Must be set before any providers are enabled.  Currently only works for kernel events.  
+        /// TODO FIX NOW untested.  
+        /// </summary>
+        public bool StackCompression { get; set; }
 
+        // OS Heap Provider support.  
+        /// <summary>
+        /// Turn on windows heap logging (stack for allocation) for a particular existing process.
+        /// </summary>
+        public void EnableWindowsHeapProvider(int pid)
+        {
+            throw new NotSupportedException("This version of PerfView does not support collection of OS Heap events.");
+        }
+        /// <summary>
+        /// Turn on windows heap logging for a particular EXE file name (just the file name, no directory, but it DOES include the .exe extension)
+        /// </summary>
+        /// <param name="exeFileName"></param>
+        public void EnableWindowsHeapProvider(string exeFileName)
+        {
+            throw new NotSupportedException("This version of PerfView does not support collection of OS Heap events.");
+        }
+
+        // CPU counter support 
+        /// <summary>
+        /// Returned by GetProfileSourceInfo, describing the CPU counter (ProfileSource) available on the machine. 
+        /// </summary>
+        public class ProfileSourceInfo
+        {
+            public string Name;             // Human readable name of the CPU performance counter (eg BranchInstructions, TotalIssues ...)
+            public int ID;                  // The ID that can be passed to SetProfileSources
+            public int Interval;            // This many events are skipped for each sample that is actually recorded
+            public int MinInterval;         // The smallest Interval can be (typically 4K)
+            public int MaxInterval;         // The largest Interval can be (typically maxInt).  
+        }
+        /// <summary>
+        /// Returns a ditionary of keyed by name of ProfileSourceInfo structures for all the CPU counters available on the machine. 
+        /// TODO FIX NOW remove log parameter. 
+        /// </summary>
+        public static unsafe Dictionary<string, ProfileSourceInfo> GetProfileSourceInfo()
+        {
+            var version = Environment.OSVersion.Version.Major * 10 + Environment.OSVersion.Version.Minor;
+            if (version < 62)
+                throw new ApplicationException("Profile source only availabe on Win8 and beyond.");
+
+            var ret = new Dictionary<string, ProfileSourceInfo>(StringComparer.OrdinalIgnoreCase);
+
+            // Figure out how much space we need.  
+            int retLen = 0;
+            var result = TraceEventNativeMethods.TraceQueryInformation(0,
+                TraceEventNativeMethods.TRACE_INFO_CLASS.TraceProfileSourceListInfo,
+                null, 0, ref retLen);
+            Debug.Assert(result == 24);     // Not enough space.  
+            if (retLen != 0)
+            {
+                // Do it for real.  
+                byte* buffer = stackalloc byte[retLen];
+                result = TraceEventNativeMethods.TraceQueryInformation(0,
+                    TraceEventNativeMethods.TRACE_INFO_CLASS.TraceProfileSourceListInfo,
+                    buffer, retLen, ref retLen);
+
+                if (result == 0)
+                {
+                    var interval = new TraceEventNativeMethods.TRACE_PROFILE_INTERVAL();
+                    var profileSource = (TraceEventNativeMethods.PROFILE_SOURCE_INFO*)buffer;
+                    for (int i = 0; i < 10; i++)
+                    {
+                        char* namePtr = (char*)&profileSource[1];       // points off the end of the array;
+
+                        interval.Source = profileSource->Source;
+                        interval.Interval = 0;
+                        result = TraceEventNativeMethods.TraceQueryInformation(0,
+                            TraceEventNativeMethods.TRACE_INFO_CLASS.TraceSampledProfileIntervalInfo,
+                            &interval, sizeof(TraceEventNativeMethods.TRACE_PROFILE_INTERVAL), ref retLen);
+                        if (result != 0)
+                            Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(result));
+
+                        var name = new string(namePtr);
+                        ret.Add(name, new ProfileSourceInfo()
+                        {
+                            Name = name,
+                            ID = profileSource->Source,
+                            Interval = interval.Interval,
+                            MinInterval = profileSource->MinInterval,
+                            MaxInterval = profileSource->MaxInterval,
+                        });
+                        if (profileSource->NextEntryOffset == 0)
+                            break;
+                        profileSource = (TraceEventNativeMethods.PROFILE_SOURCE_INFO*)(profileSource->NextEntryOffset + (byte*)profileSource);
+                    }
+                }
+                else
+                    Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(result));
+            }
+            return ret;
+        }
+        /// <summary>
+        /// Sets the Profile Sources (CPU machine counters) that will be used if PMC (Precise Machine Counters)
+        /// are turned on.   Each CPU counter is given a id (the profileSourceID) and has an interval 
+        /// (the number of counts you skip for each event you log).   You can get the human name for 
+        /// all the supported CPU counters by calling GetProfileSourceInfo.  Then choose the ones you want
+        /// and configure them here (the first array indicating the CPU counters to enable, and the second
+        /// array indicating the interval.  The second array can be shorter then the first, in which case
+        /// the existing interval is used (it persists and has a default on boot).  
+        /// </summary>
+        public static unsafe void SetProfileSources(int[] profileSourceIDs, int[] profileSourceIntervals)
+        {
+            var version = Environment.OSVersion.Version.Major * 10 + Environment.OSVersion.Version.Minor;
+            if (version < 62)
+                throw new ApplicationException("Profile source only availabe on Win8 and beyond.");
+
+            TraceEventNativeMethods.SetSystemProfilePrivilege();
+            var interval = new TraceEventNativeMethods.TRACE_PROFILE_INTERVAL();
+            for (int i = 0; i < profileSourceIntervals.Length; i++)
+            {
+                interval.Source = profileSourceIDs[i];
+                interval.Interval = profileSourceIntervals[i];
+                var result = TraceEventNativeMethods.TraceSetInformation(0,
+                    TraceEventNativeMethods.TRACE_INFO_CLASS.TraceSampledProfileIntervalInfo,
+                    &interval, sizeof(TraceEventNativeMethods.TRACE_PROFILE_INTERVAL));
+                if (result != 0)
+                    Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(result));
+            }
+
+            fixed (int* sourcesPtr = profileSourceIDs)
+            {
+                var result = TraceEventNativeMethods.TraceSetInformation(0,
+                    TraceEventNativeMethods.TRACE_INFO_CLASS.TraceProfileSourceConfigInfo,
+                    sourcesPtr, profileSourceIDs.Length * sizeof(int));
+                if (result != 0)
+                    Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRFromWin32(result));
+            }
+        }
+
+        // Post processing (static methods)
+        /// <summary>
+        /// It is sometimes useful to merge the contents of several ETL files into a single 
+        /// output ETL file.   This routine does that.  It also will attach additional 
+        /// information that will allow correct file name and symbolic lookup if the 
+        /// ETL file is used on a machine other than the one that the data was collected on.
+        /// If you wish to transport the file to another machine you need to merge them.
+        /// </summary>
+        /// <param name="inputETLFileNames"></param>
+        /// <param name="outputETLFileName"></param>
+        public static void Merge(string[] inputETLFileNames, string outputETLFileName)
+        {
+            IntPtr state = IntPtr.Zero;
+
+            // If we happen to be in the WOW, disable file system redirection as you don't get the System32 dlls otherwise. 
+            bool disableRedirection = TraceEventNativeMethods.Wow64DisableWow64FsRedirection(ref state);
+            try
+            {
+                Debug.Assert(disableRedirection || System.Runtime.InteropServices.Marshal.SizeOf(typeof(IntPtr)) == 8);
+
+                int retValue = TraceEventNativeMethods.CreateMergedTraceFile(
+                    outputETLFileName, inputETLFileNames, inputETLFileNames.Length,
+                        TraceEventNativeMethods.EVENT_TRACE_MERGE_EXTENDED_DATA.IMAGEID |
+                        TraceEventNativeMethods.EVENT_TRACE_MERGE_EXTENDED_DATA.BUILDINFO |
+                        TraceEventNativeMethods.EVENT_TRACE_MERGE_EXTENDED_DATA.WINSAT |
+                        TraceEventNativeMethods.EVENT_TRACE_MERGE_EXTENDED_DATA.EVENT_METADATA |
+                        TraceEventNativeMethods.EVENT_TRACE_MERGE_EXTENDED_DATA.VOLUME_MAPPING);
+                if (retValue != 0)
+                    throw new ApplicationException("Merge operation failed.");
+            }
+            finally
+            {
+                if (disableRedirection)
+                    TraceEventNativeMethods.Wow64RevertWow64FsRedirection(state);
+            }
+        }
+        /// <summary>
+        /// This variation of the Merge command takes the 'primary' etl file name (X.etl)
+        /// and will merge in any files that match .clr*.etl .user*.etl. and .kernel.etl.  
+        /// </summary>
+        public static void MergeInPlace(string etlFileName, TextWriter log)
+        {
+            var dir = Path.GetDirectoryName(etlFileName);
+            if (dir.Length == 0)
+                dir = ".";
+            var baseName = Path.GetFileNameWithoutExtension(etlFileName);
+            List<string> mergeInputs = new List<string>();
+            mergeInputs.Add(etlFileName);
+            mergeInputs.AddRange(Directory.GetFiles(dir, baseName + ".kernel.etl"));
+            mergeInputs.AddRange(Directory.GetFiles(dir, baseName + ".clr*.etl"));
+            mergeInputs.AddRange(Directory.GetFiles(dir, baseName + ".user*.etl"));
+
+            string tempName = Path.ChangeExtension(etlFileName, ".etl.new");
+            try
+            {
+                // Do the merge;
+                Merge(mergeInputs.ToArray(), tempName);
+
+                // Delete the originals.  
+                foreach (var mergeInput in mergeInputs)
+                    FileUtilities.ForceDelete(mergeInput);
+
+                // Place the output in its final resting place.  
+                FileUtilities.ForceMove(tempName, etlFileName);
+            }
+            finally
+            {
+                // Insure we clean up.  
+                if (File.Exists(tempName))
+                    File.Delete(tempName);
+            }
+        }
+
+        // Session Discovery 
         /// <summary>
         /// ETW trace sessions survive process shutdown. Thus you can attach to existing active sessions.
         /// GetActiveSessionNames() returns a list of currently existing session names.  These can be passed
@@ -373,70 +762,196 @@ namespace Diagnostics.Eventing
             }
             return activeTraceNames;
         }
+
+        // Dicovering providers and their Keywords
         /// <summary>
-        /// It is sometimes useful to merge the contents of several ETL files into a single 
-        /// output ETL file.   This routine does that.  It also will attach additional 
-        /// information that will allow correct file name and symbolic lookup if the 
-        /// ETL file is used on a machine other than the one that the data was collected on.
-        /// If you wish to transport the file to another machine you need to merge them.
+        /// Returns the names of every registered provider on the system.   This is a long list (1000s of entries.  
+        /// You can get its Guid with GetProviderByName.  
         /// </summary>
-        /// <param name="inputETLFileNames"></param>
-        /// <param name="outputETLFileName"></param>
-        public static void Merge(string[] inputETLFileNames, string outputETLFileName)
+        public static IEnumerable<string> RegisteredProviders
         {
-            int retValue = TraceEventNativeMethods.CreateMergedTraceFile(
-                outputETLFileName, inputETLFileNames, inputETLFileNames.Length,
-                    TraceEventNativeMethods.EVENT_TRACE_MERGE_EXTENDED_DATA.IMAGEID |
-                    TraceEventNativeMethods.EVENT_TRACE_MERGE_EXTENDED_DATA.VOLUME_MAPPING);
-            if (retValue != 0)
-                throw new ApplicationException("Merge operation failed.");
-        }
-        /// <summary>
-        /// This variation of the Merge command takes the 'primary' etl file name (X.etl)
-        /// and will merge in any files that match the list of file pattern in 'suffixPats'
-        /// By default this list is .clr*.etl .user*.etl. and .kernel.etl.  
-        /// </summary>
-        public static void MergeInPlace(string etlFileName, List<String> suffixPats = null)
-        {
-            if (suffixPats == null)
-                suffixPats = new List<string>() { ".clr*.etl", "user*.etl", ".kernel.etl" };
-
-            var dir = Path.GetDirectoryName(etlFileName);
-            if (dir.Length == 0)
-                dir = ".";
-            var baseName = Path.GetFileNameWithoutExtension(etlFileName);
-            List<string> mergeInputs = new List<string>();
-            mergeInputs.Add(etlFileName);
-
-            foreach(var suffixPat in suffixPats)
-                mergeInputs.AddRange(Directory.GetFiles(dir, baseName + suffixPat));
-                
-            string tempName = Path.ChangeExtension(etlFileName, ".etl.new");
-            try
+            get
             {
-                // Do the merge;
-                Merge(mergeInputs.ToArray(), tempName);
-
-                // Delete the originals.  
-                foreach (var mergeInput in mergeInputs)
-                    File.Delete(mergeInput);
-
-                // Place the output in its final resting place.  
-                File.Move(tempName, etlFileName);
-            }
-            finally
-            {
-                // Insure we clean up.  
-                if (File.Exists(tempName))
-                    File.Delete(tempName);
+                return ProviderNameToGuid.Keys;
             }
         }
         /// <summary>
-        /// Is the current process Elevated (allowed to turn on a ETW provider
+        /// Returns a list of provider GUIDs that are registered in a process with 'processID'.   
+        /// This is a nice way to filter down the providers you might care about. 
+        /// </summary>
+        public static List<Guid> ProvidersInProcess(int processID)
+        {
+            var ret = new List<Guid>();
+            // For every provider 
+            foreach (var guid in ProviderNameToGuid.Values)
+            {
+                // See what process it is in.  
+                int buffSize = 0;
+                Guid localGuid = guid;
+                var hr = TraceEventNativeMethods.EnumerateTraceGuidsEx(TraceEventNativeMethods.TRACE_QUERY_INFO_CLASS.TraceGuidQueryInfo,
+                    &localGuid, sizeof(Guid), null, 0, ref buffSize);
+                if (hr != 122)
+                    continue;           // TODO should we be ignoring errors?
+
+                Debug.Assert(hr == 122);     // ERROR_INSUFFICIENT_BUFFER
+                var buffer = stackalloc byte[buffSize];
+                hr = TraceEventNativeMethods.EnumerateTraceGuidsEx(TraceEventNativeMethods.TRACE_QUERY_INFO_CLASS.TraceGuidQueryInfo,
+                    &localGuid, sizeof(Guid), buffer, buffSize, ref buffSize);
+                if (hr != 0)
+                    throw new InvalidOperationException("TraceGuidQueryInfo failed.");       // TODO better error message
+
+                var providerInfos = (TraceEventNativeMethods.TRACE_GUID_INFO*)buffer;
+                var provider = (TraceEventNativeMethods.TRACE_PROVIDER_INSTANCE_INFO*)&providerInfos[1];
+                for (int i = 0; i < providerInfos->InstanceCount; i++)
+                {
+                    if (provider->Pid == processID)
+                    {
+                        ret.Add(guid);
+                        break;      // We can go on since we found what we were looking for. 
+                    }
+                    if (provider->NextOffset == 0)
+                        break;
+                    Debug.Assert(0 <= provider->NextOffset && provider->NextOffset < buffSize);
+                    var structBase = (byte*)provider;
+                    provider = (TraceEventNativeMethods.TRACE_PROVIDER_INSTANCE_INFO*)&structBase[provider->NextOffset];
+                }
+            }
+            return ret;
+        }
+
+        /// <summary>
+        /// Given the friendly name of a provider (e.g. Microsoft-Windows-DotNETRuntimeStress) return the
+        /// GUID for the provider.  Returns Guid.Empty on failure.   
+        /// </summary>
+        public static Guid GetProviderByName(string name)
+        {
+            Guid ret;
+            ProviderNameToGuid.TryGetValue(name, out ret);
+            return ret;
+        }
+        /// <summary>
+        /// Finds the friendly name for 'providerGuid'  Returns the Guid as a string if can't be found
+        /// </summary>
+        public static string GetProviderName(Guid providerGuid)
+        {
+            string ret;
+            ProviderGuidToName.TryGetValue(providerGuid, out ret);
+            if (ret == null)
+                ret = providerGuid.ToString();
+            return ret;
+        }
+        /// <summary>
+        /// Returns the keywords the provider represented by 'providerGuid' supports. 
+        /// </summary>
+        public static List<ProviderDataItem> GetProviderKeywords(Guid providerGuid)
+        {
+            return GetProviderFields(providerGuid, TraceEventNativeMethods.EVENT_FIELD_TYPE.EventKeywordInformation);
+        }
+
+        // Misc
+        /// <summary>
+        /// Is the current process Elevated (allowed to turn on a ETW provider).   Does not really belong here
+        /// but it useful since ETW does need to be elevated.  
         /// </summary>
         /// <returns></returns>
         public static bool? IsElevated() { return TraceEventNativeMethods.IsElevated(); }
+
         #region Private
+        /// <summary>
+        /// Returns a sorted dictionary of  names and Guids for every provider registered on the system.   
+        /// </summary>
+        private static SortedDictionary<string, Guid> ProviderNameToGuid
+        {
+            get
+            {
+                if (s_providersByName == null)
+                {
+                    s_providersByName = new SortedDictionary<string, Guid>();
+                    int buffSize = 0;
+                    var hr = TraceEventNativeMethods.TdhEnumerateProviders(null, ref buffSize);
+                    Debug.Assert(hr == 122);     // ERROR_INSUFFICIENT_BUFFER
+                    var buffer = stackalloc byte[buffSize];
+                    var providersDesc = (TraceEventNativeMethods.PROVIDER_ENUMERATION_INFO*)buffer;
+
+                    hr = TraceEventNativeMethods.TdhEnumerateProviders(providersDesc, ref buffSize);
+                    if (hr != 0)
+                        throw new InvalidOperationException("TdhEnumerateProviders failed.");       // TODO better error message
+
+                    var providers = (TraceEventNativeMethods.TRACE_PROVIDER_INFO*)&providersDesc[1];
+                    for (int i = 0; i < providersDesc->NumberOfProviders; i++)
+                    {
+                        var name = new string((char*)&buffer[providers[i].ProviderNameOffset]);
+                        s_providersByName[name] = providers[i].ProviderGuid;
+                    }
+                }
+                return s_providersByName;
+            }
+        }
+
+        private static Dictionary<Guid, string> ProviderGuidToName
+        {
+            get
+            {
+                if (s_providerNames == null)
+                {
+                    foreach (var keyValue in ProviderNameToGuid)
+                        s_providerNames[keyValue.Value] = keyValue.Key;
+                }
+                return s_providerNames;
+            }
+        }
+
+        static SortedDictionary<string, Guid> s_providersByName;
+        static Dictionary<Guid, string> s_providerNames;
+
+        private static List<ProviderDataItem> GetProviderFields(Guid providerGuid, TraceEventNativeMethods.EVENT_FIELD_TYPE fieldType)
+        {
+            var ret = new List<ProviderDataItem>();
+
+            int buffSize = 0;
+            var hr = TraceEventNativeMethods.TdhEnumerateProviderFieldInformation(ref providerGuid, fieldType, null, ref buffSize);
+            if (hr != 122)
+                return ret;     // TODO FIX NOW Do I want to simply return nothing or give a more explicit error? 
+            Debug.Assert(hr == 122);     // ERROR_INSUFFICIENT_BUFFER 
+
+            var buffer = stackalloc byte[buffSize];
+            var fieldsDesc = (TraceEventNativeMethods.PROVIDER_FIELD_INFOARRAY*)buffer;
+            hr = TraceEventNativeMethods.TdhEnumerateProviderFieldInformation(ref providerGuid, fieldType, fieldsDesc, ref buffSize);
+            if (hr != 0)
+                throw new InvalidOperationException("TdhEnumerateProviderFieldInformation failed.");       // TODO better error message
+
+            var fields = (TraceEventNativeMethods.PROVIDER_FIELD_INFO*)&fieldsDesc[1];
+            for (int i = 0; i < fieldsDesc->NumberOfElements; i++)
+            {
+                var field = new ProviderDataItem();
+                field.Name = new string((char*)&buffer[fields[i].NameOffset]);
+                field.Description = new string((char*)&buffer[fields[i].DescriptionOffset]);
+                field.Value = fields[i].Value;
+                ret.Add(field);
+            }
+
+            return ret;
+        }
+
+        /// <summary>
+        /// We wrap this because sadly the PMC suppport is private, so we have to do it a different way if that is present.
+        /// </summary>
+        int StartKernelTrace(
+            out UInt64 TraceHandle,
+            TraceEventNativeMethods.EVENT_TRACE_PROPERTIES* properties,
+            TraceEventNativeMethods.STACK_TRACING_EVENT_ID* stackTracingEventIds,
+            int cStackTracingEventIds)
+        {
+            bool needExtensions = false;
+            if ((((KernelTraceEventParser.Keywords)properties->EnableFlags) & KernelTraceEventParser.Keywords.PMCProfile) != 0)
+                needExtensions = true;
+
+            if (needExtensions)
+                throw new ApplicationException("CPU Counter profiling not supported.");
+            properties->EnableFlags = properties->EnableFlags & (uint)~KernelTraceEventParser.Keywords.NonOSKeywords;
+            return TraceEventNativeMethods.StartKernelTrace(out TraceHandle, properties, stackTracingEventIds, cStackTracingEventIds);
+        }
+
         private const int maxStackTraceProviders = 256;
         /// <summary>
         /// The 'properties' field is only the header information.  There is 'tail' that is 
@@ -451,6 +966,7 @@ namespace Diagnostics.Eventing
             if (m_StopOnDispose)
                 Stop(true);
 
+            // TODO FIX NOW need safe handles
             if (m_SessionHandle != TraceEventNativeMethods.INVALID_HANDLE_VALUE)
                 TraceEventNativeMethods.CloseTrace(m_SessionHandle);
             m_SessionHandle = TraceEventNativeMethods.INVALID_HANDLE_VALUE;
@@ -460,15 +976,21 @@ namespace Diagnostics.Eventing
         /// <summary>
         /// Do intialization common to the contructors.  
         /// </summary>
-        private bool EnableProvider(Guid providerGuid, TraceEventLevel providerLevel, ulong matchAnyKeywords, ulong matchAllKeywords, int providerDataType, byte[] providerData, int providerDataSize)
+        private bool EnableProvider(Guid providerGuid, TraceEventLevel providerLevel, ulong matchAnyKeywords, ulong matchAllKeywords, TraceEventOptions options, int providerDataType, byte[] providerData, int providerDataSize)
         {
+            if (m_SessionName == KernelTraceEventParser.KernelSessionName)
+                throw new NotSupportedException("Can only enable kernel events on a kernel session.");
+
             bool ret = InsureStarted();
             TraceEventNativeMethods.EVENT_FILTER_DESCRIPTOR* dataDescrPtr = null;
             fixed (byte* providerDataPtr = providerData)
             {
                 string regKeyName = @"Software\Microsoft\Windows\CurrentVersion\Winevt\Publishers\{" + providerGuid + "}";
                 byte[] registryData = null;
-                if (providerData != null || providerDataType != 0)
+                // If this is an update operation, remember the data in registry so that even providers
+                // that have not yet started will get the data.   We don't do this for any other kind of command (providerDataType)
+                // since we don't know that they are desired 'on startup'.  
+                if (providerData != null && providerDataType == 0)
                 {
                     TraceEventNativeMethods.EVENT_FILTER_DESCRIPTOR dataDescr = new TraceEventNativeMethods.EVENT_FILTER_DESCRIPTOR();
                     dataDescr.Ptr = null;
@@ -483,6 +1005,7 @@ namespace Diagnostics.Eventing
 
                     // Set the registry key so providers get the information even if they are not active now
                     registryData = new byte[providerDataSize + 4];
+                    // providerDataType is always zero, but older versions assume it is here, so we put the redundant value here for compatibility. 
                     registryData[0] = (byte)(providerDataType);
                     registryData[1] = (byte)(providerDataType >> 8);
                     registryData[2] = (byte)(providerDataType >> 16);
@@ -491,10 +1014,28 @@ namespace Diagnostics.Eventing
                 }
                 SetOrDelete(regKeyName, "ControllerData", registryData);
                 int hr;
+
                 try
                 {
-                    hr = TraceEventNativeMethods.EnableTraceEx(ref providerGuid, null, m_SessionHandle,
-                    1, (byte)providerLevel, matchAnyKeywords, matchAllKeywords, 0, dataDescrPtr);
+                    try
+                    {
+                        // Try the Win7 API
+                        TraceEventNativeMethods.ENABLE_TRACE_PARAMETERS parameters = new TraceEventNativeMethods.ENABLE_TRACE_PARAMETERS();
+                        parameters.Version = TraceEventNativeMethods.ENABLE_TRACE_PARAMETERS_VERSION;
+                        if ((options & TraceEventOptions.Stacks) != 0)
+                            parameters.EnableProperty = TraceEventNativeMethods.EVENT_ENABLE_PROPERTY_STACK_TRACE;
+                        parameters.EnableFilterDesc = dataDescrPtr;
+
+                        hr = TraceEventNativeMethods.EnableTraceEx2(m_SessionHandle, ref providerGuid,
+                            TraceEventNativeMethods.EVENT_CONTROL_CODE_ENABLE_PROVIDER, (byte)providerLevel,
+                            matchAnyKeywords, matchAllKeywords, 0, ref parameters);
+                    }
+                    catch (EntryPointNotFoundException)
+                    {
+                        // OK that did not work, try the VISTA API
+                        hr = TraceEventNativeMethods.EnableTraceEx(ref providerGuid, null, m_SessionHandle, 1,
+                            (byte)providerLevel, matchAnyKeywords, matchAllKeywords, 0, dataDescrPtr);
+                    }
                 }
                 catch (EntryPointNotFoundException)
                 {
@@ -506,9 +1047,8 @@ namespace Diagnostics.Eventing
             m_IsActive = true;
             return ret;
         }
-        private void SetOrDelete(string regKeyName, string valueName, byte[] data)
+        private static void SetOrDelete(string regKeyName, string valueName, byte[] data)
         {
-#if !Silverlight
             if (System.Runtime.InteropServices.Marshal.SizeOf(typeof(IntPtr)) == 8 &&
                 regKeyName.StartsWith(@"Software\", StringComparison.OrdinalIgnoreCase))
                 regKeyName = @"Software\Wow6432Node" + regKeyName.Substring(8);
@@ -528,8 +1068,8 @@ namespace Diagnostics.Eventing
                 regKey.SetValue(valueName, data, Microsoft.Win32.RegistryValueKind.Binary);
                 regKey.Close();
             }
-#endif
         }
+
         /// <summary>
         /// Given a mask of kernel flags, set the array stackTracingIds of size stackTracingIdsMax to match.
         /// It returns the number of entries in stackTracingIds that were filled in.
@@ -543,6 +1083,14 @@ namespace Diagnostics.Eventing
             {
                 stackTracingIds[curID].EventGuid = KernelTraceEventParser.PerfInfoTaskGuid;
                 stackTracingIds[curID].Type = 0x2e;     // Sample Profile
+                curID++;
+            }
+
+            // PCM sample profiling
+            if ((stackCapture & KernelTraceEventParser.Keywords.PMCProfile) != 0)
+            {
+                stackTracingIds[curID].EventGuid = KernelTraceEventParser.PerfInfoTaskGuid;
+                stackTracingIds[curID].Type = 0x2f;     // PMC Sample Profile
                 curID++;
             }
 
@@ -674,40 +1222,6 @@ namespace Diagnostics.Eventing
                 stackTracingIds[curID].EventGuid = KernelTraceEventParser.FileIoTaskGuid;
                 stackTracingIds[curID].Type = 0x44;     // Write
                 curID++;
-
-#if false       // TODO  (as I recall they caused failures
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.FileIoTaskGuid;
-                stackTracingIds[curID].Type = 0x45;     // SetInformation
-                curID++;
-
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.FileIoTaskGuid;
-                stackTracingIds[curID].Type = 0x46;     // Delete
-                curID++;
-
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.FileIoTaskGuid;
-                stackTracingIds[curID].Type = 0x47;     // Rename
-                curID++;
-
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.FileIoTaskGuid;
-                stackTracingIds[curID].Type = 0x48;     // DirEnum
-                curID++;
-
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.FileIoTaskGuid;
-                stackTracingIds[curID].Type = 0x49;     // Flush
-                curID++;
-
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.FileIoTaskGuid;
-                stackTracingIds[curID].Type = 0x4A;     // QueryInformation
-                curID++;
-
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.FileIoTaskGuid;
-                stackTracingIds[curID].Type = 0x4B;     // FSControl
-                curID++;
-
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.FileIoTaskGuid;
-                stackTracingIds[curID].Type = 0x4D;     // DirNotify
-                curID++;
-#endif
             }
 
             if ((stackCapture & KernelTraceEventParser.Keywords.Registry) != 0)
@@ -719,60 +1233,7 @@ namespace Diagnostics.Eventing
                 stackTracingIds[curID].EventGuid = KernelTraceEventParser.RegistryTaskGuid;
                 stackTracingIds[curID].Type = 0x0B;     // NtOpenKey
                 curID++;
-#if false       // TODO enable (as I recall they caused failures)
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.RegistryTaskGuid;
-                stackTracingIds[curID].Type = 0x0C;     // NtDeleteKey
-                curID++;
 
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.RegistryTaskGuid;
-                stackTracingIds[curID].Type = 0x0D;     // NtQueryKey
-                curID++;
-
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.RegistryTaskGuid;
-                stackTracingIds[curID].Type = 0x0E;     // NtSetValueKey
-                curID++;
-
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.RegistryTaskGuid;
-                stackTracingIds[curID].Type = 0x0F;     // NtDeleteValueKey
-                curID++;
-
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.RegistryTaskGuid;
-                stackTracingIds[curID].Type = 0x10;     // NtQueryValueKey
-                curID++;
-
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.RegistryTaskGuid;
-                stackTracingIds[curID].Type = 0x11;     // NtEnumerateKey
-                curID++;
-
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.RegistryTaskGuid;
-                stackTracingIds[curID].Type = 0x12;     // NtEnumerateValueKey
-                curID++;
-
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.RegistryTaskGuid;
-                stackTracingIds[curID].Type = 0x13;     // NtQueryMultipleValueKey
-                curID++;
-
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.RegistryTaskGuid;
-                stackTracingIds[curID].Type = 0x14;     // NtSetInformationKey
-                curID++;
-
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.RegistryTaskGuid;
-                stackTracingIds[curID].Type = 0x15;     // NtFlushKey
-                curID++;
-
-                // TODO What are these?  
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.RegistryTaskGuid;
-                stackTracingIds[curID].Type = 0x16;     // KcbCreate
-                curID++;
-
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.RegistryTaskGuid;
-                stackTracingIds[curID].Type = 0x17;     // KcbDelete
-                curID++;
-
-                stackTracingIds[curID].EventGuid = KernelTraceEventParser.RegistryTaskGuid;
-                stackTracingIds[curID].Type = 0x1A;     // VirtualizeKey
-                curID++;
-#endif
             }
 
             // TODO put these in for advanced procedure calls.  
@@ -788,29 +1249,28 @@ namespace Diagnostics.Eventing
             Debug.Assert(curID <= stackTracingIdsMax);
             return curID;
         }
-        private bool InsureStarted()
+        private bool InsureStarted(TraceEventNativeMethods.EVENT_TRACE_PROPERTIES* properties = null)
         {
             if (!m_Create)
                 throw new NotSupportedException("Can not enable providers on a session you don't create directly");
-            if (m_SessionName == KernelTraceEventParser.KernelSessionName)
-                throw new NotSupportedException("Can only enable kernel providers on a kernel session");
 
             // Already initialized, nothing to do.  
             if (m_SessionHandle != TraceEventNativeMethods.INVALID_HANDLE_VALUE)
                 return false;
 
             var propertiesBuff = stackalloc byte[PropertiesSize];
-            var properties = GetProperties(propertiesBuff);
+            if (properties == null)
+                properties = GetProperties(propertiesBuff);
             bool ret = false;
 
-            int retCode = TraceEventNativeMethods.StartTrace(out m_SessionHandle, m_SessionName, properties);
+            int retCode = TraceEventNativeMethods.StartTraceW(out m_SessionHandle, m_SessionName, properties);
             if (retCode == 0xB7)      // STIERR_HANDLEEXISTS
             {
                 ret = true;
                 Stop();
                 m_Stopped = false;
                 Thread.Sleep(100);  // Give it some time to stop. 
-                retCode = TraceEventNativeMethods.StartTrace(out m_SessionHandle, m_SessionName, properties);
+                retCode = TraceEventNativeMethods.StartTraceW(out m_SessionHandle, m_SessionName, properties);
             }
             if (retCode == 5 && Environment.OSVersion.Version.Major > 5)      // On Vista and we get a 'Accessed Denied' message
                 throw new UnauthorizedAccessException("Error Starting ETW:  Access Denied (Administrator rights required to start ETW)");
@@ -835,29 +1295,31 @@ namespace Diagnostics.Eventing
             properties->Wnode.Flags = TraceEventNativeMethods.WNODE_FLAG_TRACED_GUID;
             properties->LoggerNameOffset = (uint)sizeof(TraceEventNativeMethods.EVENT_TRACE_PROPERTIES);
             properties->LogFileNameOffset = properties->LoggerNameOffset + MaxNameSize * sizeof(char);
+            properties->FlushTimer = 10;             // Only flush every 10 seconds for file based     
 
-            properties->FlushTimer = 1;              // flush every second;
             properties->BufferSize = 1024;           // 1Mb buffer blockSize
             if (m_FileName == null)
             {
+                properties->FlushTimer = 1;              // flush every second (as fast as possible) for real time. 
                 properties->LogFileMode = TraceEventNativeMethods.EVENT_TRACE_REAL_TIME_MODE;
                 properties->LogFileNameOffset = 0;
             }
             else
             {
-                if (m_FileName.Length > MaxNameSize - 1)
-                    throw new ArgumentException("File name too long", "fileName");
-                char* fileNamePtr = (char*)(((byte*)properties) + properties->LogFileNameOffset);
-                CopyStringToPtr(fileNamePtr, m_FileName);
-                if (m_CircularBufferMB == 0)
-                {
-                    properties->LogFileMode |= TraceEventNativeMethods.EVENT_TRACE_FILE_MODE_SEQUENTIAL;
-                }
-                else
+                var fileName = m_FileName;
+                if (m_CircularBufferMB != 0)
                 {
                     properties->LogFileMode |= TraceEventNativeMethods.EVENT_TRACE_FILE_MODE_CIRCULAR;
                     properties->MaximumFileSize = (uint)m_CircularBufferMB;
                 }
+                else
+                {
+                    properties->LogFileMode |= TraceEventNativeMethods.EVENT_TRACE_FILE_MODE_SEQUENTIAL;
+                }
+                if (fileName.Length > MaxNameSize - 1)
+                    throw new ArgumentException("File name too long", "fileName");
+                char* fileNamePtr = (char*)(((byte*)properties) + properties->LogFileNameOffset);
+                CopyStringToPtr(fileNamePtr, fileName);
             }
 
             properties->MinimumBuffers = (uint)m_BufferSizeMB;
@@ -882,7 +1344,8 @@ namespace Diagnostics.Eventing
         }
 
         private const int MaxNameSize = 1024;
-        private int PropertiesSize = sizeof(TraceEventNativeMethods.EVENT_TRACE_PROPERTIES) + 2 * MaxNameSize * sizeof(char);
+        private const int MaxExtensionSize = 256;
+        private int PropertiesSize = sizeof(TraceEventNativeMethods.EVENT_TRACE_PROPERTIES) + 2 * MaxNameSize * sizeof(char) + MaxExtensionSize;
 
         // Data that is exposed through properties.  
         private string m_SessionName;             // Session name (identifies it uniquely on the machine)
@@ -897,6 +1360,32 @@ namespace Diagnostics.Eventing
         private bool m_StopOnDispose;             // Should we Stop() when the object is destroyed?
         private ulong m_SessionHandle;            // OS handle
         #endregion
+    }
+
+    /// <summary>
+    /// A list of these is returned by GetProviderKeywords
+    /// </summary>
+    public struct ProviderDataItem
+    {
+        public string Name;
+        public string Description;
+        public long Value;
+
+        public override string ToString()
+        {
+            return string.Format("<ProviderDataItem Name=\"{0}\" Description=\"{1}\" Value=\"0x{2:x}\"/>", Name, Description, Value);
+        }
+    }
+
+    /// <summary>
+    /// These are options to EnableProvider
+    /// </summary>
+    [Flags]
+    public enum TraceEventOptions
+    {
+        None = 0,
+        Stacks = 1,         // Take a stack trace with the event
+        // There is also the SID and Term Svr Session, but I have not wired them up.  
     }
 
     /// <summary>

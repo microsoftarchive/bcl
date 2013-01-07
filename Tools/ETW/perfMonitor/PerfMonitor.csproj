@@ -42,19 +42,26 @@
     <NoWarn>1591 0649</NoWarn>
     <UseVSHostingProcess>false</UseVSHostingProcess>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Release|AnyCPU'">
+    <OutputPath>bin\Release\</OutputPath>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
   <ItemGroup>
     <Compile Include="ClrStats.cs" />
+    <Compile Include="CommandProcessor.cs" />
     <Compile Include="EventStats.cs" />
     <Compile Include="GroupOSStacks.cs" />
     <Compile Include="PerfMonitorNativeMethods.cs" />
+    <Compile Include="PerfViewEventSource.cs" />
     <Compile Include="utilities\CommandLine.cs" />
+    <Compile Include="utilities\ExceptionMessage.cs" />
     <Compile Include="utilities\StreamUtilities.cs" />
+    <Compile Include="utilities\SupportFiles.cs" />
     <Compile Include="_README.cs" />
     <Compile Include="PerfMonitor.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="utilities\DirectoryUtilities.cs" />
     <Compile Include="utilities\FileUtilities.cs" />
-    <Compile Include="utilities\command.cs" />
     <Compile Include="utilities\CommandLineUtilities.cs" />
     <Compile Include="utilities\ResourceUtilities.cs" />
     <Compile Include="utilities\_README.cs" />
@@ -69,22 +76,42 @@
     <EmbeddedResource Include="..\TraceEvent\SupportDlls\x86\dbghelp.dll">
       <Type>Non-Resx</Type>
       <WithCulture>false</WithCulture>
-      <LogicalName>.\dbghelp.dll</LogicalName>
+      <LogicalName>.\x86\dbghelp.dll</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\TraceEvent\SupportDlls\Interop.Dia2Lib.dll">
+      <Type>Non-Resx</Type>
+      <WithCulture>false</WithCulture>
+      <LogicalName>.\Interop.Dia2Lib.dll</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\TraceEvent\SupportDlls\x86\msdia100.dll">
+      <Type>Non-Resx</Type>
+      <WithCulture>false</WithCulture>
+      <LogicalName>.\x86\msdia100.dll</LogicalName>
     </EmbeddedResource>
     <EmbeddedResource Include="..\TraceEvent\SupportDlls\x86\symsrv.dll">
       <Type>Non-Resx</Type>
       <WithCulture>false</WithCulture>
-      <LogicalName>.\symsrv.dll</LogicalName>
+      <LogicalName>.\x86\symsrv.dll</LogicalName>
     </EmbeddedResource>
     <EmbeddedResource Include="..\TraceEvent\SupportDlls\x86\KernelTraceControl.dll">
       <Type>Non-Resx</Type>
       <WithCulture>false</WithCulture>
-      <LogicalName>.\KernelTraceControl.dll</LogicalName>
+      <LogicalName>.\x86\KernelTraceControl.dll</LogicalName>
     </EmbeddedResource>
     <EmbeddedResource Include="..\TraceEvent\$(OutDir)\TraceEvent.dll">
       <Type>Non-Resx</Type>
       <WithCulture>false</WithCulture>
       <LogicalName>.\TraceEvent.dll</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="SupportDlls\ZipLib.dll">
+      <Type>Non-Resx</Type>
+      <WithCulture>false</WithCulture>
+      <LogicalName>.\ZipLib.dll</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="SupportDlls\eventSource.dll">
+      <Type>Non-Resx</Type>
+      <WithCulture>false</WithCulture>
+      <LogicalName>.\eventSource.dll</LogicalName>
     </EmbeddedResource>
     <EmbeddedResource Include=".\UsersGuide.htm">
       <Type>Non-Resx</Type>
@@ -93,11 +120,17 @@
     </EmbeddedResource>
   </ItemGroup>
   <ItemGroup>
+    <Reference Include="EventSource">
+      <HintPath>supportDlls\EventSource.dll</HintPath>
+    </Reference>
     <Reference Include="System" />
     <Reference Include="System.Core">
       <RequiredTargetFramework>3.5</RequiredTargetFramework>
     </Reference>
     <Reference Include="System.XML" />
+    <Reference Include="ZipLib">
+      <HintPath>supportDlls\ZipLib.dll</HintPath>
+    </Reference>
   </ItemGroup>
   <Import Project="$(MSBuildBinPath)\Microsoft.CSharp.targets" />
   <!-- To modify your build process, add your task inside one of the targets below and uncomment it. 

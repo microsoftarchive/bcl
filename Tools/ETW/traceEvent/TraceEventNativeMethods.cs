@@ -9,10 +9,11 @@ using System.Runtime.InteropServices;
 using System.ComponentModel;
 using System.Security;
 using System.Diagnostics;
-using Diagnostics.Eventing;
+using Diagnostics.Tracing.Parsers;
+using System.Collections.Generic;
 
 // This moduleFile contains Internal PINVOKE declarations and has no public API surface. 
-namespace Diagnostics.Eventing
+namespace Diagnostics.Tracing.Parsers
 {
     // TODO use safehandles. 
     #region Private Classes
@@ -22,11 +23,10 @@ namespace Diagnostics.Eventing
     /// to get at the Win32 TraceEvent infrastructure.  It is effectively
     /// a port of evntrace.h to C# declarations.  
     /// </summary>
-    [SecuritySafeCritical]
-    internal unsafe static class TraceEventNativeMethods
+    // [SecuritySafeCritical]
+    // TODO FIX NOW making this public is dubious (did it for enabling Debug Privilege for attaching profiler)
+    public unsafe static class TraceEventNativeMethods
     {
-
-
         #region TimeZone type from winbase.h
 
         /// <summary>
@@ -68,6 +68,8 @@ namespace Diagnostics.Eventing
         //  EVENT_TRACE_LOGFILE.LogFileMode should be set to PROCESS_TRACE_MODE_EVENT_RECORD 
         //  to consume events using EventRecordCallback
         internal const uint PROCESS_TRACE_MODE_EVENT_RECORD = 0x10000000;
+        internal const uint PROCESS_TRACE_MODE_REAL_TIME = 0x00000100;
+        internal const uint PROCESS_TRACE_MODE_RAW_TIMESTAMP = 0x00001000;
 
         internal const uint EVENT_TRACE_FILE_MODE_NONE = 0x00000000;
         internal const uint EVENT_TRACE_FILE_MODE_SEQUENTIAL = 0x00000001;
@@ -82,6 +84,7 @@ namespace Diagnostics.Eventing
         internal const uint EVENT_TRACE_CONTROL_FLUSH = 3;
 
         internal const uint WNODE_FLAG_TRACED_GUID = 0x00020000;
+        internal const uint EVENT_TRACE_SYSTEM_LOGGER_MODE = 0x02000000;
 
         /// <summary>
         /// EventTraceHeader structure used by EVENT_TRACE_PROPERTIES
@@ -94,7 +97,7 @@ namespace Diagnostics.Eventing
             public UInt64 HistoricalContext;
             public UInt64 TimeStamp;
             public Guid Guid;
-            public UInt32 ClientContext;
+            public UInt32 ClientContext;  // Determines the time stamp resolution
             public UInt32 Flags;
         }
 
@@ -107,7 +110,7 @@ namespace Diagnostics.Eventing
         [StructLayout(LayoutKind.Sequential)]
         internal struct EVENT_TRACE_PROPERTIES
         {
-            public WNODE_HEADER Wnode;
+            public WNODE_HEADER Wnode;      // Timer Resolution determined by the Wnode.ClientContext.  
             public UInt32 BufferSize;
             public UInt32 MinimumBuffers;
             public UInt32 MaximumBuffers;
@@ -190,7 +193,7 @@ namespace Diagnostics.Eventing
         internal struct TRACE_LOGFILE_HEADER
         {
             public uint BufferSize;
-            public uint Version;
+            public uint Version;            // This is for the operating system it was collected on.  Major, Minor, SubVerMajor, subVerMinor
             public uint ProviderVersion;
             public uint NumberOfProcessors;
             public long EndTime;            // 0x10
@@ -244,6 +247,67 @@ namespace Diagnostics.Eventing
             public IntPtr Context;	        // reserved for internal use
         }
         #endregion // ETW tracing types
+
+        #region Win8 ETW Support - Windows 8
+
+        internal enum TRACE_INFO_CLASS
+        {
+            TraceGuidQueryList,
+            TraceGuidQueryInfo,
+            TraceGuidQueryProcess,
+            TraceStackTracingInfo,                  // This is the last one supported on Win7
+            // Win 8 
+            TraceSystemTraceEnableFlagsInfo,        // Turns on kernel event logger
+            TraceSampledProfileIntervalInfo,        // TRACE_PROFILE_INTERVAL (allows you to set the sampling interval) (Set, Get)
+
+            TraceProfileSourceConfigInfo,           // int array, turns on all listed sources.  (Set)
+            TraceProfileSourceListInfo,             // PROFILE_SOURCE_INFO linked list (converts names to source numbers) (Get)
+
+            // Used to collect extra info on other events (currently only context switch).  
+            TracePmcEventListInfo,                  // CLASSIC_EVENT_ID array (Works like TraceStackTracingInfo)
+            TracePmcCounterListInfo,                // int array
+            MaxTraceSetInfoClass
+        };
+
+        internal struct CLASSIC_EVENT_ID
+        {
+            public Guid EventGuid;
+            public byte Type;
+            public fixed byte Reserved[7];
+        };
+
+        internal struct TRACE_PROFILE_INTERVAL       // Used for TraceSampledProfileIntervalInfo
+        {
+            public int Source;
+            public int Interval;
+        };
+
+        internal struct PROFILE_SOURCE_INFO
+        {
+            public int NextEntryOffset;             // relative to the start of this structure, 0 indicates end.  
+            public int Source;
+            public int MinInterval;
+            public int MaxInterval;
+            public ulong Reserved;
+            // char Description[ANYSIZE_ARRAY]; 
+        };
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true), SuppressUnmanagedCodeSecurityAttribute]
+        static internal extern int TraceSetInformation(
+            [In] UInt64 traceHandle,
+            [In] TRACE_INFO_CLASS InformationClass,
+            [In] void* TraceInformation,
+            [In] int InformationLength);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true), SuppressUnmanagedCodeSecurityAttribute]
+        static internal extern int TraceQueryInformation(
+            [In] UInt64 traceHandle,
+            [In] TRACE_INFO_CLASS InformationClass,
+            [Out] void* TraceInformation,
+            [In] int InformationLength,
+            [In][Out] ref int ReturnLength);
+
+        #endregion
 
         #region ETW tracing types from evntcons.h
 
@@ -309,10 +373,42 @@ namespace Diagnostics.Eventing
             public ETW_BUFFER_CONTEXT BufferContext;    //  size: 4
             public ushort ExtendedDataCount;
             public ushort UserDataLength;               //  offset: 86
-            public IntPtr ExtendedData;
+            public EVENT_HEADER_EXTENDED_DATA_ITEM* ExtendedData;
             public IntPtr UserData;
             public IntPtr UserContext;
         }
+
+        // Values for the ExtType field 
+        internal const ushort EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID = 0x0001;
+        internal const ushort EVENT_HEADER_EXT_TYPE_SID = 0x0002;
+        internal const ushort EVENT_HEADER_EXT_TYPE_TS_ID = 0x0003;
+        internal const ushort EVENT_HEADER_EXT_TYPE_INSTANCE_INFO = 0x0004;
+        internal const ushort EVENT_HEADER_EXT_TYPE_STACK_TRACE32 = 0x0005;
+        internal const ushort EVENT_HEADER_EXT_TYPE_STACK_TRACE64 = 0x0006;
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct EVENT_HEADER_EXTENDED_DATA_ITEM
+        {
+            public ushort Reserved1;
+            public ushort ExtType;
+            public ushort Reserved2;
+            public ushort DataSize;
+            public ulong DataPtr;
+        };
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct EVENT_EXTENDED_ITEM_STACK_TRACE32
+        {
+            public ulong MatchId;
+            public fixed uint Address[1];       // Actually variable size
+        };
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct EVENT_EXTENDED_ITEM_STACK_TRACE64
+        {
+            public ulong MatchId;
+            public fixed ulong Address[1];       // Actually variable size
+        };
 
         [StructLayout(LayoutKind.Explicit)]
         unsafe internal struct EVENT_FILTER_DESCRIPTOR
@@ -354,7 +450,7 @@ namespace Diagnostics.Eventing
             [In][Out] ref int sessionCount);
 
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode), SuppressUnmanagedCodeSecurityAttribute]
-        internal extern static int StartTrace(
+        internal extern static int StartTraceW(
             [Out] out UInt64 sessionHandle,
             [In] string sessionName,
             EVENT_TRACE_PROPERTIES* properties);
@@ -379,6 +475,38 @@ namespace Diagnostics.Eventing
             [In] uint EnableProperty,
             [In] EVENT_FILTER_DESCRIPTOR* filterData);
 
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode), SuppressUnmanagedCodeSecurityAttribute]
+        internal static extern int EnableTraceEx2(
+            [In] ulong TraceHandle,
+            [In] ref Guid ProviderId,
+            [In] uint ControlCode,          // See EVENT_CONTROL_CODE_*
+            [In] byte Level,
+            [In] ulong MatchAnyKeyword,
+            [In] ulong MatchAllKeyword,
+            [In] uint Timeout,
+            [In] ref ENABLE_TRACE_PARAMETERS EnableParameters);
+
+        // Values for ENABLE_TRACE_PARAMETERS.Version
+        internal const uint ENABLE_TRACE_PARAMETERS_VERSION = 1;
+
+        // Values for ENABLE_TRACE_PARAMETERS.EnableProperty
+        internal const uint EVENT_ENABLE_PROPERTY_SID = 0x00000001;
+        internal const uint EVENT_ENABLE_PROPERTY_TS_ID = 0x00000002;
+        internal const uint EVENT_ENABLE_PROPERTY_STACK_TRACE = 0x00000004;
+
+        internal const uint EVENT_CONTROL_CODE_DISABLE_PROVIDER = 0;
+        internal const uint EVENT_CONTROL_CODE_ENABLE_PROVIDER = 1;
+        internal const uint EVENT_CONTROL_CODE_CAPTURE_STATE = 2;
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct ENABLE_TRACE_PARAMETERS
+        {
+            public uint Version;
+            public uint EnableProperty;
+            public uint ControlFlags;
+            public Guid SourceId;
+            public EVENT_FILTER_DESCRIPTOR* EnableFilterDesc;
+        };
 
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode), SuppressUnmanagedCodeSecurityAttribute]
         internal static extern int ControlTrace(
@@ -412,7 +540,7 @@ namespace Diagnostics.Eventing
         [DllImport("KernelTraceControl.dll", CharSet = CharSet.Unicode), SuppressUnmanagedCodeSecurityAttribute]
         internal extern static int StartKernelTrace(
             out UInt64 TraceHandle,
-            EVENT_TRACE_PROPERTIES* Properties,    
+            EVENT_TRACE_PROPERTIES* Properties,
             STACK_TRACING_EVENT_ID* StackTracingEventIds,       // Actually an array of  code:STACK_TRACING_EVENT_ID
             int cStackTracingEventIds);
 
@@ -423,16 +551,22 @@ namespace Diagnostics.Eventing
             int cTraceFileNames,
             EVENT_TRACE_MERGE_EXTENDED_DATA dwExtendedDataFlags);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool Wow64DisableWow64FsRedirection(ref IntPtr ptr);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool Wow64RevertWow64FsRedirection(IntPtr ptr);
+
         // Flags to save extended information to the ETW trace file
         [Flags]
         public enum EVENT_TRACE_MERGE_EXTENDED_DATA
-        {   
-            NONE            = 0x00,
-            IMAGEID         = 0x01,
-            BUILDINFO       = 0x02,
-            VOLUME_MAPPING  = 0x04,
-            WINSAT          = 0x08,
-            EVENT_METADATA  = 0x10,
+        {
+            NONE = 0x00,
+            IMAGEID = 0x01,
+            BUILDINFO = 0x02,
+            VOLUME_MAPPING = 0x04,
+            WINSAT = 0x08,
+            EVENT_METADATA = 0x10,
         }
         #endregion
 
@@ -518,7 +652,7 @@ namespace Diagnostics.Eventing
            [In] IntPtr NullParam,
            [In] IntPtr ReturnLength);
 
-        // I explicitly DONT caputure GetLastError information on this call because it is often used to
+        // I explicitly DONT capture GetLastError information on this call because it is often used to
         // clean up and it is cleaner if GetLastError still points at the orginal error, and not the failure
         // in CloseHandle.  If we ever care about exact errors of CloseHandle, we can make another entry
         // point 
@@ -548,17 +682,12 @@ namespace Diagnostics.Eventing
 
         // Constants for the Luid field 
         internal const uint SE_SYSTEM_PROFILE_PRIVILEGE = 11;
+        internal const uint SE_DEBUG_PRIVILEGE = 20;
 
         #endregion
 
         [DllImport("kernel32.dll", SetLastError = true), SuppressUnmanagedCodeSecurityAttribute]
         internal static extern void ZeroMemory(IntPtr handle, uint length);
-
-        [DllImport("kernel32.dll", EntryPoint = "LocalAlloc"), SuppressUnmanagedCodeSecurityAttribute]
-        private static extern IntPtr LocalAlloc(int uFlags, IntPtr sizeBytes);
-
-        [DllImport("kernel32.dll", SetLastError = true), SuppressUnmanagedCodeSecurityAttribute]
-        private static extern IntPtr LocalFree(IntPtr handle);
 
         // TODO what is this for?
         internal static int GetHRForLastWin32Error()
@@ -570,24 +699,22 @@ namespace Diagnostics.Eventing
                 return (dwLastError & 0x0000FFFF) | unchecked((int)0x80070000);
         }
 
-        internal static IntPtr AllocHGlobal(int sizeBytes)
-        {
-            IntPtr ret = LocalAlloc(0, (IntPtr)sizeBytes);
-            return ret;
-        }
-
-        internal static void FreeHGlobal(IntPtr hglobal)
-        {
-            if (IntPtr.Zero != LocalFree(hglobal))
-                Marshal.ThrowExceptionForHR(GetHRForLastWin32Error());
-        }
-
         /// <summary>
         /// The Sample based profiling requires the SystemProfilePrivilege, This code turns it on.   
         /// </summary>
         internal static void SetSystemProfilePrivilege()
         {
-#if !Silverlight
+            SetPrivilege(SE_SYSTEM_PROFILE_PRIVILEGE);
+        }
+
+        // TODO bit of a hack to make this public.  
+        public static void SetDebugPrivilege()
+        {
+            SetPrivilege(SE_DEBUG_PRIVILEGE);
+        }
+
+        private static void SetPrivilege(uint privilege)
+        {
             Process process = Process.GetCurrentProcess();
             IntPtr tokenHandle = IntPtr.Zero;
             bool success = OpenProcessToken(process.Handle, TOKEN_ADJUST_PRIVILEGES, out tokenHandle);
@@ -597,17 +724,16 @@ namespace Diagnostics.Eventing
 
             TOKEN_PRIVILEGES privileges = new TOKEN_PRIVILEGES();
             privileges.PrivilegeCount = 1;
-            privileges.Luid.LowPart = SE_SYSTEM_PROFILE_PRIVILEGE;
+            privileges.Luid.LowPart = privilege;
             privileges.Attributes = SE_PRIVILEGE_ENABLED;
 
             success = AdjustTokenPrivileges(tokenHandle, false, ref privileges, 0, IntPtr.Zero, IntPtr.Zero);
             CloseHandle(tokenHandle);
             if (!success)
                 throw new Win32Exception();
-#endif
         }
 
-        internal static bool? IsElevated() //= NULL )
+        public static bool? IsElevated()
         {
             if (Environment.OSVersion.Version.Major < 6)
                 return true;
@@ -619,7 +745,7 @@ namespace Diagnostics.Eventing
 
             int tokenIsElevated = 0;
             int retSize;
-            bool success = GetTokenInformation(tokenHandle, TOKEN_INFORMATION_CLASS.TokenElevation, (IntPtr) (&tokenIsElevated), 4, out retSize);
+            bool success = GetTokenInformation(tokenHandle, TOKEN_INFORMATION_CLASS.TokenElevation, (IntPtr)(&tokenIsElevated), 4, out retSize);
             CloseHandle(tokenHandle);
             if (!success)
                 return null;
@@ -633,6 +759,106 @@ namespace Diagnostics.Eventing
         {
             return (int)((0 != dwErr) ? (0x80070000 | ((uint)dwErr & 0xffff)) : 0);
         }
+
+        internal static bool CanSetCpuSamplingRate() { return false; }
+        internal static bool SetCpuSamplingRate(int interval100ns) { return false; }
+        internal static void EnableStackCaching(ulong traceHandle) { }
+
+        internal struct TRACE_PROVIDER_INFO
+        {
+            public Guid ProviderGuid;
+            public int SchemaSource;
+            public int ProviderNameOffset;
+        }
+
+        internal struct PROVIDER_ENUMERATION_INFO
+        {
+            public int NumberOfProviders;
+            public int Padding;
+            // TRACE_PROVIDER_INFO TraceProviderInfoArray[ANYSIZE];
+        };
+
+        [DllImport("tdh.dll"), SuppressUnmanagedCodeSecurityAttribute]
+        internal static extern int TdhEnumerateProviders(
+            PROVIDER_ENUMERATION_INFO* pBuffer,
+            ref int pBufferSize
+        );
+
+        internal enum TRACE_QUERY_INFO_CLASS
+        {
+            TraceGuidQueryList,
+            TraceGuidQueryInfo,
+            TraceGuidQueryProcess,
+            TraceStackTracingInfo,
+            MaxTraceSetInfoClass
+        };
+
+        internal struct TRACE_GUID_INFO
+        {
+            public int InstanceCount;
+            public int Reserved;
+        };
+
+        internal struct TRACE_PROVIDER_INSTANCE_INFO
+        {
+            public int NextOffset;
+            public int EnableCount;
+            public int Pid;
+            public int Flags;
+        };
+
+        internal struct TRACE_ENABLE_INFO
+        {
+            public int IsEnabled;
+            public byte Level;
+            public byte Reserved1;
+            public ushort LoggerId;
+            public ushort EnableProperty;
+            public int Reserved2;
+            public long MatchAnyKeyword;
+            public long MatchAllKeyword;
+        };
+
+        [DllImport("advapi32.dll"), SuppressUnmanagedCodeSecurityAttribute]
+        internal static extern int EnumerateTraceGuidsEx(
+        TRACE_QUERY_INFO_CLASS TraceQueryInfoClass,
+            void* InBuffer,
+            int InBufferSize,
+            void* OutBuffer,
+            int OutBufferSize,
+            ref int ReturnLength);
+
+        internal enum EVENT_FIELD_TYPE
+        {
+            EventKeywordInformation = 0,
+            EventLevelInformation = 1,
+            EventChannelInformation = 2,
+            EventTaskInformation = 3,
+            EventOpcodeInformation = 4,
+            EventInformationMax = 5,
+        };
+
+        internal struct PROVIDER_FIELD_INFOARRAY
+        {
+            public int NumberOfElements;
+            public EVENT_FIELD_TYPE FieldType;
+            // PROVIDER_FIELD_INFO FieldInfoArray[ANYSIZE_ARRAY];
+        };
+
+        internal struct PROVIDER_FIELD_INFO
+        {
+            public int NameOffset;
+            public int DescriptionOffset;
+            public long Value;
+        };
+
+        [DllImport("tdh.dll"), SuppressUnmanagedCodeSecurityAttribute]
+        internal static extern int TdhEnumerateProviderFieldInformation(
+            ref Guid guid,
+            EVENT_FIELD_TYPE EventFieldType,
+            PROVIDER_FIELD_INFOARRAY* pBuffer,
+            ref int pBufferSize
+        );
 
     } // end class
     #endregion

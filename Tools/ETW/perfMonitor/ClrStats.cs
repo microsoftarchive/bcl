@@ -3,7 +3,10 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using Diagnostics.Eventing;
+using Address = System.UInt64;
+using Utilities;
+using Diagnostics.Tracing;
+using Diagnostics.Tracing.Parsers;
 
 namespace Stats
 {

@@ -7,7 +7,11 @@ using System.Diagnostics;
 using FastSerialization;
 using System.Runtime.InteropServices;
 using System.Security;
-using Diagnostics.Eventing;
+using Diagnostics.Tracing;
+using Diagnostics.Tracing.Parsers;
+using Address = System.UInt64;
+using Utilities;
+using System.IO;
 
 /* This file was generated with the command */
 // traceParserGen /needsState /merge /renameFile KernelTraceEventParser.renames /mof KernelTraceEventParser.mof KernelTraceEventParser.cs
@@ -19,7 +23,7 @@ using Diagnostics.Eventing;
 // See traceParserGen /usersGuide for more on the /merge option 
 
 // TODO I have low confidence in the TCP headers, especially for Versions < 2 (how much do we care?)
-namespace Diagnostics.Eventing
+namespace Diagnostics.Tracing.Parsers
 {
     /// <summary>
     /// The code:KernelTraceEventParser is a class that knows how to decode the 'standard' kernel events.
@@ -27,7 +31,7 @@ namespace Diagnostics.Eventing
     /// 
     /// see code:TraceEventParser for more 
     /// </summary>
-    [SecuritySafeCritical]
+    // [SecuritySafeCritical]
     public sealed class KernelTraceEventParser : TraceEventParser
     {
         /// <summary>
@@ -48,7 +52,6 @@ namespace Diagnostics.Eventing
             /// Logs nothing
             /// </summary>
             None = 0x00000000, // no tracing
-
             // Part of the 'default set of keywords' (good value in most scenarios).  
             /// <summary>
             /// Logs the mapping of file IDs to actual (kernel) file names. 
@@ -154,16 +157,19 @@ namespace Diagnostics.Eventing
             /// Disk I/O that was split (eg because of mirroring requirements) (Vista+ only)
             /// </summary> 
             SplitIO = 0x00200000,
-
             /// <summary>
             /// Good default kernel flags.  (TODO more detail)
             /// </summary>  
-            Default = DiskIO | DiskFileIO | ImageLoad | MemoryHardFaults | NetworkTCPIP | Process | ProcessCounters | Profile | Thread,
+            Default = DiskIO | DiskFileIO | DiskIOInit | ImageLoad | MemoryHardFaults | NetworkTCPIP | Process | ProcessCounters | Profile | Thread,
             /// <summary>
             /// These events are too verbose for normal use, but this give you a quick way of turing on 'interesting' events
             /// This does not include SystemCall because it is 'too verbose'
             /// </summary>
-            Verbose = Default | ContextSwitch | DiskIOInit | Dispatcher | FileIO | FileIOInit | MemoryPageFaults | Registry | VirtualAlloc,  // use as needed
+            Verbose = Default | ContextSwitch | Dispatcher | FileIO | FileIOInit | MemoryPageFaults | Registry | VirtualAlloc,  // use as needed
+            /// <summary>
+            /// Use this if you care about blocked time.  
+            /// </summary>
+            TheadTime = Default | ContextSwitch | Dispatcher,
             /// <summary>
             /// You mostly don't care about these unless you are dealing with OS internals.  
             /// </summary>
@@ -171,9 +177,18 @@ namespace Diagnostics.Eventing
             /// <summary>
             /// All legal kernel events
             /// </summary>
-            All = Verbose | ContextSwitch | DiskIOInit | Dispatcher | FileIO | FileIOInit | MemoryPageFaults | Registry | VirtualAlloc  // use as needed
+            All = Verbose | ContextSwitch | Dispatcher | FileIO | FileIOInit | MemoryPageFaults | Registry | VirtualAlloc  // use as needed
                 | SystemCall        // Interesting but very expensive. 
                 | OS,
+
+            /// <summary>
+            /// These keywords are can't be passed to the OS, they are defined by KernelTraceEventParser
+            /// </summary>
+            NonOSKeywords = unchecked((int)0xf84c8000),
+            /// <summary>
+            /// Turn on PMC (Precise Machine Counter) events.  
+            /// </summary>
+            PMCProfile = unchecked((int)0x80000000),
         };
 
         public KernelTraceEventParser(TraceEventSource source)
@@ -189,13 +204,20 @@ namespace Diagnostics.Eventing
                 // logic to initialize state
                 AddToAllMatching(delegate(RegistryTraceData data)
                 {
+                    // TODO FIX NOW 
+                    // When registry events are on this is very expensive.   
+                    // We need to remove entries that die.  
+                    /*
+                    var isRundown = (data.Opcode == (TraceEventOpcode)22);        // RegistryRundown
                     if (RegistryTraceData.NameIsKeyName(data.Opcode))
-                        State.fileIDToName.Add(data.KeyHandle, data.TimeStamp100ns, data.KeyName);
+                        State.fileIDToName.Add(data.KeyHandle, data.TimeStamp100ns, data.KeyName, isRundown);
+                     ****/
                 });
                 AddToAllMatching(delegate(FileIoNameTraceData data)
                 {
-                    Debug.Assert(data.FileName.Length != 0);
-                    State.fileIDToName.Add(data.FileObject, data.TimeStamp100ns, data.FileName);
+                    var isRundown = (data.Opcode == (TraceEventOpcode)36);        // FileIoFileRundown
+                    Debug.Assert(data.KernelFileName.Length != 0);
+                    State.fileIDToName.Add(data.FileObject, data.TimeStamp100ns, data.KernelFileName, isRundown);
                 });
                 ThreadStartGroup += delegate(ThreadTraceData data)
                 {
@@ -203,27 +225,41 @@ namespace Diagnostics.Eventing
                     Debug.Assert(data.ProcessID >= 0);
                     State.threadIDtoProcessID.Add((Address)data.ThreadID, data.TimeStamp100ns, data.ProcessID);
                 };
+                ThreadEndGroup += delegate(ThreadTraceData data)
+                {
+                    // Do we have thread start information for this thread?
+                    int processID;
+                    if (!State.threadIDtoProcessID.TryGetValue((Address)data.ThreadID, data.TimeStamp100ns, out processID))
+                    {
+                        // No, this is likely a circular buffer, remember the thread end information 
+                        if (State.threadIDtoProcessIDRundown == null)
+                            State.threadIDtoProcessIDRundown = new HistoryDictionary<int>(100);
+
+                        // Notice I NEGATE the timestamp, this way HistoryDictionary does the comparision the way I want it.  
+                        State.threadIDtoProcessIDRundown.Add((Address)data.ThreadID, -data.TimeStamp100ns, data.ProcessID);
+                    }
+                };
+
                 VolumeMapping += delegate(VolumeMappingTraceData data)
                 {
-                    // Remove trailing \
-                    var kernelPath = data.NtPath;
-                    if (kernelPath.Length > 0 && kernelPath[kernelPath.Length - 1] == '\\')
-                        kernelPath = kernelPath.Substring(0, kernelPath.Length - 1);
-                    var dosPath = data.DosPath;
-                    if (dosPath.Length > 0 && dosPath[dosPath.Length - 1] == '\\')
-                        dosPath = dosPath.Substring(0, dosPath.Length - 1);
-                    State.kernelToDriveMap.Add(new KeyValuePair<string, string>(kernelPath, dosPath));
+                    State.driveMapping.AddMapping(data.NtPath, data.DosPath);
                 };
                 SystemPaths += delegate(SystemPathsTraceData data)
                 {
-                    // Remove trailing \
                     var windows = data.SystemWindowsDirectory;
-                    if (windows.Length > 0 && windows[windows.Length - 1] == '\\')
-                        windows = windows.Substring(0, windows.Length - 1);
-
-                    State.kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\Windows", windows));
+                    State.driveMapping.AddSystemDrive(windows);
                 };
 
+                AddToAllMatching(delegate(DiskIoTraceData data)
+                {
+                    State.diskEventTimeStamp.Add((Address)data.DiskNumber, data.TimeStamp100ns, data.TimeStamp100ns);
+
+                });
+
+                DiskIoFlushBuffers += delegate(DiskIoFlushBuffersTraceData data)
+                {
+                    State.diskEventTimeStamp.Add((Address)data.DiskNumber, data.TimeStamp100ns, data.TimeStamp100ns);
+                };
             }
         }
 
@@ -434,7 +470,6 @@ namespace Diagnostics.Eventing
                 throw new Exception("Not supported");
             }
         }
-
         public event Action<ThreadTraceData> ThreadEnd
         {
             add
@@ -1778,6 +1813,20 @@ namespace Diagnostics.Eventing
                 throw new Exception("Not supported");
             }
         }
+
+
+        public event Action<PMCCounterProfTraceData> PMCCounterProf
+        {
+            add
+            {
+                // action, eventid, taskid, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName
+                source.RegisterEventTemplate(new PMCCounterProfTraceData(value, 0xFFFF, 11, "PerfInfo", PerfInfoTaskGuid, 47, "PMCCounterProf", ProviderGuid, ProviderName, State));
+            }
+            remove
+            {
+                throw new Exception("Not supported");
+            }
+        }
         public event Action<BatchedSampledProfileTraceData> PerfInfoBatchedSampleProf
         {
             add
@@ -1922,6 +1971,56 @@ namespace Diagnostics.Eventing
                 throw new Exception("Not supported");
             }
         }
+
+        public event Action<StackWalkRefTraceData> StackWalkStackKeyKernel
+        {
+            add
+            {
+                // action, eventid, taskid, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName
+                source.RegisterEventTemplate(new StackWalkRefTraceData(value, 0xFFFF, 12, "StackWalk", StackWalkTaskGuid, 37, "StackKeyKernel", ProviderGuid, ProviderName, State));
+            }
+            remove
+            {
+                throw new Exception("Not supported");
+            }
+        }
+        public event Action<StackWalkRefTraceData> StackWalkStackKeyUser
+        {
+            add
+            {
+                // action, eventid, taskid, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName
+                source.RegisterEventTemplate(new StackWalkRefTraceData(value, 0xFFFF, 12, "StackWalk", StackWalkTaskGuid, 38, "StackKeyUser", ProviderGuid, ProviderName, State));
+            }
+            remove
+            {
+                throw new Exception("Not supported");
+            }
+        }
+        public event Action<StackWalkDefTraceData> StackWalkDelete
+        {
+            add
+            {
+                // action, eventid, taskid, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName
+                source.RegisterEventTemplate(new StackWalkDefTraceData(value, 0xFFFF, 12, "StackWalk", StackWalkTaskGuid, 35, "KeyDelete", ProviderGuid, ProviderName, State));
+            }
+            remove
+            {
+                throw new Exception("Not supported");
+            }
+        }
+        public event Action<StackWalkDefTraceData> StackWalkRundown
+        {
+            add
+            {
+                // action, eventid, taskid, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName
+                source.RegisterEventTemplate(new StackWalkDefTraceData(value, 0xFFFF, 12, "StackWalk", StackWalkTaskGuid, 36, "KeyRundown", ProviderGuid, ProviderName, State));
+            }
+            remove
+            {
+                throw new Exception("Not supported");
+            }
+        }
+
         public event Action<ALPCSendMessageTraceData> ALPCSendMessage
         {
             add
@@ -2131,7 +2230,7 @@ namespace Diagnostics.Eventing
         {
             add
             {
-                source.RegisterEventTemplate(new VirtualAllocTraceData(value, 0xFFFF, 0, "VirtualAlloc", VirtualAllocTaskGuid, 98, "VirtualAlloc", ProviderGuid, ProviderName, State));
+                source.RegisterEventTemplate(new VirtualAllocTraceData(value, 0xFFFF, 0, "VirtualMem", VirtualAllocTaskGuid, 98, "Alloc", ProviderGuid, ProviderName, State));
             }
             remove
             {
@@ -2142,7 +2241,7 @@ namespace Diagnostics.Eventing
         {
             add
             {
-                source.RegisterEventTemplate(new VirtualAllocTraceData(value, 0xFFFF, 0, "VirtualAlloc", VirtualAllocTaskGuid, 99, "VirtualFree", ProviderGuid, ProviderName, State));
+                source.RegisterEventTemplate(new VirtualAllocTraceData(value, 0xFFFF, 0, "VirtualMem", VirtualAllocTaskGuid, 99, "Free", ProviderGuid, ProviderName, State));
             }
             remove
             {
@@ -2272,103 +2371,44 @@ namespace Diagnostics.Eventing
     ///     * ThreadID to ProcessID mapping
     ///     * Kernel file name to user file name mapping 
     /// </summary>
-    [SecuritySafeCritical]
+    // [SecuritySafeCritical]
     internal class KernelTraceEventParserState : IFastSerializable
     {
         public KernelTraceEventParserState()
         {
             fileIDToName = new HistoryDictionary<string>(500);
             threadIDtoProcessID = new HistoryDictionary<int>(50);
-            kernelToDriveMap = new List<KeyValuePair<string, string>>(8);
+            driveMapping = new KernelToUserDriveMapping();
+            diskEventTimeStamp = new HistoryDictionary<long>(500);
         }
 
         internal string FileIDToName(Address fileHandle, long time100ns)
         {
             string ret;
             if (!fileIDToName.TryGetValue(fileHandle, time100ns, out ret))
-                return "";
+                return ""; 
             return ret;
         }
         internal int ThreadIDToProcessID(int threadID, long time100ns)
         {
             int ret;
             if (!threadIDtoProcessID.TryGetValue((Address)threadID, time100ns, out ret))
+            {
+                // See if we have end-Thread information, and use that if it is there.  
+                if (threadIDtoProcessIDRundown != null && threadIDtoProcessIDRundown.TryGetValue((Address)threadID, -time100ns, out ret))
+                    return ret;
                 ret = -1;
+            }
             return ret;
         }
         internal string KernelToUser(string kernelName)
         {
-            if (kernelToDriveMap.Count == 0)
-                InitializeKernelDriveMapFromLocalMachine();
-
-            for (int i = 0; i < kernelToDriveMap.Count; i++)
-            {
-                string kernelPrefix = kernelToDriveMap[i].Key;
-                if (kernelName.Length > kernelPrefix.Length && kernelName[kernelPrefix.Length] == '\\' &&
-                    string.Compare(kernelName, 0, kernelPrefix, 0, kernelPrefix.Length, StringComparison.OrdinalIgnoreCase) == 0)
-                    return kernelToDriveMap[i].Value + kernelName.Substring(kernelPrefix.Length);
-            }
-
-            // TODO this is still not complete.   
-            return kernelName;
+            return driveMapping[kernelName];
         }
-
         #region private
-        #region KernelToUserFileMapping
-
-        [DllImport("kernel32.dll", SetLastError = true), SuppressUnmanagedCodeSecurityAttribute]
-        private static extern uint QueryDosDevice(string lpDeviceName, StringBuilder lpTargetPath, int ucchMax);
-        [DllImport("kernel32.dll", SetLastError = true), SuppressUnmanagedCodeSecurityAttribute]
-        private static extern int GetLogicalDrives();
-
-        private void InitializeKernelDriveMapFromLocalMachine()
-        {
-            kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\??", ""));
-            kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\SystemRoot", Environment.GetEnvironmentVariable("SystemRoot")));
-
-            StringBuilder kernelNameBuff = new StringBuilder(2048);
-            int logicalDriveBitVector = GetLogicalDrives();
-            char curChar = 'A';
-            while (logicalDriveBitVector != 0)
-            {
-                if ((logicalDriveBitVector & 1) != 0)
-                {
-                    string driveName = new string(curChar, 1) + ":";
-                    kernelNameBuff.Length = 0;
-                    if (QueryDosDevice(driveName, kernelNameBuff, 2048) != 0)
-                        kernelToDriveMap.Add(new KeyValuePair<string, string>(kernelNameBuff.ToString(), driveName));
-                }
-                logicalDriveBitVector >>= 1;
-                curChar++;
-            }
-
-            kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\Device\LanmanRedirector", @"\"));
-            kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\Device\Mup", @"\"));
-            kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\Windows", Environment.GetEnvironmentVariable("windir")));
-            kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\", @"\"));     // This translates \\ to \\
-        }
-        internal List<KeyValuePair<string, string>> kernelToDriveMap;
-
-        #endregion
-
         void IFastSerializable.ToStream(Serializer serializer)
         {
-            if (kernelToDriveMap.Count == 0)
-                InitializeKernelDriveMapFromLocalMachine();
-            // We mark the end of this set of variables so we can add to the end of it, since there is a
-            // good chance we will have to change it.  
-            ForwardReference endOfKernelNameMap = serializer.GetForwardReference();
-            serializer.Write(endOfKernelNameMap);
-            serializer.Write(1);        // This is a version number.  
-            serializer.Write(kernelToDriveMap.Count);
-            serializer.Log("<WriteColection name=\"driveNames\" count=\"" + kernelToDriveMap.Count + "\">\r\n");
-            foreach (var keyValue in kernelToDriveMap)
-            {
-                serializer.Write(keyValue.Key);
-                serializer.Write(keyValue.Value);
-            }
-            serializer.Log("</WriteColection>\r\n");
-            serializer.DefineForwardReference(endOfKernelNameMap);
+            serializer.Write(driveMapping);
 
             serializer.Write(threadIDtoProcessID.Count);
             serializer.Log("<WriteColection name=\"ProcessIDForThread\" count=\"" + threadIDtoProcessID.Count + "\">\r\n");
@@ -2378,6 +2418,21 @@ namespace Diagnostics.Eventing
                 serializer.Write(entry.StartTime100ns);
                 serializer.Write(entry.Value);
             }
+
+            if (threadIDtoProcessIDRundown == null)
+                serializer.Write(0);
+            else
+            {
+                serializer.Write(threadIDtoProcessIDRundown.Count);
+                serializer.Log("<WriteColection name=\"ProcessIDForThreadRundown\" count=\"" + threadIDtoProcessIDRundown.Count + "\">\r\n");
+                foreach (HistoryDictionary<int>.HistoryValue entry in threadIDtoProcessIDRundown.Entries)
+                {
+                    serializer.Write((long)entry.Key);
+                    serializer.Write(entry.StartTime100ns);
+                    serializer.Write(entry.Value);
+                }
+            }
+
             serializer.Log("</WriteColection>\r\n");
 
             serializer.Log("<WriteColection name=\"fileIDToName\" count=\"" + fileIDToName.Count + "\">\r\n");
@@ -2389,22 +2444,20 @@ namespace Diagnostics.Eventing
                 serializer.Write(entry.Value);
             }
             serializer.Log("</WriteColection>\r\n");
+
+            serializer.Log("<WriteCollection name=\"diskEventTimeStamp\" count=\"" + diskEventTimeStamp.Count + "\">\r\n");
+            serializer.Write(diskEventTimeStamp.Count);
+            foreach (var entry in diskEventTimeStamp.Entries)
+            {
+                serializer.Write((int)entry.Key);
+                serializer.Write(entry.StartTime100ns);
+                serializer.Write(entry.Value);
+            }
+            serializer.Log("</WriteCollection>");
         }
         void IFastSerializable.FromStream(Deserializer deserializer)
         {
-            // We mark the end of this set of variables so we can add to the end of it, since there is a
-            // good chance we will have to change it.  
-            ForwardReference endOfKernelNameMap = deserializer.ReadForwardReference();
-            int version; deserializer.Read(out version);        // Not used (yet).  
-            int numDrives; deserializer.Read(out numDrives);
-            for (int i = 0; i < numDrives; i++)
-            {
-                string key, value;
-                deserializer.Read(out key);
-                deserializer.Read(out value);
-                kernelToDriveMap.Add(new KeyValuePair<string, string>(key, value));
-            }
-            deserializer.Goto(endOfKernelNameMap);      // Skip any fields added in later versions.  
+            deserializer.Read(out driveMapping);
 
             int count; deserializer.Read(out count);
             Debug.Assert(count >= 0);
@@ -2419,6 +2472,21 @@ namespace Diagnostics.Eventing
 
             deserializer.Read(out count);
             Debug.Assert(count >= 0);
+            deserializer.Log("<Marker name=\"ProcessIDForThreadRundown\"/ count=\"" + count + "\">");
+            if (count > 0)
+            {
+                threadIDtoProcessIDRundown = new HistoryDictionary<int>(count);
+                for (int i = 0; i < count; i++)
+                {
+                    long key; deserializer.Read(out key);
+                    long startTime100ns; deserializer.Read(out startTime100ns);
+                    int value; deserializer.Read(out value);
+                    threadIDtoProcessIDRundown.Add((Address)key, startTime100ns, value);
+                }
+            }
+
+            deserializer.Read(out count);
+            Debug.Assert(count >= 0);
             deserializer.Log("<Marker name=\"fileIDToName\"/ count=\"" + count + "\">");
             for (int i = 0; i < count; i++)
             {
@@ -2427,15 +2495,156 @@ namespace Diagnostics.Eventing
                 string value; deserializer.Read(out value);
                 fileIDToName.Add((Address)key, startTime100ns, value);
             }
+
+            deserializer.Read(out count);
+            Debug.Assert(count >= 0);
+            deserializer.Log("<Marker name=\"diskEventTimeStamp\"/ count=\"" + count + "\">");
+            for (int i = 0; i < count; i++)
+            {
+                int key; deserializer.Read(out key);
+                long startTime100ns; deserializer.Read(out startTime100ns);
+                long value; deserializer.Read(out value);
+                diskEventTimeStamp.Add((Address)key, startTime100ns, value);
+            }
+
         }
         internal HistoryDictionary<string> fileIDToName;
         internal HistoryDictionary<int> threadIDtoProcessID;
+        internal KernelToUserDriveMapping driveMapping;
+        internal HistoryDictionary<long> diskEventTimeStamp;
+
+        /// <summary>
+        /// This is for the circular buffer case.  In that case we may not have thread starts (and thus we don't
+        /// have entries in threadIDtoProcessID).   Because HistoryTable finds the FIRST entry GREATER than the
+        /// given threadID we NEGATE all times before we place it in this table.
+        /// 
+        /// Also, because circular buffering is not the common case, we only add entries to this table if needed
+        /// (if we could not find the thread ID using threadIDtoProcessID).  
+        /// </summary>
+        internal HistoryDictionary<int> threadIDtoProcessIDRundown;
         internal bool callBacksSet;
         #endregion
     }
+
+    /// <summary>
+    /// Keeps track of the mapping from kernel names to file system names (drives)  
+    /// </summary>
+    public class KernelToUserDriveMapping : IFastSerializable
+    {
+        public KernelToUserDriveMapping()
+        {
+            kernelToDriveMap = new List<KeyValuePair<string, string>>();
+        }
+        public string this[string kernelName]
+        {
+            get
+            {
+                // TODO confirm that you are on the local machine before initializing in this way.  
+                if (kernelToDriveMap.Count == 0)
+                    PopulateFromLocalMachine();
+
+                for (int i = 0; i < kernelToDriveMap.Count; i++)
+                {
+                    Debug.Assert(kernelToDriveMap[i].Key.EndsWith(@"\"));
+                    Debug.Assert(kernelToDriveMap[i].Value.Length == 0 || kernelToDriveMap[i].Value.EndsWith(@"\"));
+
+                    // For every string in the map, does the kernel name match a prefix in the table?
+                    // If so we have found a match. 
+                    string kernelPrefix = kernelToDriveMap[i].Key;
+                    if (string.Compare(kernelName, 0, kernelPrefix, 0, kernelPrefix.Length, StringComparison.OrdinalIgnoreCase) == 0)
+                    {
+                        var ret = kernelToDriveMap[i].Value + kernelName.Substring(kernelPrefix.Length);
+                        return ret;
+                    }
+                }
+
+                // Heuristic.  If we have not found it yet, tack on the system drive letter if it is not 
+                // This is simmiar to what XPERF does too, but it is clear it is not perfect. 
+                if (kernelName.Length > 2 && kernelName[0] == '\\' && Char.IsLetterOrDigit(kernelName[1]))
+                    return systemDrive + kernelName;
+
+                // TODO this is still not complete, compare to XPERF and align.  
+                return kernelName;
+            }
+        }
+        public void AddMapping(string kernelName, string driveName)
+        {
+            kernelToDriveMap.Add(new KeyValuePair<string, string>(kernelName, driveName));
+        }
+        public void AddSystemDrive(string windows)
+        {
+            AddMapping(@"\Windows\", windows);
+            systemDrive = windows.Substring(0, 2);        // grab just the drive letter.  
+        }
+        public void PopulateFromLocalMachine()
+        {
+            kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\??\", ""));
+            kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\SystemRoot\", Environment.GetEnvironmentVariable("SystemRoot") + @"\"));
+
+            StringBuilder kernelNameBuff = new StringBuilder(2048);
+            int logicalDriveBitVector = GetLogicalDrives();
+            char curChar = 'A';
+            while (logicalDriveBitVector != 0)
+            {
+                if ((logicalDriveBitVector & 1) != 0)
+                {
+                    string driveName = new string(curChar, 1) + @":";
+                    kernelNameBuff.Length = 0;
+                    if (QueryDosDevice(driveName, kernelNameBuff, 2048) != 0)
+                        kernelToDriveMap.Add(new KeyValuePair<string, string>(kernelNameBuff.ToString() + @"\", driveName + @"\"));
+                }
+                logicalDriveBitVector >>= 1;
+                curChar++;
+            }
+
+            kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\Device\LanmanRedirector\", @"\\"));
+            kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\Device\Mup\", @"\\"));
+            var windir = Environment.GetEnvironmentVariable("windir") + @"\";
+            systemDrive = windir.Substring(0, 2);
+            kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\Windows\", windir));
+            kernelToDriveMap.Add(new KeyValuePair<string, string>(@"\\", @"\\"));
+        }
+
+        #region private
+        [DllImport("kernel32.dll", SetLastError = true), SuppressUnmanagedCodeSecurityAttribute]
+        private static extern uint QueryDosDevice(string lpDeviceName, StringBuilder lpTargetPath, int ucchMax);
+        [DllImport("kernel32.dll", SetLastError = true), SuppressUnmanagedCodeSecurityAttribute]
+        private static extern int GetLogicalDrives();
+
+        internal List<KeyValuePair<string, string>> kernelToDriveMap;
+        internal string systemDrive;
+
+        void IFastSerializable.ToStream(Serializer serializer)
+        {
+            serializer.Write(kernelToDriveMap.Count);
+            serializer.Log("<WriteColection name=\"driveNames\" count=\"" + kernelToDriveMap.Count + "\">\r\n");
+            foreach (var keyValue in kernelToDriveMap)
+            {
+                serializer.Write(keyValue.Key);
+                serializer.Write(keyValue.Value);
+            }
+            serializer.Log("</WriteColection>\r\n");
+            serializer.Write(systemDrive);
+        }
+
+        void IFastSerializable.FromStream(Deserializer deserializer)
+        {
+            int numDrives; deserializer.Read(out numDrives);
+            for (int i = 0; i < numDrives; i++)
+            {
+                string key, value;
+                deserializer.Read(out key);
+                deserializer.Read(out value);
+                kernelToDriveMap.Add(new KeyValuePair<string, string>(key, value));
+            }
+            deserializer.Read(out systemDrive);
+        }
+        #endregion
+    }
+
     #endregion
 
-    [SecuritySafeCritical]
+    // [SecuritySafeCritical]
     public sealed class EventTraceHeaderTraceData : TraceEvent
     {
         public int BufferSize { get { return GetInt32At(0); } }
@@ -2656,22 +2865,60 @@ namespace Diagnostics.Eventing
         #endregion
     }
 
+    [Flags]
+    public enum ProcessFlags
+    {
+        None = 0,
+        PackageFullName = 1,
+        Wow64 = 2,
+        Protected = 4,
+    }
+
     public sealed class ProcessTraceData : TraceEvent
     {
         // public int ProcessID { get { if (Version >= 1) return GetInt32At(HostOffset(4, 1)); return (int) GetHostPointer(0); } }
         public int ParentID { get { if (Version >= 1) return GetInt32At(HostOffset(8, 1)); return (int)GetHostPointer(HostOffset(4, 1)); } }
         // Skipping UserSID
-        public string KernelImageFileName { get { if (Version >= 1) return GetAsciiStringAt(SkipSID((Version >= 3) ? HostOffset(24, 2) : HostOffset(20, 1))); return GetAsciiStringAt(SkipSID(HostOffset(8, 2))); } }
+        public string KernelImageFileName { get { if (Version >= 1) return GetUTF8StringAt(GetKernelImageNameOffset()); return ""; } }
         public string ImageFileName { get { return state.KernelToUser(KernelImageFileName); } }
 
         public Address DirectoryTableBase { get { if (Version >= 3) return GetHostPointer(HostOffset(20, 1)); return 0; } }
+        public ProcessFlags Flags { get { if (Version >= 4) return (ProcessFlags)GetInt32At(HostOffset(24, 2)); return 0; } }
 
         public int SessionID { get { if (Version >= 1) return GetInt32At(HostOffset(12, 1)); return 0; } }
         public int ExitStatus { get { if (Version >= 1) return GetInt32At(HostOffset(16, 1)); return 0; } }
         public Address UniqueProcessKey { get { if (Version >= 2) return GetHostPointer(0); return 0; } }
-        public string CommandLine { get { if (Version >= 2) return GetUnicodeStringAt(SkipAsciiString(SkipSID((Version >= 3) ? HostOffset(24, 2) : HostOffset(20, 1)))); return ""; } }
-
+        public string CommandLine
+        {
+            get
+            {
+                if (Version >= 2)
+                    return GetUnicodeStringAt(SkipUTF8String(GetKernelImageNameOffset())); return "";
+            }
+        }
+        public string PackageFullName
+        {
+            get
+            {
+                if (Version >= 4)
+                    return GetUnicodeStringAt(SkipUnicodeString(SkipUTF8String(GetKernelImageNameOffset())));
+                return "";
+            }
+        }
+        public string ApplicationID
+        {
+            get
+            {
+                if (Version >= 4)
+                    return GetUnicodeStringAt(SkipUnicodeString(SkipUnicodeString(SkipUTF8String(GetKernelImageNameOffset()))));
+                return "";
+            }
+        }
         #region Private
+        private int GetKernelImageNameOffset()
+        {
+            return SkipSID(Version >= 4 ? HostOffset(28, 2) : (Version >= 3) ? HostOffset(24, 2) : HostOffset(20, 1));
+        }
         internal ProcessTraceData(Action<ProcessTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
             : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
         {
@@ -2681,10 +2928,15 @@ namespace Diagnostics.Eventing
         }
         protected internal override void Dispatch()
         {
-            Debug.Assert(!(Version == 0 && EventDataLength < SkipAsciiString(SkipSID(HostOffset(8, 2)))));  // TODO fixed by hand
-            Debug.Assert(!(Version == 1 && EventDataLength < SkipAsciiString(SkipSID((Version >= 3) ? HostOffset(24, 2) : HostOffset(20, 1))))); // TODO fixed by hand
-            Debug.Assert(!(Version == 2 && EventDataLength != SkipUnicodeString(SkipAsciiString(SkipSID((Version >= 3) ? HostOffset(24, 2) : HostOffset(20, 1))))));
-            Debug.Assert(!(Version > 2 && EventDataLength < SkipUnicodeString(SkipAsciiString(SkipSID((Version >= 3) ? HostOffset(24, 2) : HostOffset(20, 1))))));
+            Debug.Assert(!(Version == 0 && EventDataLength < SkipUTF8String(SkipSID(HostOffset(8, 2)))));  // TODO fixed by hand
+            Debug.Assert(!(Version == 1 && EventDataLength < SkipUTF8String(SkipSID((Version >= 3) ? HostOffset(24, 2) : HostOffset(20, 1))))); // TODO fixed by hand
+            Debug.Assert(!(Version == 2 && EventDataLength != SkipUnicodeString(SkipUTF8String(GetKernelImageNameOffset()))));
+            Debug.Assert(!(Version == 3 && EventDataLength != SkipUnicodeString(SkipUTF8String(GetKernelImageNameOffset()))));
+            Debug.Assert(Version <= 4, "V4 Process update.  Test that it is OK");
+            Debug.Assert(!(Version == 4 && EventDataLength !=
+                SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUTF8String(GetKernelImageNameOffset()))))));
+            Debug.Assert(!(Version > 4 && EventDataLength <
+                SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUTF8String(GetKernelImageNameOffset()))))));
             Action(this);
         }
         public override StringBuilder ToXml(StringBuilder sb)
@@ -2694,10 +2946,15 @@ namespace Diagnostics.Eventing
             sb.XmlAttrib("ParentID", ParentID);
             sb.XmlAttrib("ImageFileName", ImageFileName);
             sb.XmlAttribHex("DirectoryTableBase", DirectoryTableBase);
+            sb.XmlAttrib("Flags", Flags);
             sb.XmlAttrib("SessionID", SessionID);
             sb.XmlAttribHex("ExitStatus", ExitStatus);
             sb.XmlAttribHex("UniqueProcessKey", UniqueProcessKey);
             sb.XmlAttrib("CommandLine", CommandLine);
+            if (PackageFullName.Length != 0)
+                sb.XmlAttrib("PackageFullName", PackageFullName);
+            if (ApplicationID.Length != 0)
+                sb.XmlAttrib("ApplicationID", ApplicationID);
             sb.Append("/>");
             return sb;
         }
@@ -2707,7 +2964,9 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "ProcessID", "ParentID", "ImageFileName", "PageDirectoryBase", "SessionID", "ExitStatus", "UniqueProcessKey", "CommandLine" };
+                    payloadNames = new string[] { "ProcessID", "ParentID", "ImageFileName", "PageDirectoryBase", 
+                        "Flags", "SessionID", "ExitStatus", "UniqueProcessKey", "CommandLine", 
+                        "PackageFullName", "ApplicationID" };
                 return payloadNames;
             }
         }
@@ -2725,13 +2984,19 @@ namespace Diagnostics.Eventing
                 case 3:
                     return DirectoryTableBase;
                 case 4:
-                    return SessionID;
+                    return Flags;
                 case 5:
-                    return ExitStatus;
+                    return SessionID;
                 case 6:
-                    return UniqueProcessKey;
+                    return ExitStatus;
                 case 7:
+                    return UniqueProcessKey;
+                case 8:
                     return CommandLine;
+                case 9:
+                    return PackageFullName;
+                case 10:
+                    return ApplicationID;
                 default:
                     Debug.Assert(false, "Bad field index");
                     return null;
@@ -2963,9 +3228,9 @@ namespace Diagnostics.Eventing
         /// <summary>
         /// Indicate that StartAddr and Win32StartAddr are a code addresses that needs symbolic information
         /// </summary>
-        protected internal override void LogCodeAddresses(Action<TraceEvent, Address> callBack)
+        protected internal override bool LogCodeAddresses(Func<TraceEvent, Address, bool> callBack)
         {
-            callBack(this, StartAddr);
+            return callBack(this, StartAddr);
             // TODO is this one worth resolving?
             // callBack(this, Win32StartAddr);
         }
@@ -2984,6 +3249,7 @@ namespace Diagnostics.Eventing
         /// </summary>
         public int NewThreadID { get { return ThreadID; } }
         public int NewProcessID { get { return ProcessID; } }
+        public string NewProcessName { get { return ProcessName; } }
         public int OldThreadID { get { return GetInt32At(4); } }
         public int NewThreadPriority { get { return GetByteAt(8); } }
         public int OldThreadPriority { get { return GetByteAt(9); } }
@@ -3041,7 +3307,8 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "OldThreadID", "OldPRocessID", "OldProcessName",
+                    payloadNames = new string[] { "OldThreadID", "OldProcessID", "OldProcessName", 
+                        "NewThreadID", "NewProcessID", "NewProcessName", "ProcessorNumber",
                         "NewThreadPriority", "OldThreadPriority", "NewThreadQuantum", "OldThreadQuantum", 
                         "OldThreadWaitReason", "OldThreadWaitMode", "OldThreadState", "OldThreadWaitIdealProcessor", 
                         "NewThreadWaitTime" };
@@ -3053,7 +3320,6 @@ namespace Diagnostics.Eventing
         {
             switch (index)
             {
-
                 case 0:
                     return OldThreadID;
                 case 1:
@@ -3061,22 +3327,30 @@ namespace Diagnostics.Eventing
                 case 2:
                     return OldProcessName;
                 case 3:
-                    return NewThreadPriority;
+                    return NewThreadID;
                 case 4:
-                    return OldThreadPriority;
+                    return NewProcessID;
                 case 5:
-                    return NewThreadQuantum;
+                    return NewProcessName;
                 case 6:
-                    return OldThreadQuantum;
+                    return ProcessorNumber;
                 case 7:
-                    return OldThreadWaitReason;
+                    return NewThreadPriority;
                 case 8:
-                    return OldThreadWaitMode;
+                    return OldThreadPriority;
                 case 9:
-                    return OldThreadState;
+                    return NewThreadQuantum;
                 case 10:
-                    return OldThreadWaitIdealProcessor;
+                    return OldThreadQuantum;
                 case 11:
+                    return OldThreadWaitReason;
+                case 12:
+                    return OldThreadWaitMode;
+                case 13:
+                    return OldThreadState;
+                case 14:
+                    return OldThreadWaitIdealProcessor;
+                case 15:
                     return NewThreadWaitTime;
                 default:
                     Debug.Assert(false, "Bad field index");
@@ -3094,6 +3368,21 @@ namespace Diagnostics.Eventing
             Debug.Assert(eventRecord->EventHeader.ProcessId == -1);
             eventRecord->EventHeader.ProcessId = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
         }
+
+        unsafe public override int ProcessID
+        {
+            get
+            {
+                // We try to fix up the process ID 'on the fly' however in the case of a circular buffer,
+                // We simply don't know the process ID until the end of the trace.  Thus you to check and
+                // possibly try again.  
+                var ret = eventRecord->EventHeader.ProcessId;
+                if (ret == -1)
+                    ret = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
+                return ret;
+            }
+        }
+
         private string ToString(ThreadState state)
         {
             switch (state)
@@ -3219,7 +3508,7 @@ namespace Diagnostics.Eventing
         protected internal override void Dispatch()
         {
             Debug.Assert(!(Version == 2 && EventDataLength != HostOffset(17, 1)));
-            Debug.Assert(!(Version > 2 && EventDataLength < HostOffset(17, 1)));
+            // TODO FIX NOW Version 3 is smaller.  Debug.Assert(!(Version > 2 && EventDataLength < HostOffset(17, 1)));
             Action(this);
         }
         public override StringBuilder ToXml(StringBuilder sb)
@@ -3622,13 +3911,30 @@ namespace Diagnostics.Eventing
         /// </summary>
         private long HighResResponseTime { get { return GetInt64At(HostOffset(32, 2)); } }
         /// <summary>
+        /// This is the actual time the disk spent servicing this IO.
+        /// </summary>
+        public double DiskServiceTimeMSec
+        {
+            get
+            {
+                long timestamp;
+                if (!state.diskEventTimeStamp.TryGetValue((Address)DiskNumber, TimeStamp100ns-1, out timestamp))
+                {
+                    // On the off chance we don't have something in the previous dictionary for some reason, just use the current event time stamp.
+                    timestamp = TimeStamp100ns;
+                }
+                return (double)(TimeStamp100ns - Math.Max(TimeStamp100ns - ElapsedTime100ns, timestamp)) / 10000;
+            }
+        }
+
+        /// <summary>
         /// The time since the I/O was initiated.  
         /// </summary>
         public double ElapsedTimeMSec
         {
             get
             {
-                return HighResResponseTime * 1000.0 / source.PerfFreq;
+                return HighResResponseTime * 1000.0 / source.QPCFreq;
             }
         }
         /// <summary>
@@ -3638,7 +3944,7 @@ namespace Diagnostics.Eventing
         {
             get
             {
-                return HighResResponseTime * 10000000 / source.PerfFreq;
+                return HighResResponseTime * 10000000 / source.QPCFreq;
             }
         }
         // TODO you can get service time (what XPERF gives) by taking the minimum of 
@@ -3649,6 +3955,17 @@ namespace Diagnostics.Eventing
         {
             this.Action = action;
             this.state = state;
+            this.FixupETLData = FixupData;
+        }
+        private unsafe void FixupData()
+        {
+            Debug.Assert(eventRecord->EventHeader.ThreadId == -1 || eventRecord->EventHeader.ThreadId == GetInt32At(HostOffset(40, 2)));
+            if (eventRecord->EventHeader.ThreadId == -1)
+                eventRecord->EventHeader.ThreadId = GetInt32At(HostOffset(40, 2));
+
+            Debug.Assert(eventRecord->EventHeader.ProcessId == -1);
+            if (eventRecord->EventHeader.ProcessId == -1)
+                eventRecord->EventHeader.ProcessId = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
         }
         protected internal override void Dispatch()
         {
@@ -3667,6 +3984,7 @@ namespace Diagnostics.Eventing
             sb.XmlAttribHex("FileObject", FileObject);
             sb.XmlAttribHex("Irp", Irp);
             sb.XmlAttrib("ElapsedTimeMSec", ElapsedTimeMSec.ToString("f4"));
+            sb.XmlAttrib("DiskServiceTimeMSec", DiskServiceTimeMSec.ToString("f4"));
             sb.Append("/>");
             return sb;
         }
@@ -3676,7 +3994,7 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "DiskNumber", "IrpFlags", "TransferSize", "ByteOffset", "FileObject", "Irp", "ElapsedTime100ns" };
+                    payloadNames = new string[] { "DiskNumber", "IrpFlags", "TransferSize", "ByteOffset", "Irp", "ElapsedTimeMSec", "DiskServiceTimeMSec", "FileObject", "FileName" };
                 return payloadNames;
             }
         }
@@ -3694,11 +4012,15 @@ namespace Diagnostics.Eventing
                 case 3:
                     return ByteOffset;
                 case 4:
-                    return FileObject;
-                case 5:
                     return Irp;
+                case 5:
+                    return ElapsedTimeMSec;
                 case 6:
-                    return ElapsedTime100ns;
+                    return DiskServiceTimeMSec;
+                case 7:
+                    return FileObject;
+                case 8:
+                    return FileName;
                 default:
                     Debug.Assert(false, "Bad field index");
                     return null;
@@ -3717,8 +4039,18 @@ namespace Diagnostics.Eventing
         internal DiskIoInitTraceData(Action<DiskIoInitTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
             : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
         {
+            this.FixupETLData = FixupData;
             this.Action = action;
             this.state = state;
+        }
+
+        private unsafe void FixupData()
+        {
+            if (this.Version >= 3 && this.ThreadID == -1 && this.ProcessID == -1)
+            {
+                eventRecord->EventHeader.ThreadId = GetInt32At(HostOffset(4, 1));
+                eventRecord->EventHeader.ProcessId = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
+            }
         }
         protected internal override void Dispatch()
         {
@@ -3764,16 +4096,48 @@ namespace Diagnostics.Eventing
     {
         public int DiskNumber { get { return GetInt32At(0); } }
         public int IrpFlags { get { return GetInt32At(4); } }
-        public long HighResResponseTime100ns { get { return GetInt64At(8); } }
-        public DateTime HighResResponseTime { get { return DateTime.FromFileTime(HighResResponseTime100ns); } }
+        /// <summary>
+        /// This is the time since the I/O was initiated, in source.PerfFreq (QPC) ticks.  
+        /// </summary>
+        private long HighResResponseTime { get { return GetInt64At(8); } }
+        /// <summary>
+        /// The time since the I/O was initiated.  
+        /// </summary>
+        public double ElapsedTimeMSec
+        {
+            get
+            {
+                return HighResResponseTime * 1000.0 / source.QPCFreq;
+            }
+        }
+        /// <summary>
+        /// The time since the I/O was initiated.  
+        /// </summary>
+        public long ElapsedTime100ns
+        {
+            get
+            {
+                return HighResResponseTime * 10000000 / source.QPCFreq;
+            }
+        }
         public Address Irp { get { return GetHostPointer(16); } }
 
         #region Private
         internal DiskIoFlushBuffersTraceData(Action<DiskIoFlushBuffersTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
             : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
         {
+            this.FixupETLData = FixupData;
             this.Action = action;
             this.state = state;
+        }
+
+        private unsafe void FixupData()
+        {
+            if (this.Version >= 3 && this.ThreadID == -1 && this.ProcessID == -1)
+            {
+                eventRecord->EventHeader.ThreadId = GetInt32At(20);
+                eventRecord->EventHeader.ProcessId = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
+            }
         }
         protected internal override void Dispatch()
         {
@@ -3786,8 +4150,8 @@ namespace Diagnostics.Eventing
             Prefix(sb);
             sb.XmlAttrib("DiskNumber", DiskNumber);
             sb.XmlAttribHex("IrpFlags", IrpFlags);
-            sb.XmlAttrib("HighResResponseTime", HighResResponseTime);
             sb.XmlAttribHex("Irp", Irp);
+            sb.XmlAttribHex("ElapsedTimeMSec", Irp);
             sb.Append("/>");
             return sb;
         }
@@ -3797,7 +4161,7 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "DiskNumber", "IrpFlags", "HighResResponseTime", "Irp" };
+                    payloadNames = new string[] { "DiskNumber", "IrpFlags", "Irp", "ElapsedTimeMSec" };
                 return payloadNames;
             }
         }
@@ -3811,9 +4175,9 @@ namespace Diagnostics.Eventing
                 case 1:
                     return IrpFlags;
                 case 2:
-                    return HighResResponseTime;
-                case 3:
                     return Irp;
+                case 3:
+                    return ElapsedTimeMSec;
                 default:
                     Debug.Assert(false, "Bad field index");
                     return null;
@@ -4193,7 +4557,7 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "Status", "KeyHandle", "ElapsedTime", "KeyName", "Index", "InitialTime" };
+                    payloadNames = new string[] { "Status", "KeyHandle", "ElapsedTime", "KeyName", "ValueName", "Index", "InitialTime" };
                 return payloadNames;
             }
         }
@@ -4211,8 +4575,10 @@ namespace Diagnostics.Eventing
                 case 3:
                     return KeyName;
                 case 4:
-                    return Index;
+                    return ValueName;
                 case 5:
+                    return Index;
+                case 6:
                     return InitialTime;
                 default:
                     Debug.Assert(false, "Bad field index");
@@ -4371,20 +4737,32 @@ namespace Diagnostics.Eventing
         private KernelTraceEventParserState state;
         #endregion
     }
+
     public sealed class FileIoCreateTraceData : TraceEvent
     {
         public Address IrpPtr { get { return GetHostPointer(0); } }
-        // public Address TTID { get { return GetHostPointer(HostOffset(4, 1)); } }
-        public Address FileObject { get { return GetHostPointer(HostOffset(8, 2)); } }
-        public string KernelFileName { get { return state.FileIDToName(FileObject, TimeStamp100ns); } }
-        public string FileName { get { return state.KernelToUser(KernelFileName); } }
-        // TODO proper enums for these
-        public int CreateOptions { get { return GetInt32At(HostOffset(12, 3)); } }
-        public int FileAttributes { get { return GetInt32At(HostOffset(16, 3)); } }
-        public int ShareAccess { get { return GetInt32At(HostOffset(20, 3)); } }
-        public string KernelOpenPath { get { return GetUnicodeStringAt(HostOffset(24, 3)); } }
-        public string OpenPath { get { return state.KernelToUser(KernelOpenPath); } }
+        public Address FileObject { get { return GetHostPointer(Version <= 2 ? HostOffset(8, 2) : HostOffset(4, 1)); } }
+        // public Address TTID { get { return GetInt32At(Version <= 2 ? HostOffset(4, 1) : HostOffset(8, 2)); } }
 
+        // TODO proper enums for these
+        public int CreateOptions { get { return GetInt32At(Version <= 2 ? HostOffset(12, 3) : HostOffset(12, 2)); } }
+        public FileAttributes FileAttributes { get { return (FileAttributes)(GetInt32At(Version <= 2 ? HostOffset(16, 3) : HostOffset(16, 2))); } }
+        public FileShare ShareAccess { get { return (FileShare)(GetInt32At(Version <= 2 ? HostOffset(20, 3) : HostOffset(20, 2))); } }
+        public string KernelFileName { get { return GetUnicodeStringAt(Version <= 2 ? HostOffset(24, 3) : HostOffset(24, 2)); } }
+        public string FileName { get { return state.KernelToUser(KernelFileName); } }
+        unsafe public override int ProcessID
+        {
+            get
+            {
+                // We try to fix up the process ID 'on the fly' however in the case of a circular buffer,
+                // We simply don't know the process ID until the end of the trace.  Thus you to check and
+                // possibly try again.  
+                var ret = eventRecord->EventHeader.ProcessId;
+                if (ret == -1)
+                    ret = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
+                return ret;
+            }
+        }
         #region Private
         internal FileIoCreateTraceData(Action<FileIoCreateTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
             : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
@@ -4396,7 +4774,8 @@ namespace Diagnostics.Eventing
         protected internal override void Dispatch()
         {
             Debug.Assert(!(Version == 2 && EventDataLength != SkipUnicodeString(HostOffset(24, 3))));
-            Debug.Assert(!(Version > 2 && EventDataLength < SkipUnicodeString(HostOffset(24, 3))));
+            Debug.Assert(!(Version == 3 && EventDataLength != SkipUnicodeString(HostOffset(24, 2))));
+            Debug.Assert(!(Version > 3 && EventDataLength < SkipUnicodeString(HostOffset(24, 2))));
             Action(this);
         }
         public override StringBuilder ToXml(StringBuilder sb)
@@ -4407,7 +4786,7 @@ namespace Diagnostics.Eventing
             sb.XmlAttrib("CreateOptions", CreateOptions);
             sb.XmlAttrib("FileAttributes", FileAttributes);
             sb.XmlAttrib("ShareAccess", ShareAccess);
-            sb.XmlAttrib("OpenPath", OpenPath);
+            sb.XmlAttrib("FileName", FileName);
             sb.Append("/>");
             return sb;
         }
@@ -4417,7 +4796,7 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "IrpPtr", "FileObject", "CreateOptions", "FileAttributes", "ShareAccess", "OpenPath" };
+                    payloadNames = new string[] { "IrpPtr", "FileObject", "CreateOptions", "FileAttributes", "ShareAccess", "FileName" };
                 return payloadNames;
             }
         }
@@ -4437,7 +4816,7 @@ namespace Diagnostics.Eventing
                 case 4:
                     return ShareAccess;
                 case 5:
-                    return OpenPath;
+                    return FileName;
                 default:
                     Debug.Assert(false, "Bad field index");
                     return null;
@@ -4447,7 +4826,9 @@ namespace Diagnostics.Eventing
         private unsafe void FixupData()
         {
             Debug.Assert(eventRecord->EventHeader.ThreadId == -1 || eventRecord->EventHeader.ThreadId == GetInt32At(HostOffset(4, 1)));
-            eventRecord->EventHeader.ThreadId = GetInt32At(HostOffset(4, 1));
+            eventRecord->EventHeader.ThreadId = GetInt32At(Version <= 2 ? HostOffset(4, 1) : HostOffset(8, 2));
+            Debug.Assert(eventRecord->EventHeader.ProcessId == -1);
+            eventRecord->EventHeader.ProcessId = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
         }
         private event Action<FileIoCreateTraceData> Action;
         private KernelTraceEventParserState state;
@@ -4456,12 +4837,24 @@ namespace Diagnostics.Eventing
     public sealed class FileIoSimpleOpTraceData : TraceEvent
     {
         public Address IrpPtr { get { return GetHostPointer(0); } }
-        // public Address TTID { get { return GetHostPointer(HostOffset(4, 1)); } }
-        public Address FileObject { get { return GetHostPointer(HostOffset(8, 2)); } }
-        public string KernelFileName { get { return state.FileIDToName(FileObject, TimeStamp100ns); } }
+        public Address FileObject { get { return GetHostPointer(Version <= 2 ? HostOffset(8, 2) : HostOffset(4, 1)); } }
+        public string KernelFileName { get { return state.FileIDToName(FileKey, TimeStamp100ns); } }
         public string FileName { get { return state.KernelToUser(KernelFileName); } }
-        public Address FileKey { get { return GetHostPointer(HostOffset(12, 3)); } }
-
+        public Address FileKey { get { return GetHostPointer(Version <= 2 ? HostOffset(12, 3) : HostOffset(8, 2)); } }
+        // public Address TTID { get { return GetInt32At(Version <= 2 ? HostOffset(4, 1) : HostOffset(12, 3)); } }
+        unsafe public override int ProcessID
+        {
+            get
+            {
+                // We try to fix up the process ID 'on the fly' however in the case of a circular buffer,
+                // We simply don't know the process ID until the end of the trace.  Thus you to check and
+                // possibly try again.  
+                var ret = eventRecord->EventHeader.ProcessId;
+                if (ret == -1)
+                    ret = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
+                return ret;
+            }
+        }
         #region Private
         internal FileIoSimpleOpTraceData(Action<FileIoSimpleOpTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
             : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
@@ -4473,7 +4866,8 @@ namespace Diagnostics.Eventing
         protected internal override void Dispatch()
         {
             Debug.Assert(!(Version == 2 && EventDataLength != HostOffset(16, 4)));
-            Debug.Assert(!(Version > 2 && EventDataLength < HostOffset(16, 4)));
+            Debug.Assert(!(Version == 3 && EventDataLength != HostOffset(16, 3)));
+            Debug.Assert(!(Version > 3 && EventDataLength < HostOffset(16, 3)));
             Action(this);
         }
         public override StringBuilder ToXml(StringBuilder sb)
@@ -4482,6 +4876,7 @@ namespace Diagnostics.Eventing
             sb.XmlAttribHex("IrpPtr", IrpPtr);
             sb.XmlAttribHex("FileObject", FileObject);
             sb.XmlAttribHex("FileKey", FileKey);
+            sb.XmlAttrib("FileName", FileName);
             sb.Append("/>");
             return sb;
         }
@@ -4491,7 +4886,7 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "IrpPtr", "FileObject", "FileKey" };
+                    payloadNames = new string[] { "IrpPtr", "FileObject", "FileKey", "FileName" };
                 return payloadNames;
             }
         }
@@ -4506,6 +4901,8 @@ namespace Diagnostics.Eventing
                     return FileObject;
                 case 2:
                     return FileKey;
+                case 3:
+                    return FileName;
                 default:
                     Debug.Assert(false, "Bad field index");
                     return null;
@@ -4515,7 +4912,9 @@ namespace Diagnostics.Eventing
         private unsafe void FixupData()
         {
             Debug.Assert(eventRecord->EventHeader.ThreadId == -1 || eventRecord->EventHeader.ThreadId == GetInt32At(HostOffset(4, 1)));
-            eventRecord->EventHeader.ThreadId = GetInt32At(HostOffset(4, 1));
+            eventRecord->EventHeader.ThreadId = GetInt32At(Version <= 2 ? HostOffset(4, 1) : HostOffset(12, 3));
+            Debug.Assert(eventRecord->EventHeader.ProcessId == -1);
+            eventRecord->EventHeader.ProcessId = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
         }
 
         private event Action<FileIoSimpleOpTraceData> Action;
@@ -4526,13 +4925,28 @@ namespace Diagnostics.Eventing
     {
         public long Offset { get { return GetInt64At(0); } }
         public Address IrpPtr { get { return GetHostPointer(8); } }
-        // public Address TTID { get { return GetHostPointer(HostOffset(12, 1)); } }
-        public Address FileObject { get { return GetHostPointer(HostOffset(16, 2)); } }
-        public string KernelFileName { get { return state.FileIDToName(FileObject, TimeStamp100ns); } }
+        public Address FileObject { get { return GetHostPointer(Version <= 2 ? HostOffset(16, 2) : HostOffset(12, 1)); } }
+        public Address FileKey { get { return GetHostPointer(Version <= 2 ? HostOffset(20, 3) : HostOffset(16, 2)); } }
+
+        public string KernelFileName { get { return state.FileIDToName(FileKey, TimeStamp100ns); } }
         public string FileName { get { return state.KernelToUser(KernelFileName); } }
-        public Address FileKey { get { return GetHostPointer(HostOffset(20, 3)); } }
-        public int IoSize { get { return GetInt32At(HostOffset(24, 4)); } }
-        public int IoFlags { get { return GetInt32At(HostOffset(28, 4)); } }
+        unsafe public override int ProcessID
+        {
+            get
+            {
+                // We try to fix up the process ID 'on the fly' however in the case of a circular buffer,
+                // We simply don't know the process ID until the end of the trace.  Thus you to check and
+                // possibly try again.  
+                var ret = eventRecord->EventHeader.ProcessId;
+                if (ret == -1)
+                    ret = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
+                return ret;
+            }
+        }
+        // public Address TTID { get { return GetInt32At(Version <= 2 ? HostOffset(12, 1) : HostOffset(20, 3)); } }
+
+        public int IoSize { get { return GetInt32At(Version <= 2 ? HostOffset(24, 4) : HostOffset(24, 3)); } }
+        public int IoFlags { get { return GetInt32At(Version <= 2 ? HostOffset(28, 4) : HostOffset(28, 3)); } }
 
         #region Private
         internal FileIoReadWriteTraceData(Action<FileIoReadWriteTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
@@ -4545,12 +4959,14 @@ namespace Diagnostics.Eventing
         protected internal override void Dispatch()
         {
             Debug.Assert(!(Version == 2 && EventDataLength != HostOffset(32, 4)));
-            Debug.Assert(!(Version > 2 && EventDataLength < HostOffset(32, 4)));
+            Debug.Assert(!(Version == 3 && EventDataLength != HostOffset(32, 3)));
+            Debug.Assert(!(Version > 3 && EventDataLength < HostOffset(32, 3)));
             Action(this);
         }
         public override StringBuilder ToXml(StringBuilder sb)
         {
             Prefix(sb);
+            sb.XmlAttrib("FileName", FileName);
             sb.XmlAttrib("Offset", Offset);
             sb.XmlAttribHex("IrpPtr", IrpPtr);
             sb.XmlAttribHex("FileObject", FileObject);
@@ -4566,7 +4982,7 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "Offset", "IrpPtr", "FileObject", "FileKey", "IoSize", "IoFlags" };
+                    payloadNames = new string[] { "Offset", "IrpPtr", "FileObject", "FileKey", "IoSize", "IoFlags", "FileName" };
                 return payloadNames;
             }
         }
@@ -4587,6 +5003,8 @@ namespace Diagnostics.Eventing
                     return IoSize;
                 case 5:
                     return IoFlags;
+                case 6:
+                    return FileName;
                 default:
                     Debug.Assert(false, "Bad field index");
                     return null;
@@ -4596,7 +5014,9 @@ namespace Diagnostics.Eventing
         private unsafe void FixupData()
         {
             Debug.Assert(eventRecord->EventHeader.ThreadId == -1 || eventRecord->EventHeader.ThreadId == GetInt32At(HostOffset(12, 1)));
-            eventRecord->EventHeader.ThreadId = GetInt32At(HostOffset(12, 1));
+            Debug.Assert(eventRecord->EventHeader.ProcessId == -1);
+            eventRecord->EventHeader.ThreadId = GetInt32At(Version <= 2 ? HostOffset(12, 1) : HostOffset(20, 3));
+            eventRecord->EventHeader.ProcessId = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
         }
         private event Action<FileIoReadWriteTraceData> Action;
         private KernelTraceEventParserState state;
@@ -4605,14 +5025,26 @@ namespace Diagnostics.Eventing
     public sealed class FileIoInfoTraceData : TraceEvent
     {
         public Address IrpPtr { get { return GetHostPointer(0); } }
-        // public Address TTID { get { return GetHostPointer(HostOffset(4, 1)); } }
-        public Address FileObject { get { return GetHostPointer(HostOffset(8, 2)); } }
-        public string KernelFileName { get { return state.FileIDToName(FileObject, TimeStamp100ns); } }
+        public Address FileObject { get { return GetHostPointer(Version <= 2 ? HostOffset(8, 2) : HostOffset(4, 1)); } }
+        public string KernelFileName { get { return state.FileIDToName(FileKey, TimeStamp100ns); } }
         public string FileName { get { return state.KernelToUser(KernelFileName); } }
-        public Address FileKey { get { return GetHostPointer(HostOffset(12, 3)); } }
-        public Address ExtraInfo { get { return GetHostPointer(HostOffset(16, 4)); } }
-        public int InfoClass { get { return GetInt32At(HostOffset(20, 5)); } }
-
+        public Address FileKey { get { return GetHostPointer(Version <= 2 ? HostOffset(12, 3) : HostOffset(8, 2)); } }
+        public Address ExtraInfo { get { return GetHostPointer(Version <= 2 ? HostOffset(16, 4) : HostOffset(12, 3)); } }
+        // public Address TTID { get { return GetInt32At(Version <= 2 ? HostOffset(4, 1) : HostOffset(16, 4)); } }
+        public int InfoClass { get { return GetInt32At(Version <= 2 ? HostOffset(20, 5) : HostOffset(20, 4)); } }
+        unsafe public override int ProcessID
+        {
+            get
+            {
+                // We try to fix up the process ID 'on the fly' however in the case of a circular buffer,
+                // We simply don't know the process ID until the end of the trace.  Thus you to check and
+                // possibly try again.  
+                var ret = eventRecord->EventHeader.ProcessId;
+                if (ret == -1)
+                    ret = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
+                return ret;
+            }
+        }
         #region Private
         internal FileIoInfoTraceData(Action<FileIoInfoTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
             : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
@@ -4624,12 +5056,14 @@ namespace Diagnostics.Eventing
         protected internal override void Dispatch()
         {
             Debug.Assert(!(Version == 2 && EventDataLength != HostOffset(24, 5)));
-            Debug.Assert(!(Version > 2 && EventDataLength < HostOffset(24, 5)));
+            Debug.Assert(!(Version == 3 && EventDataLength != HostOffset(24, 4)));
+            Debug.Assert(!(Version > 3 && EventDataLength < HostOffset(24, 4)));
             Action(this);
         }
         public override StringBuilder ToXml(StringBuilder sb)
         {
             Prefix(sb);
+            sb.XmlAttrib("FileName", FileName);
             sb.XmlAttribHex("IrpPtr", IrpPtr);
             sb.XmlAttribHex("FileObject", FileObject);
             sb.XmlAttribHex("FileKey", FileKey);
@@ -4644,7 +5078,7 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "IrpPtr", "FileObject", "FileKey", "ExtraInfo", "InfoClass" };
+                    payloadNames = new string[] { "IrpPtr", "FileObject", "FileKey", "ExtraInfo", "InfoClass", "FileName" };
                 return payloadNames;
             }
         }
@@ -4663,6 +5097,8 @@ namespace Diagnostics.Eventing
                     return ExtraInfo;
                 case 4:
                     return InfoClass;
+                case 5:
+                    return FileName;
                 default:
                     Debug.Assert(false, "Bad field index");
                     return null;
@@ -4671,7 +5107,9 @@ namespace Diagnostics.Eventing
         private unsafe void FixupData()
         {
             Debug.Assert(eventRecord->EventHeader.ThreadId == -1 || eventRecord->EventHeader.ThreadId == GetInt32At(HostOffset(4, 1)));
-            eventRecord->EventHeader.ThreadId = GetInt32At(HostOffset(4, 1));
+            eventRecord->EventHeader.ThreadId = GetInt32At(Version <= 2 ? HostOffset(4, 1) : HostOffset(16, 4));
+            Debug.Assert(eventRecord->EventHeader.ProcessId == -1);
+            eventRecord->EventHeader.ProcessId = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
         }
         private event Action<FileIoInfoTraceData> Action;
         private KernelTraceEventParserState state;
@@ -4680,15 +5118,28 @@ namespace Diagnostics.Eventing
     public sealed class FileIoDirEnumTraceData : TraceEvent
     {
         public Address IrpPtr { get { return GetHostPointer(0); } }
-        // public Address TTID { get { return GetHostPointer(HostOffset(4, 1)); } }
-        public Address FileObject { get { return GetHostPointer(HostOffset(8, 2)); } }
-        public Address FileKey { get { return GetHostPointer(HostOffset(12, 3)); } }
-        public int Length { get { return GetInt32At(HostOffset(16, 4)); } }
-        public int InfoClass { get { return GetInt32At(HostOffset(20, 4)); } }
-        public int FileIndex { get { return GetInt32At(HostOffset(24, 4)); } }
-        public string KernelFileName { get { return GetUnicodeStringAt(HostOffset(28, 4)); } }
+        public Address FileObject { get { return GetHostPointer(Version <= 2 ? HostOffset(8, 2) : HostOffset(4, 1)); } }
+        public Address FileKey { get { return GetHostPointer(Version <= 2 ? HostOffset(12, 3) : HostOffset(8, 2)); } }
+        public string DirectoryName { get { return state.KernelToUser(state.FileIDToName(FileKey, TimeStamp100ns)); } }
+        // public Address TTID { get { return GetInt32At(Version <= 2 ? HostOffset(4, 1) : HostOffset(12, 3)); } }
+        public int Length { get { return GetInt32At(Version <= 2 ? HostOffset(16, 4) : HostOffset(16, 3)); } }
+        public int InfoClass { get { return GetInt32At(Version <= 2 ? HostOffset(20, 4) : HostOffset(20, 3)); } }
+        public int FileIndex { get { return GetInt32At(Version <= 2 ? HostOffset(24, 4) : HostOffset(24, 3)); } }
+        public string KernelFileName { get { return GetUnicodeStringAt(Version <= 2 ? HostOffset(28, 4) : HostOffset(28, 3)); } }
         public string FileName { get { return state.KernelToUser(KernelFileName); } }
-
+        unsafe public override int ProcessID
+        {
+            get
+            {
+                // We try to fix up the process ID 'on the fly' however in the case of a circular buffer,
+                // We simply don't know the process ID until the end of the trace.  Thus you to check and
+                // possibly try again.  
+                var ret = eventRecord->EventHeader.ProcessId;
+                if (ret == -1)
+                    ret = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
+                return ret;
+            }
+        }
         #region Private
         internal FileIoDirEnumTraceData(Action<FileIoDirEnumTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
             : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
@@ -4700,19 +5151,21 @@ namespace Diagnostics.Eventing
         protected internal override void Dispatch()
         {
             Debug.Assert(!(Version == 2 && EventDataLength != SkipUnicodeString(HostOffset(28, 4))));
-            Debug.Assert(!(Version > 2 && EventDataLength < SkipUnicodeString(HostOffset(28, 4))));
+            Debug.Assert(!(Version == 3 && EventDataLength != SkipUnicodeString(HostOffset(28, 3))));
+            Debug.Assert(!(Version > 3 && EventDataLength < SkipUnicodeString(HostOffset(28, 3))));
             Action(this);
         }
         public override StringBuilder ToXml(StringBuilder sb)
         {
             Prefix(sb);
+            sb.XmlAttrib("FileName", FileName);
             sb.XmlAttribHex("IrpPtr", IrpPtr);
             sb.XmlAttribHex("FileObject", FileObject);
             sb.XmlAttribHex("FileKey", FileKey);
+            sb.XmlAttrib("DirectoryName", DirectoryName);
             sb.XmlAttrib("Length", Length);
             sb.XmlAttrib("InfoClass", InfoClass);
             sb.XmlAttrib("FileIndex", FileIndex);
-            sb.XmlAttrib("FileName", FileName);
             sb.Append("/>");
             return sb;
         }
@@ -4722,7 +5175,7 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "IrpPtr", "FileObject", "FileKey", "Length", "InfoClass", "FileIndex", "FileName" };
+                    payloadNames = new string[] { "IrpPtr", "FileObject", "FileKey", "DirectoryName", "Length", "InfoClass", "FileIndex", "FileName" };
                 return payloadNames;
             }
         }
@@ -4738,12 +5191,14 @@ namespace Diagnostics.Eventing
                 case 2:
                     return FileKey;
                 case 3:
-                    return Length;
+                    return DirectoryName;
                 case 4:
-                    return InfoClass;
+                    return Length;
                 case 5:
-                    return FileIndex;
+                    return InfoClass;
                 case 6:
+                    return FileIndex;
+                case 7:
                     return FileName;
                 default:
                     Debug.Assert(false, "Bad field index");
@@ -4754,7 +5209,9 @@ namespace Diagnostics.Eventing
         private unsafe void FixupData()
         {
             Debug.Assert(eventRecord->EventHeader.ThreadId == -1 || eventRecord->EventHeader.ThreadId == GetInt32At(HostOffset(4, 1)));
-            eventRecord->EventHeader.ThreadId = GetInt32At(HostOffset(4, 1));
+            eventRecord->EventHeader.ThreadId = GetInt32At(Version <= 2 ? HostOffset(4, 1) : HostOffset(12, 3));
+            Debug.Assert(eventRecord->EventHeader.ProcessId == -1);
+            eventRecord->EventHeader.ProcessId = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
         }
 
         private event Action<FileIoDirEnumTraceData> Action;
@@ -4822,15 +5279,31 @@ namespace Diagnostics.Eventing
     }
     public sealed class TcpIpTraceData : TraceEvent
     {
+
         // PID
         public int size { get { if (Version >= 1) return GetInt32At(4); return GetInt32At(12); } }
-        public int daddr { get { if (Version >= 1) return GetInt32At(8); return GetInt32At(0); } }
-        public int saddr { get { if (Version >= 1) return GetInt32At(12); return GetInt32At(4); } }
-        public int dport { get { if (Version >= 1) return GetInt16At(16); return GetInt16At(8); } }
-        public int sport { get { if (Version >= 1) return GetInt16At(18); return GetInt16At(10); } }
+        public System.Net.IPAddress daddr
+        {
+            get
+            {
+                var addr = (uint)((Version >= 1) ? GetInt32At(8) : GetInt32At(0));
+                return new System.Net.IPAddress(addr);
+            }
+        }
+        public System.Net.IPAddress saddr
+        {
+            get
+            {
+                var addr = (uint)((Version >= 1) ? GetInt32At(12) : GetInt32At(4));
+                return new System.Net.IPAddress(addr);
+            }
+        }
+        public int dport { get { if (Version >= 1) return ByteSwap16(GetInt16At(16)); return ByteSwap16(GetInt16At(8)); } }
+        public int sport { get { if (Version >= 1) return ByteSwap16(GetInt16At(18)); return ByteSwap16(GetInt16At(10)); } }
         public Address connid { get { if (Version >= 1) return GetHostPointer(HostOffset(20, 1)); return 0; } }
         public int seqnum { get { if (Version >= 1) return GetInt32At(HostOffset(24, 1)); return 0; } }
 
+        internal static int ByteSwap16(int val) { return ((val << 8) & 0xFF00) + ((val >> 8) & 0xFF); }
         #region Private
         internal TcpIpTraceData(Action<TcpIpTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
             : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
@@ -4970,10 +5443,11 @@ namespace Diagnostics.Eventing
 
         // PID
         public int size { get { return GetInt32At(4); } }
-        public int daddr { get { return GetInt32At(8); } }
-        public int saddr { get { return GetInt32At(12); } }
-        public int dport { get { return (ushort)GetInt16At(16); } }
-        public int sport { get { return (ushort)GetInt16At(18); } }
+
+        public System.Net.IPAddress daddr { get { return new System.Net.IPAddress((uint)GetInt32At(8)); } }
+        public System.Net.IPAddress saddr { get { return new System.Net.IPAddress((uint)GetInt32At(12)); } }
+        public int dport { get { return TcpIpTraceData.ByteSwap16(GetInt16At(16)); } }
+        public int sport { get { return TcpIpTraceData.ByteSwap16(GetInt16At(18)); } }
         public int startime { get { return GetInt32At(20); } }
         public int endtime { get { return GetInt32At(24); } }
         public int seqnum { get { return GetInt32At(28); } }
@@ -5064,10 +5538,10 @@ namespace Diagnostics.Eventing
 
         // PID
         public int size { get { return GetInt32At(4); } }
-        public int daddr { get { return GetInt32At(8); } }
-        public int saddr { get { return GetInt32At(12); } }
-        public int dport { get { return (ushort)GetInt16At(16); } }
-        public int sport { get { return (ushort)GetInt16At(18); } }
+        public System.Net.IPAddress daddr { get { return new System.Net.IPAddress((uint)GetInt32At(8)); } }
+        public System.Net.IPAddress saddr { get { return new System.Net.IPAddress((uint)GetInt32At(12)); } }
+        public int dport { get { return TcpIpTraceData.ByteSwap16(GetInt16At(16)); } }
+        public int sport { get { return TcpIpTraceData.ByteSwap16(GetInt16At(18)); } }
         public int mss { get { return GetInt16At(20); } }
         public int sackopt { get { return GetInt16At(22); } }
         public int tsopt { get { return GetInt16At(24); } }
@@ -5177,8 +5651,8 @@ namespace Diagnostics.Eventing
         public int size { get { return GetInt32At(4); } }
         public System.Net.IPAddress daddr { get { return GetIPAddrV6At(8); } }
         public System.Net.IPAddress saddr { get { return GetIPAddrV6At(24); } }
-        public int dport { get { return (ushort)GetInt16At(40); } }
-        public int sport { get { return (ushort)GetInt16At(42); } }
+        public int dport { get { return TcpIpTraceData.ByteSwap16(GetInt16At(40)); } }
+        public int sport { get { return TcpIpTraceData.ByteSwap16(GetInt16At(42)); } }
         public Address connid { get { return GetHostPointer(44); } }
         public int seqnum { get { return GetInt32At(HostOffset(48, 1)); } }
 
@@ -5256,8 +5730,8 @@ namespace Diagnostics.Eventing
         public int size { get { return GetInt32At(4); } }
         public System.Net.IPAddress daddr { get { return GetIPAddrV6At(8); } }
         public System.Net.IPAddress saddr { get { return GetIPAddrV6At(24); } }
-        public int dport { get { return (ushort)GetInt16At(40); } }
-        public int sport { get { return (ushort)GetInt16At(42); } }
+        public int dport { get { return TcpIpTraceData.ByteSwap16(GetInt16At(40)); } }
+        public int sport { get { return TcpIpTraceData.ByteSwap16(GetInt16At(42)); } }
         public int startime { get { return GetInt32At(44); } }
         public int endtime { get { return GetInt32At(48); } }
         public int seqnum { get { return GetInt32At(52); } }
@@ -5344,8 +5818,8 @@ namespace Diagnostics.Eventing
         public int size { get { return GetInt32At(4); } }
         public System.Net.IPAddress daddr { get { return GetIPAddrV6At(8); } }
         public System.Net.IPAddress saddr { get { return GetIPAddrV6At(24); } }
-        public int dport { get { return (ushort)GetInt16At(40); } }
-        public int sport { get { return (ushort)GetInt16At(42); } }
+        public int dport { get { return TcpIpTraceData.ByteSwap16(GetInt16At(40)); } }
+        public int sport { get { return TcpIpTraceData.ByteSwap16(GetInt16At(42)); } }
         public int mss { get { return GetInt16At(44); } }
         public int sackopt { get { return GetInt16At(46); } }
         public int tsopt { get { return GetInt16At(48); } }
@@ -5445,13 +5919,27 @@ namespace Diagnostics.Eventing
     public sealed class UdpIpTraceData : TraceEvent
     {
         public Address context { get { return GetHostPointer(0); } }
-        public int saddr { get { if (Version >= 1) return GetInt32At(12); return GetInt32At(HostOffset(4, 1)); } }
-        public int sport { get { if (Version >= 1) return GetInt16At(18); return GetInt16At(HostOffset(8, 1)); } }
+        public System.Net.IPAddress saddr
+        {
+            get
+            {
+                var addr = (uint)((Version >= 1) ? GetInt32At(12) : GetInt32At(HostOffset(4, 1)));
+                return new System.Net.IPAddress(addr);
+            }
+        }
+        public int sport { get { if (Version >= 1) return TcpIpTraceData.ByteSwap16(GetInt16At(18)); return TcpIpTraceData.ByteSwap16(GetInt16At(HostOffset(8, 1))); } }
         public int size { get { if (Version >= 1) return GetInt32At(4); return GetInt16At(HostOffset(10, 1)); } }
-        public int daddr { get { if (Version >= 1) return GetInt32At(8); return GetInt32At(HostOffset(12, 1)); } }
-        public int dport { get { if (Version >= 1) return GetInt16At(16); return GetInt16At(HostOffset(16, 1)); } }
+        public System.Net.IPAddress daddr
+        {
+            get
+            {
+                var addr = (uint)((Version >= 1) ? GetInt32At(8) : GetInt32At(HostOffset(12, 1)));
+                return new System.Net.IPAddress(addr);
+            }
+        }
+        public int dport { get { if (Version >= 1) return TcpIpTraceData.ByteSwap16(GetInt16At(16)); return TcpIpTraceData.ByteSwap16(GetInt16At(HostOffset(16, 1))); } }
         public int dsize { get { return GetInt16At(HostOffset(18, 1)); } }
-        // PID
+        // PID  
         #region Private
         internal UdpIpTraceData(Action<UdpIpTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
             : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
@@ -5586,8 +6074,8 @@ namespace Diagnostics.Eventing
         public int size { get { return GetInt32At(4); } }
         public System.Net.IPAddress daddr { get { return GetIPAddrV6At(8); } }
         public System.Net.IPAddress saddr { get { return GetIPAddrV6At(24); } }
-        public int dport { get { return (ushort)GetInt16At(40); } }
-        public int sport { get { return (ushort)GetInt16At(42); } }
+        public int dport { get { return TcpIpTraceData.ByteSwap16(GetInt16At(40)); } }
+        public int sport { get { return TcpIpTraceData.ByteSwap16(GetInt16At(42)); } }
         public int seqnum { get { return GetInt32At(44); } }
         public Address connid { get { return GetHostPointer(48); } }
 
@@ -5663,6 +6151,18 @@ namespace Diagnostics.Eventing
         // public int ProcessID { get { if (Version >= 1) return GetInt32At(HostOffset(8, 2)); return 0; } }
         public int ImageChecksum { get { if (Version >= 2) return GetInt32At(HostOffset(12, 2)); return 0; } }
         public int TimeDateStamp { get { if (Version >= 2) return GetInt32At(HostOffset(16, 2)); return 0; } }
+        /// <summary>
+        /// This is the TimeDateStamp converted to a DateTime
+        /// TODO: daylight savings time seems to mess this up.  
+        /// </summary>
+        public DateTime BuildTime
+        {
+            get
+            {
+                return PEFile.PEHeader.TimeDateStampToDate(TimeDateStamp);
+            }
+        }
+
         // Skipping Reserved0
         public Address DefaultBase { get { if (Version >= 2) return GetHostPointer(HostOffset(24, 2)); return 0; } }
         // Skipping Reserved1
@@ -5706,7 +6206,7 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "ImageBase", "ImageSize", "ImageChecksum", "TimeDateStamp", "DefaultBase", "FileName" };
+                    payloadNames = new string[] { "ImageBase", "ImageSize", "ImageChecksum", "TimeDateStamp", "DefaultBase", "BuildTime", "FileName" };
                 return payloadNames;
             }
         }
@@ -5726,6 +6226,8 @@ namespace Diagnostics.Eventing
                 case 4:
                     return DefaultBase;
                 case 5:
+                    return BuildTime;
+                case 6:
                     return FileName;
                 default:
                     Debug.Assert(false, "Bad field index");
@@ -5747,7 +6249,7 @@ namespace Diagnostics.Eventing
                 if (eventRecord->EventHeader.Version >= 1)
                     eventRecord->EventHeader.ProcessId = GetInt32At(HostOffset(8, 2));
             }
-            Debug.Assert(eventRecord->EventHeader.Version == 0 || eventRecord->EventHeader.ProcessId == GetInt32At(HostOffset(8, 2)));
+            // Debug.Assert(eventRecord->EventHeader.Version == 0 || eventRecord->EventHeader.ProcessId == GetInt32At(HostOffset(8, 2)));
         }
         #endregion
     }
@@ -5808,9 +6310,9 @@ namespace Diagnostics.Eventing
         /// <summary>
         /// Indicate that ProgramCounter is a code address that needs symbolic information
         /// </summary>
-        protected internal override void LogCodeAddresses(Action<TraceEvent, Address> callBack)
+        protected internal override bool LogCodeAddresses(Func<TraceEvent, Address, bool> callBack)
         {
-            callBack(this, ProgramCounter);
+            return callBack(this, ProgramCounter);
         }
         #endregion
     }
@@ -5860,7 +6362,7 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "InitialTime", "ReadOffset", "VirtualAddress", "FileObject", "ByteCount" };
+                    payloadNames = new string[] { "InitialTime", "ReadOffset", "VirtualAddress", "FileObject", "ByteCount", "FileName" };
                 return payloadNames;
             }
         }
@@ -5879,6 +6381,8 @@ namespace Diagnostics.Eventing
                     return FileObject;
                 case 4:
                     return ByteCount;
+                case 5:
+                    return FileName;
                 default:
                     Debug.Assert(false, "Bad field index");
                     return null;
@@ -5894,6 +6398,20 @@ namespace Diagnostics.Eventing
             eventRecord->EventHeader.ThreadId = GetInt32At(HostOffset(0x18, 2));
             Debug.Assert(eventRecord->EventHeader.ProcessId == -1);
             eventRecord->EventHeader.ProcessId = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
+        }
+
+        unsafe public override int ProcessID
+        {
+            get
+            {
+                // We try to fix up the process ID 'on the fly' however in the case of a circular buffer,
+                // We simply don't know the process ID until the end of the trace.  Thus you to check and
+                // possibly try again.  
+                var ret = eventRecord->EventHeader.ProcessId;
+                if (ret == -1)
+                    ret = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
+                return ret;
+            }
         }
 
         #endregion
@@ -5960,7 +6478,9 @@ namespace Diagnostics.Eventing
 
         private unsafe void FixupData()
         {
-            Debug.Assert(eventRecord->EventHeader.ProcessId == -1);
+            // We always make the process id the one where the fault occured
+            // TODO is this a good idea?  
+            // Debug.Assert(eventRecord->EventHeader.ProcessId == -1);
             eventRecord->EventHeader.ProcessId = GetInt32At(HostOffset(8, 1));
         }
         #endregion
@@ -6172,7 +6692,7 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "FileObject", "DeviceChar", "FileChar", "LoadFlags" };
+                    payloadNames = new string[] { "FileObject", "DeviceChar", "FileChar", "LoadFlags", "FileName" };
                 return payloadNames;
             }
         }
@@ -6189,6 +6709,8 @@ namespace Diagnostics.Eventing
                     return FileChar;
                 case 3:
                     return LoadFlags;
+                case 4:
+                    return FileName;
                 default:
                     Debug.Assert(false, "Bad field index");
                     return null;
@@ -6258,8 +6780,8 @@ namespace Diagnostics.Eventing
     {
         public Address InstructionPointer { get { return GetHostPointer(0); } }
         // public int ThreadID { get { return GetInt32At(HostOffset(4, 1)); } }
-        public int Count { get { return GetInt32At(HostOffset(8, 1)); } }
-
+        public int Count { get { return GetInt16At(HostOffset(8, 1)); } }
+        // 16 bits of reserved space, seems to be a flags field
         #region Private
         internal SampledProfileTraceData(Action<SampledProfileTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
             : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
@@ -6289,7 +6811,7 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "InstructionPointer", "ThreadID", "Count" };
+                    payloadNames = new string[] { "InstructionPointer", "ThreadID", "ProcessorNumber", "Count" };
                 return payloadNames;
             }
         }
@@ -6303,6 +6825,8 @@ namespace Diagnostics.Eventing
                 case 1:
                     return ThreadID;
                 case 2:
+                    return ProcessorNumber;
+                case 3:
                     return Count;
                 default:
                     Debug.Assert(false, "Bad field index");
@@ -6316,9 +6840,9 @@ namespace Diagnostics.Eventing
         /// <summary>
         /// Indicate that SystemCallAddress is a code address that needs symbolic information
         /// </summary>
-        protected internal override void LogCodeAddresses(Action<TraceEvent, Address> callBack)
+        protected internal override bool LogCodeAddresses(Func<TraceEvent, Address, bool> callBack)
         {
-            callBack(this, InstructionPointer);
+            return callBack(this, InstructionPointer);
         }
 
         private unsafe void FixupData()
@@ -6327,6 +6851,118 @@ namespace Diagnostics.Eventing
             eventRecord->EventHeader.ThreadId = GetInt32At(HostOffset(4, 1));
             Debug.Assert(eventRecord->EventHeader.ProcessId == -1);
             eventRecord->EventHeader.ProcessId = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
+        }
+
+        unsafe public override int ProcessID
+        {
+            get
+            {
+                // We try to fix up the process ID 'on the fly' however in the case of a circular buffer,
+                // We simply don't know the process ID until the end of the trace.  Thus you to check and
+                // possibly try again.  
+                var ret = eventRecord->EventHeader.ProcessId;
+                if (ret == -1)
+                    ret = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
+                return ret;
+            }
+        }
+        #endregion
+    }
+
+    /// <summary>
+    /// PMC (Precise Machine Counter) events are fired when a CPU counter trips.  The the ProfileSource identifies
+    /// which counter it is.   The PerfInfoCollectionStart events will tell you the count that was configured to trip
+    /// the event.  
+    /// </summary>
+    public sealed class PMCCounterProfTraceData : TraceEvent
+    {
+        public Address InstructionPointer { get { return GetHostPointer(0); } }
+        // public int ThreadID { get { return GetInt32At(HostOffset(4, 1)); } }
+        public int ProfileSource { get { return GetInt16At(HostOffset(8, 1)); } }
+        // short Reserved;
+        #region Private
+        internal PMCCounterProfTraceData(Action<PMCCounterProfTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
+            : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
+        {
+            this.FixupETLData = FixupData;
+            this.Action = action;
+            this.state = state;
+        }
+        protected internal override void Dispatch()
+        {
+            Debug.Assert(!(Version == 2 && EventDataLength != HostOffset(12, 1)));
+            Debug.Assert(!(Version > 2 && EventDataLength < HostOffset(12, 1)));
+            Action(this);
+        }
+        public override StringBuilder ToXml(StringBuilder sb)
+        {
+            Prefix(sb);
+            sb.XmlAttribHex("InstructionPointer", InstructionPointer);
+            sb.XmlAttrib("ThreadID", ThreadID);
+            sb.XmlAttrib("ProfileSource", ProfileSource);
+            sb.Append("/>");
+            return sb;
+        }
+
+        public override string[] PayloadNames
+        {
+            get
+            {
+                if (payloadNames == null)
+                    payloadNames = new string[] { "InstructionPointer", "ThreadID", "ProcessorNumber", "ProfileSource" };
+                return payloadNames;
+            }
+        }
+
+        public override object PayloadValue(int index)
+        {
+            switch (index)
+            {
+                case 0:
+                    return InstructionPointer;
+                case 1:
+                    return ThreadID;
+                case 2:
+                    return ProcessorNumber;
+                case 3:
+                    return ProfileSource;
+                default:
+                    Debug.Assert(false, "Bad field index");
+                    return null;
+            }
+        }
+
+        private event Action<PMCCounterProfTraceData> Action;
+        private KernelTraceEventParserState state;
+
+        /// <summary>
+        /// Indicate that SystemCallAddress is a code address that needs symbolic information
+        /// </summary>
+        protected internal override bool LogCodeAddresses(Func<TraceEvent, Address, bool> callBack)
+        {
+            return callBack(this, InstructionPointer);
+        }
+
+        private unsafe void FixupData()
+        {
+            Debug.Assert(eventRecord->EventHeader.ThreadId == -1);
+            eventRecord->EventHeader.ThreadId = GetInt32At(HostOffset(4, 1));
+            Debug.Assert(eventRecord->EventHeader.ProcessId == -1);
+            eventRecord->EventHeader.ProcessId = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
+        }
+
+        unsafe public override int ProcessID
+        {
+            get
+            {
+                // We try to fix up the process ID 'on the fly' however in the case of a circular buffer,
+                // We simply don't know the process ID until the end of the trace.  Thus you to check and
+                // possibly try again.  
+                var ret = eventRecord->EventHeader.ProcessId;
+                if (ret == -1)
+                    ret = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
+                return ret;
+            }
         }
         #endregion
     }
@@ -6417,16 +7053,20 @@ namespace Diagnostics.Eventing
         /// <summary>
         /// Indicate that SystemCallAddress is a code address that needs symbolic information
         /// </summary>
-        protected internal override void LogCodeAddresses(Action<TraceEvent, Address> callBack)
+        protected internal override bool LogCodeAddresses(Func<TraceEvent, Address, bool> callBack)
         {
+            bool ret = true;
             for (int i = 0; i < BatchCount; i++)
-                callBack(this, InstructionPointer(i));
+                if (!callBack(this, InstructionPointer(i)))
+                    ret = false;
+            return ret;
         }
         #endregion
     }
 
     public sealed class SampledProfileIntervalTraceData : TraceEvent
     {
+        // This is 0 for the timeer, but is non-zero for CPU counter, and this number identifies the CPU counter. 
         public int SampleSource { get { return GetInt32At(0); } }
         public int NewInterval { get { return GetInt32At(4); } }
         public int OldInterval { get { return GetInt32At(8); } }
@@ -6537,9 +7177,9 @@ namespace Diagnostics.Eventing
         /// <summary>
         /// Indicate that SystemCallAddress is a code address that needs symbolic information
         /// </summary>
-        protected internal override void LogCodeAddresses(Action<TraceEvent, Address> callBack)
+        protected internal override bool LogCodeAddresses(Func<TraceEvent, Address, bool> callBack)
         {
-            callBack(this, SysCallAddress);
+            return callBack(this, SysCallAddress);
         }
         #endregion
     }
@@ -6632,7 +7272,7 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "InitialTime", "Routine", "ReturnValue", "Vector" };
+                    payloadNames = new string[] { "InitialTime", "Routine", "ReturnValue", "Vector", "ProcessorNumber" };
                 return payloadNames;
             }
         }
@@ -6649,6 +7289,8 @@ namespace Diagnostics.Eventing
                     return ReturnValue;
                 case 3:
                     return Vector;
+                case 4:
+                    return ProcessorNumber;
                 default:
                     Debug.Assert(false, "Bad field index");
                     return null;
@@ -6692,7 +7334,7 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "InitialTime", "Routine" };
+                    payloadNames = new string[] { "InitialTime", "Routine", "ProcessorNumber" };
                 return payloadNames;
             }
         }
@@ -6705,6 +7347,8 @@ namespace Diagnostics.Eventing
                     return InitialTime;
                 case 1:
                     return Routine;
+                case 2:
+                    return ProcessorNumber;
                 default:
                     Debug.Assert(false, "Bad field index");
                     return null;
@@ -6728,7 +7372,10 @@ namespace Diagnostics.Eventing
         /// cycles as the tick.
         /// </summary>
         public long EventTimeStampQPC { get { return GetInt64At(0); } }
-
+        /// <summary>
+        /// Converts this to a time relative to the start of the trace in msec. 
+        /// </summary>
+        public double EventTimeStampRelMSec { get { return source.RelativeTimeMSec(source.QPCTimeToFileTime(EventTimeStampQPC)); } }
         /// <summary>
         /// The total number of eventToStack frames collected.  The Windows OS currently has a maximum of 96 frames. 
         /// </summary>
@@ -6745,6 +7392,10 @@ namespace Diagnostics.Eventing
             Debug.Assert(0 <= i && i < FrameCount);
             return GetHostPointer(16 + i * PointerSize);
         }
+        /// <summary>
+        /// Access to the instruction pointers as a unsafe memory blob
+        /// </summary>
+        unsafe internal void* InstructionPointers { get { return ((byte*)DataStart) + 16; } }
         #region Private
         internal StackWalkTraceData(Action<StackWalkTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
             : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
@@ -6771,7 +7422,11 @@ namespace Diagnostics.Eventing
         }
         public override StringBuilder ToXml(StringBuilder sb)
         {
-            Prefix(sb).XmlAttrib("EventTimeStampQPC", EventTimeStampQPC).XmlAttrib("FrameCount", FrameCount).AppendLine(">");
+            Prefix(sb);
+            sb.XmlAttrib("EventTimeStampQPC", EventTimeStampQPC);
+            sb.XmlAttrib("EventTimeStampRelMSec", EventTimeStampRelMSec.ToString("f4"));
+            sb.XmlAttrib("FrameCount", FrameCount);
+            sb.AppendLine(">");
             for (int i = 0; i < FrameCount; i++)
             {
                 sb.Append("  ");
@@ -6786,15 +7441,204 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[0];
+                    payloadNames = new string[] { "EventTimeStampRelMSec", "FrameCount", "IP0", "IP1", "IP2", "IP3" };
                 return payloadNames;
             }
         }
         public override object PayloadValue(int index)
         {
-            return null;
+            switch (index)
+            {
+                case 0:
+                    return EventTimeStampRelMSec;
+                case 1:
+                    return FrameCount;
+                case 2:
+                case 3:
+                case 4:
+                case 5:
+                    var idx = index - 2;
+                    if (idx < FrameCount)
+                        return InstructionPointer(idx);
+                    return 0;
+                default:
+                    Debug.Assert(false, "Bad field index");
+                    return null;
+            }
         }
         public event Action<StackWalkTraceData> Action;
+
+        private KernelTraceEventParserState state;
+        #endregion
+    }
+
+    /// <summary>
+    /// To save space, stack walks in Win8 can be complressed.  The stack walk event only has a 
+    /// reference to a stack Key which is then looked up by StackWalkDefTraceData. 
+    /// </summary>
+    public sealed class StackWalkRefTraceData : TraceEvent
+    {
+        /// <summary>
+        /// The timestamp of the event which caused this stack walk using QueryPerformaceCounter
+        /// cycles as the tick.
+        /// </summary>
+        public long EventTimeStampQPC { get { return GetInt64At(0); } }
+        /// <summary>
+        /// Converts this to a time relative to the start of the trace in msec. 
+        /// </summary>
+        public double EventTimeStampRelMSec { get { return source.RelativeTimeMSec(source.QPCTimeToFileTime(EventTimeStampQPC)); } }
+        /// <summary>
+        /// Returns a key that can be used to look up the stack in KeyDelete or KeyRundown events 
+        /// </summary>
+        public Address StackKey { get { return (Address)GetIntPtrAt(16); } }
+        #region Private
+        internal StackWalkRefTraceData(Action<StackWalkRefTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
+            : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
+        {
+            this.FixupETLData = FixupData;
+            this.Action = action;
+            this.state = state;
+        }
+        protected internal override void Dispatch()
+        {
+            Action(this);
+        }
+
+        /// <summary>
+        /// StackWalkTraceData does not set Thread and process ID fields properly.  if that.  
+        /// </summary>
+        private unsafe void FixupData()
+        {
+            Debug.Assert(eventRecord->EventHeader.ThreadId == -1);
+            Debug.Assert(eventRecord->EventHeader.ProcessId == -1);
+            eventRecord->EventHeader.ThreadId = GetInt32At(0xC);
+            eventRecord->EventHeader.ProcessId = GetInt32At(8);
+        }
+        public override StringBuilder ToXml(StringBuilder sb)
+        {
+            Prefix(sb);
+            sb.XmlAttrib("EventTimeStampQPC", EventTimeStampQPC);
+            sb.XmlAttrib("EventTimeStampRelMSec", EventTimeStampRelMSec.ToString("f4"));
+            sb.XmlAttrib("StackKey", StackKey);
+            sb.AppendLine("/>");
+            return sb;
+        }
+        public override string[] PayloadNames
+        {
+            get
+            {
+                if (payloadNames == null)
+                    payloadNames = new string[] { "EventTimeStampRelMSec", "StackKey" };
+                return payloadNames;
+            }
+        }
+        public override object PayloadValue(int index)
+        {
+            switch (index)
+            {
+                case 0:
+                    return EventTimeStampRelMSec;
+                case 1:
+                    return StackKey;
+                default:
+                    Debug.Assert(false, "Bad field index");
+                    return null;
+            }
+        }
+        public event Action<StackWalkRefTraceData> Action;
+
+        private KernelTraceEventParserState state;
+        #endregion
+    }
+
+    /// <summary>
+    /// This event defines a stack and gives it a unique id (the StackKey), which StackWalkRefTraceData can point at.  
+    /// </summary>
+    public sealed class StackWalkDefTraceData : TraceEvent
+    {
+        /// <summary>
+        /// Returns a key that can be used to look up the stack in KeyDelete or KeyRundown events 
+        /// </summary>
+        public Address StackKey { get { return (Address)GetIntPtrAt(0); } }
+        /// <summary>
+        /// The total number of eventToStack frames collected.  The Windows OS currently has a maximum of 96 frames. 
+        /// </summary>
+        public int FrameCount { get { return (EventDataLength / PointerSize) - 1; } }
+        /// <summary>
+        /// Fetches the instruction pointer of a eventToStack frame 0 is the deepest frame, and the maximum should
+        /// be a thread offset routine (if you get a complete eventToStack).  
+        /// </summary>
+        /// <param name="i">The index of the frame to fetch.  0 is the CPU EIP, 1 is the Caller of that
+        /// routine ...</param>
+        /// <returns>The instruction pointer of the specified frame.</returns>
+        public Address InstructionPointer(int i)
+        {
+            Debug.Assert(0 <= i && i < FrameCount);
+            return GetHostPointer((i + 1) * PointerSize);
+        }
+        /// <summary>
+        /// Access to the instruction pointers as a unsafe memory blob
+        /// </summary>
+        unsafe internal void* InstructionPointers { get { return ((byte*)DataStart) + PointerSize; } }
+        #region Private
+        internal StackWalkDefTraceData(Action<StackWalkDefTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
+            : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
+        {
+            this.Action = action;
+            this.state = state;
+        }
+        protected internal override void Dispatch()
+        {
+            Debug.Assert(FrameCount >= 0);
+            Action(this);
+        }
+
+        public override StringBuilder ToXml(StringBuilder sb)
+        {
+            Prefix(sb);
+            sb.XmlAttrib("StackKey", StackKey);
+            sb.XmlAttrib("FrameCount", FrameCount);
+            sb.AppendLine(">");
+            for (int i = 0; i < FrameCount; i++)
+            {
+                sb.Append("  ");
+                sb.Append("0x").Append(((ulong)InstructionPointer(i)).ToString("x"));
+            }
+            sb.AppendLine();
+            sb.Append("</Event>");
+            return sb;
+        }
+        public override string[] PayloadNames
+        {
+            get
+            {
+                if (payloadNames == null)
+                    payloadNames = new string[] { "StackKey", "FrameCount", "IP0", "IP1", "IP2", "IP3" };
+                return payloadNames;
+            }
+        }
+        public override object PayloadValue(int index)
+        {
+            switch (index)
+            {
+                case 0:
+                    return StackKey;
+                case 1:
+                    return FrameCount;
+                case 2:
+                case 3:
+                case 4:
+                case 5:
+                    var idx = index - 2;
+                    if (idx < FrameCount)
+                        return InstructionPointer(idx);
+                    return 0;
+                default:
+                    Debug.Assert(false, "Bad field index");
+                    return null;
+            }
+        }
+        public event Action<StackWalkDefTraceData> Action;
 
         private KernelTraceEventParserState state;
         #endregion
@@ -6956,7 +7800,7 @@ namespace Diagnostics.Eventing
     public sealed class ALPCWaitForNewMessageTraceData : TraceEvent
     {
         public int IsServerPort { get { return GetInt32At(0); } }
-        public string PortName { get { return GetAsciiStringAt(4); } }
+        public string PortName { get { return GetUTF8StringAt(4); } }
 
         #region Private
         internal ALPCWaitForNewMessageTraceData(Action<ALPCWaitForNewMessageTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
@@ -6967,8 +7811,8 @@ namespace Diagnostics.Eventing
         }
         protected internal override void Dispatch()
         {
-            Debug.Assert(!(Version == 0 && EventDataLength != SkipAsciiString(4)));
-            Debug.Assert(!(Version > 0 && EventDataLength < SkipAsciiString(4)));
+            Debug.Assert(!(Version == 0 && EventDataLength != SkipUTF8String(4)));
+            Debug.Assert(!(Version > 0 && EventDataLength < SkipUTF8String(4)));
             Action(this);
         }
         public override StringBuilder ToXml(StringBuilder sb)
@@ -7276,7 +8120,7 @@ namespace Diagnostics.Eventing
         {
             Debug.Assert(!(Version == 0 && EventDataLength < 108));        // TODO fixed by hand
             Debug.Assert(!(Version == 1 && EventDataLength < 108));        // TODO fixed by hand
-            Debug.Assert(!(Version == 2 && EventDataLength != 112));
+            Debug.Assert(!(Version == 2 && EventDataLength < 112));        // TODO fixed by hand
             Debug.Assert(!(Version > 2 && EventDataLength < 112));
             Action(this);
         }
@@ -7987,7 +8831,9 @@ namespace Diagnostics.Eventing
 
         private unsafe void FixupData()
         {
-            Debug.Assert(eventRecord->EventHeader.ProcessId == -1);
+            // We always choose the process ID to be the process where for the allocation happens 
+            // TODO Is this really a good idea?  
+            // Debug.Assert(eventRecord->EventHeader.ProcessId == -1 || eventRecord->EventHeader.ProcessId == GetInt32At(HostOffset(8, 2)));
             eventRecord->EventHeader.ProcessId = GetInt32At(HostOffset(8, 2));
         }
         public override StringBuilder ToXml(StringBuilder sb)
@@ -8004,7 +8850,7 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "BaseAddr", "Length", "Flags" };
+                    payloadNames = new string[] { "BaseAddr", "Length", "Flags", "LengthHex", "EndAddr" };
                 return payloadNames;
             }
         }
@@ -8018,6 +8864,10 @@ namespace Diagnostics.Eventing
                     return Length;
                 case 2:
                     return Flags;
+                case 3:
+                    return "0x" + Length.ToString("x");
+                case 4:
+                    return "0x" + ((Address)Length + BaseAddr).ToString("x");
                 default:
                     Debug.Assert(false, "Bad field index");
                     return null;
@@ -8038,11 +8888,20 @@ namespace Diagnostics.Eventing
             Boost = 2,
         };
 
-        // Thread ID is at offset 0 (we fix it up)
+        [Flags]
+        public enum ReadyThreadFlags : byte
+        {
+            ReadiedFromDPC = 1,     // The thread has been readied from DPC (deferred procedure call).
+            KernelSwappedOut = 2,   // The kernel stack is currently swapped out.
+            ProcessSwappedOut = 4   // The process address space is swapped out.
+        }
+
+        public int AwakenedThreadID { get { return GetInt32At(0); } }
+        public int AwakenedProcessID { get { return state.ThreadIDToProcessID(AwakenedThreadID, TimeStamp100ns); } }
         public AdjustReasonEnum AdjustReason { get { return (AdjustReasonEnum)GetByteAt(4); } }
         public int AdjustIncrement { get { return GetByteAt(5); } }
-        public bool ExecutingDpc { get { return GetByteAt(6) != 0; } }
-        // There is a spare byte after ExecutingDpc
+        public ReadyThreadFlags Flags { get { return (ReadyThreadFlags)GetByteAt(6); } }
+        // There is a reserved byte after Flags
 
         #region Private
         internal ReadyThreadTraceData(Action<ReadyThreadTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName, KernelTraceEventParserState state)
@@ -8060,17 +8919,21 @@ namespace Diagnostics.Eventing
 
         private unsafe void FixupData()
         {
+            /* TODO FIX NOW: How do we get the thread ID of who did the awakening? 
             Debug.Assert(eventRecord->EventHeader.ThreadId == -1);
             eventRecord->EventHeader.ThreadId = GetInt32At(0);
             Debug.Assert(eventRecord->EventHeader.ProcessId == -1);
             eventRecord->EventHeader.ProcessId = state.ThreadIDToProcessID(ThreadID, TimeStamp100ns);
+             */
         }
         public override StringBuilder ToXml(StringBuilder sb)
         {
             Prefix(sb);
+            sb.XmlAttrib("AwakenedThreadID", AwakenedThreadID);
+            sb.XmlAttrib("AwakenedProcessID", AwakenedProcessID);
             sb.XmlAttrib("AdjustReason", AdjustReason);
             sb.XmlAttrib("AdjustIncrement", AdjustIncrement);
-            sb.XmlAttrib("ExecutingDpc", ExecutingDpc);
+            sb.XmlAttrib("ReadyThreadFlags", Flags);
             sb.Append("/>");
             return sb;
         }
@@ -8079,7 +8942,7 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "AdjustReason", "AdjustIncrement", "ExecutingDpc" };
+                    payloadNames = new string[] { "AwakenedThreadID", "AwakenedProcessID", "AdjustReason", "AdjustIncrement", "Flags" };
                 return payloadNames;
             }
         }
@@ -8088,11 +8951,15 @@ namespace Diagnostics.Eventing
             switch (index)
             {
                 case 0:
-                    return AdjustReason;
+                    return AwakenedThreadID;
                 case 1:
-                    return AdjustIncrement;
+                    return AwakenedProcessID;
                 case 2:
-                    return ExecutingDpc;
+                    return AdjustReason;
+                case 3:
+                    return AdjustIncrement;
+                case 4:
+                    return Flags;
                 default:
                     Debug.Assert(false, "Bad field index");
                     return null;
@@ -8103,7 +8970,7 @@ namespace Diagnostics.Eventing
         #endregion
     }
 
-    [SecuritySafeCritical]
+    // [SecuritySafeCritical]
     public sealed class ThreadPoolTraceEventParser : TraceEventParser
     {
         public static string ProviderName = "ThreadPool";
@@ -8529,7 +9396,7 @@ namespace Diagnostics.Eventing
         #endregion
     }
 
-    [SecuritySafeCritical]
+    // [SecuritySafeCritical]
     public sealed class HeapTraceProviderTraceEventParser : TraceEventParser
     {
         public static string ProviderName = "HeapTraceProvider";
@@ -8766,10 +9633,18 @@ namespace Diagnostics.Eventing
         private HeapTraceProviderState state;
         #endregion
     }
+
+    // TODO make an enum for SourceID these are the values. 
+    // #define MEMORY_FROM_LOOKASIDE                   1       //Activity from LookAside  
+    // #define MEMORY_FROM_LOWFRAG                     2       //Activity from Low Frag Heap  
+    // #define MEMORY_FROM_MAINPATH                    3       //Activity from Main Code Path  
+    // #define MEMORY_FROM_SLOWPATH                    4       //Activity from Slow C  
+    // #define MEMORY_FROM_INVALID                     5  
+
     public sealed class HeapAllocTraceData : TraceEvent
     {
         public Address HeapHandle { get { return GetHostPointer(0); } }
-        public Address AllocSize { get { return GetHostPointer(HostOffset(4, 1)); } }
+        public long AllocSize { get { return (long)GetHostPointer(HostOffset(4, 1)); } }
         public Address AllocAddress { get { return GetHostPointer(HostOffset(8, 2)); } }
         public int SourceID { get { return GetInt32At(HostOffset(12, 3)); } }
 
@@ -8834,8 +9709,8 @@ namespace Diagnostics.Eventing
         public Address HeapHandle { get { return GetHostPointer(0); } }
         public Address NewAllocAddress { get { return GetHostPointer(HostOffset(4, 1)); } }
         public Address OldAllocAddress { get { return GetHostPointer(HostOffset(8, 2)); } }
-        public Address NewAllocSize { get { return GetHostPointer(HostOffset(12, 3)); } }
-        public Address OldAllocSize { get { return GetHostPointer(HostOffset(16, 4)); } }
+        public long NewAllocSize { get { return (long)GetHostPointer(HostOffset(12, 3)); } }
+        public long OldAllocSize { get { return (long)GetHostPointer(HostOffset(16, 4)); } }
         public int SourceID { get { return GetInt32At(HostOffset(20, 5)); } }
 
         #region Private
@@ -9228,7 +10103,7 @@ namespace Diagnostics.Eventing
         #endregion
     }
 
-    [SecuritySafeCritical]
+    // [SecuritySafeCritical]
     public sealed class CritSecTraceProviderTraceEventParser : TraceEventParser
     {
         public static string ProviderName = "CritSecTraceProvider";
@@ -9411,7 +10286,7 @@ namespace Diagnostics.Eventing
 
     public sealed class BuildInfoTraceData : TraceEvent
     {
-        public DateTime InstallDate { get { return DateTime.FromFileTimeUtc(GetInt64At(0)); } }
+        public DateTime InstallDate { get { return DateTime.FromFileTime(GetInt64At(0)); } }
         public string BuildLab { get { return GetUnicodeStringAt(8); } }
         public string ProductName { get { return GetUnicodeStringAt(SkipUnicodeString(8)); } }
         #region Private

@@ -1,6 +1,5 @@
-// Copyright (c) Microsoft Corporation.  All rights reserved
 /****************************************************************************/
-/*                                  Command.cs                              */
+/*                                  Command.cs                                  */
 /****************************************************************************/
 
 
@@ -189,7 +188,7 @@ namespace Utilities
 
         /// <summary>
         /// Indicates the standard output and error of the command should be redirected
-        /// to a archiveFile rather than being stored in memory in the 'Output' property of the
+        /// to a archiveFile rather than being stored in Memory in the 'Output' property of the
         /// command.
         /// </summary>
         public string OutputFile
@@ -214,7 +213,7 @@ namespace Utilities
 
         /// <summary>
         /// Indicates the standard output and error of the command should be redirected
-        /// to a a TextWriter rather than being stored in memory in the 'Output' property 
+        /// to a a TextWriter rather than being stored in Memory in the 'Output' property 
         /// of the command.
         /// </summary>
         public TextWriter OutputStream
@@ -485,18 +484,6 @@ namespace Utilities
                 outputStream = File.CreateText(options.outputFile);
             }
 
-#if false
-            if (options.showCommand && outputStream != null)
-            {
-                // TODO why only for output streams?
-                outputStream.WriteLine("RUN CMD: " + commandLine);
-            }
-#endif
-#if false
-            // Make sure we kill this task when Ctrl C or appdomain unloads
-            if (!options.noWait)
-                AddCommandToCleanupList(this);
-#endif
             try
             {
                 process.Start();
@@ -545,23 +532,34 @@ namespace Utilities
             if (options.noWait)
                 return this;
 
-            process.WaitForExit(options.timeoutMSec);
-            //  TODO : HACK we see to have a race in the async process stuff
-            //  If you do Run("cmd /c set") you get truncated output at the
-            //  Looks like the problem in the framework.  
-            for (int i = 0; i < 10; i++)
-                System.Threading.Thread.Sleep(1);
-
-            if (!process.HasExited)
+            bool waitReturned = false;
+            bool killed = false;
+            try
             {
-                Kill();
-                throw new Exception("Timeout of " + (options.timeoutMSec / 1000) + " sec exceeded\r\n    Cmd: " + commandLine);
+                process.WaitForExit(options.timeoutMSec);
+                waitReturned = true;
+                //  TODO : HACK we see to have a race in the async process stuff
+                //  If you do Run("cmd /c set") you get truncated output at the
+                //  Looks like the problem in the framework.  
+                for (int i = 0; i < 10; i++)
+                    System.Threading.Thread.Sleep(1);
+            }
+            finally
+            {
+                if (!process.HasExited)
+                {
+                    killed = true;
+                    Kill();
+                }
             }
 
             // If we created the output stream, we should close it.  
             if (outputStream != null && options.outputFile != null)
                 outputStream.Close();
             outputStream = null;
+
+            if (waitReturned && killed) 
+                throw new Exception("Timeout of " + (options.timeoutMSec / 1000) + " sec exceeded\r\n    Cmd: " + commandLine);
 
             if (process.ExitCode != 0 && !options.noThrow)
                 ThrowCommandFailure(null);
@@ -737,57 +735,7 @@ namespace Utilities
         private CommandOptions options;
         private TextWriter outputStream;
 
-#if false 
-        // Control C support.  Kill any commands if control C is hit or process exits.  
-        private static List<WeakReference> s_commandsToCleanup = SetupControlC();
-        private static bool s_controlCProcessed;
-
-        private static List<WeakReference> SetupControlC()
-        {
-            Console.CancelKeyPress += OnControlC;
-            AppDomain.CurrentDomain.DomainUnload += OnControlC;
-            return new List<WeakReference>(); 
-        }
-        private static void OnControlC(object sender, EventArgs e)
-        {
-            lock (s_commandsToCleanup)
-            {
-                if (!s_controlCProcessed)
-                {
-                    Console.WriteLine("Command Cleanup");
-                    foreach (WeakReference commandToCleanupRef in s_commandsToCleanup)
-                    {
-                        var commandToCleanup = commandToCleanupRef.Target as Command;
-                        if (commandToCleanup != null && !commandToCleanup.HasExited)
-                        {
-                            Console.WriteLine("Killing {0}", commandToCleanup.commandLine);
-                            commandToCleanup.Kill();
-                        }
-                    }
-                    s_controlCProcessed = true;
-                    s_commandsToCleanup.Clear();
-                }
-            }
-        }
-
-        private void AddCommandToCleanupList(Command cmd)
-        {
-            lock (s_commandsToCleanup)
-            {
-                foreach (WeakReference cmdElemRef in s_commandsToCleanup)
-                {
-                    var cmdElem = cmdElemRef.Target as Command;
-                    if (cmdElem == null || cmdElem.HasExited)
-                    {
-                        cmdElemRef.Target = cmd;
-                        return;
-                    }
-                }
-                s_commandsToCleanup.Add(new WeakReference(cmd));
-            }
-        }
-#endif 
-    #endregion
+        #endregion
     }
 }
-    
+

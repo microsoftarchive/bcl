@@ -2,8 +2,10 @@
 using System;
 using System.Collections.Generic;
 using System.Text;
-using Diagnostics.Eventing;
+using Diagnostics.Tracing;
 using System.Diagnostics;
+using Address = System.UInt64;
+using Diagnostics.Tracing.Parsers;
 
 class EventStats
 {
@@ -22,7 +24,6 @@ class EventStats
         new ClrRundownTraceEventParser(source).All += StatsCollector;
         new ClrStressTraceEventParser(source).All += StatsCollector;
         new SymbolTraceEventParser(source).All += StatsCollector;
-        new WPFTraceEventParser(source).All += StatsCollector;
 
         source.UnhandledEvent += StatsCollector;
         source.Process();

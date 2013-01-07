@@ -8,10 +8,10 @@ using System;
 using System.Runtime.InteropServices;
 using System.ComponentModel;
 using System.Security;
-using Diagnostics.Eventing;
+using Diagnostics.Tracing;
 
 // This moduleFile contains Internal PINVOKE declarations and has no public API surface. 
-namespace Diagnostics.Eventing
+namespace Diagnostics.Tracing
 {
     #region Private Classes
 

@@ -10,10 +10,10 @@ using System.Runtime.InteropServices;
 using System.Collections.Generic;
 using System.Security;
 using System.Diagnostics;
-using Diagnostics.Eventing;
+using Diagnostics.Tracing.Parsers;
 
 // code:System.Diagnostics.ETWTraceEventSource defintion.
-namespace Diagnostics.Eventing
+namespace Diagnostics.Tracing
 {
     /// <summary>
     /// A code:ETWTraceEventSource represents the stream of events that was collected from a
@@ -45,7 +45,7 @@ namespace Diagnostics.Eventing
         /// If type == ModuleFile this is the name of the moduleFile to open.
         /// If type == Session this is the name of real time sessing to open.</param>
         /// <param name="type"></param>
-        [SecuritySafeCritical]
+        // [SecuritySafeCritical]
         public ETWTraceEventSource(string fileOrSessionName, TraceEventSourceType type)
         {
             long now = DateTime.Now.ToFileTime() - 100000;     // used as the start time for real time sessions (sub 10msec to avoid negative times)
@@ -65,7 +65,7 @@ namespace Diagnostics.Eventing
                 allLogFiles.AddRange(Directory.GetFiles(dir, fileBaseName + ".user*.etl"));
 
                 if (allLogFiles.Count == 0)
-                    throw new FileNotFoundException("Could not find any files in the file family " + fileOrSessionName);
+                    throw new FileNotFoundException("Could not find file     " + fileOrSessionName);
 
                 logFiles = new TraceEventNativeMethods.EVENT_TRACE_LOGFILEW[allLogFiles.Count];
                 for (int i = 0; i < allLogFiles.Count; i++)
@@ -91,7 +91,7 @@ namespace Diagnostics.Eventing
             useClassicETW = Environment.OSVersion.Version.Major < 6;
             if (useClassicETW)
             {
-                IntPtr mem = TraceEventNativeMethods.AllocHGlobal(sizeof(TraceEventNativeMethods.EVENT_RECORD));
+                IntPtr mem = Marshal.AllocHGlobal(sizeof(TraceEventNativeMethods.EVENT_RECORD));
                 TraceEventNativeMethods.ZeroMemory(mem, (uint)sizeof(TraceEventNativeMethods.EVENT_RECORD));
                 convertedHeader = (TraceEventNativeMethods.EVENT_RECORD*)mem;
                 logFiles[0].EventCallback = RawDispatchClassic;
@@ -101,6 +101,8 @@ namespace Diagnostics.Eventing
                 logFiles[0].LogFileMode |= TraceEventNativeMethods.PROCESS_TRACE_MODE_EVENT_RECORD;
                 logFiles[0].EventCallback = RawDispatch;
             }
+            // We want the raw timestamp because it is needed to match up stacks with the event they go with.  
+            logFiles[0].LogFileMode |= TraceEventNativeMethods.PROCESS_TRACE_MODE_RAW_TIMESTAMP;
 
             // Copy the information to any additional log files 
             for (int i = 1; i < logFiles.Length; i++)
@@ -122,7 +124,7 @@ namespace Diagnostics.Eventing
                 if (handles[i] == TraceEventNativeMethods.INVALID_HANDLE_VALUE)
                     Marshal.ThrowExceptionForHR(TraceEventNativeMethods.GetHRForLastWin32Error());
 
-                // Start time is minimum of all start times
+                // Start time is minimum of all start times 
                 if (logFiles[i].LogfileHeader.StartTime < sessionStartTime100ns)
                     sessionStartTime100ns = logFiles[i].LogfileHeader.StartTime;
                 // End time is maximum of all start times
@@ -152,7 +154,15 @@ namespace Diagnostics.Eventing
 
             cpuSpeedMHz = (int)logFiles[0].LogfileHeader.CpuSpeedInMHz;
             numberOfProcessors = (int)logFiles[0].LogfileHeader.NumberOfProcessors;
-            perfFreq = logFiles[0].LogfileHeader.PerfFreq;
+            _QPCFreq = logFiles[0].LogfileHeader.PerfFreq;
+            if (_QPCFreq == 0)          // Real time does not set this all the time 
+            {
+                _QPCFreq = Stopwatch.Frequency;
+                Debug.Assert((logFiles[0].LogFileMode & TraceEventNativeMethods.EVENT_TRACE_REAL_TIME_MODE) != 0);
+            }
+            Debug.Assert(_QPCFreq != 0);
+            int ver = (int) logFiles[0].LogfileHeader.Version;
+            osVersion = new Version((byte) ver, (byte) (ver>> 8));
 
             // Logic for looking up process names
             processNameForID = new Dictionary<int, string>();
@@ -180,7 +190,7 @@ namespace Diagnostics.Eventing
         /// code:#Introduction for more
         /// </summary>
         /// <returns>false If StopProcesing was called</returns>
-        [SecuritySafeCritical]
+        // [SecuritySafeCritical]
         public override bool Process()
         {
             if (processTraceCalled)
@@ -188,6 +198,9 @@ namespace Diagnostics.Eventing
             processTraceCalled = true;
             stopProcessing = false;
             int dwErr = TraceEventNativeMethods.ProcessTrace(handles, (uint)handles.Length, (IntPtr)0, (IntPtr)0);
+
+            if (dwErr == 6)
+                throw new ApplicationException("Error opening ETL file.  Most likely caused by opening a Win8 Trace on a Pre Win8 OS.");
 
             // ETW returns 1223 when you stop processing explicitly 
             if (!(dwErr == 1223 && stopProcessing))
@@ -199,7 +212,6 @@ namespace Diagnostics.Eventing
         /// <summary>
         /// Closes the ETL moduleFile or detaches from the session.  
         /// </summary>  
-
         public void Close()
         {
             Dispose(true);
@@ -214,12 +226,29 @@ namespace Diagnostics.Eventing
         /// </summary>
         public string SessionName { get { return logFiles[0].LoggerName; } }
         /// <summary>
+        /// The size of the log, will return 0 if it does not know. 
+        /// </summary>
+        public override long Size
+        {
+            get
+            {
+                long ret = 0;
+                for (int i = 0; i < logFiles.Length; i++)
+                {
+                    var fileName = logFiles[0].LogFileName;
+                    if (File.Exists(fileName))
+                        ret += new FileInfo(fileName).Length;
+                }
+                return ret;
+            }
+        }
+        /// <summary>
         /// Returns true if the code:Process can be called mulitple times (if the Data source is from a
         /// moduleFile, not a real time stream.
         /// </summary>
         public bool CanReset { get { return (logFiles[0].LogFileMode & TraceEventNativeMethods.EVENT_TRACE_REAL_TIME_MODE) == 0; } }
 
-        [SecuritySafeCritical]
+        // [SecuritySafeCritical]
         public override void Dispose()
         {
             Dispose(true);
@@ -232,7 +261,7 @@ namespace Diagnostics.Eventing
         // ETWTraceEventSource is a wrapper around the Windows API code:TraceEventNativeMethods.OpenTrace
         // methodIndex (see http://msdn2.microsoft.com/en-us/library/aa364089.aspx) We set it up so that we call
         // back to code:ETWTraceEventSource.Dispatch which is the heart of the event callback logic.
-        [SecuritySafeCritical]
+        // [SecuritySafeCritical]
         [AllowReversePInvokeCalls]
         private void RawDispatchClassic(TraceEventNativeMethods.EVENT_RECORD* eventData)
         {
@@ -277,26 +306,32 @@ namespace Diagnostics.Eventing
             RawDispatch(eventData);
         }
 
-        [SecuritySafeCritical]
+        // [SecuritySafeCritical]
         [AllowReversePInvokeCalls]
         private void RawDispatch(TraceEventNativeMethods.EVENT_RECORD* rawData)
         {
             Debug.Assert(rawData->EventHeader.HeaderType == 0);     // if non-zero probably old-style ETW header
             TraceEvent anEvent = Lookup(rawData);
+
             // Keep in mind that for UnhandledTraceEvent 'PrepForCallback' has NOT been called, which means the
             // opcode, guid and eventIds are not correct at this point.  The ToString() routine WILL call
             // this so if that is in your debug window, it will have this side effect (which is good and bad)
             // Looking at rawData will give you the truth however. 
             anEvent.DebugValidate();
 
+            // TODO FIX NOW, can we be more efficient?
+            if (sessionStartTimeQPC == 0)
+                sessionStartTimeQPC = rawData->EventHeader.TimeStamp;
+
             if (anEvent.FixupETLData != null)
                 anEvent.FixupETLData();
             Dispatch(anEvent);
         }
 
-        [SecuritySafeCritical]
+        // [SecuritySafeCritical]
         protected override void Dispose(bool disposing)
         {
+            stopProcessing = true;      
             if (handles != null)
             {
                 foreach (ulong handle in handles)
@@ -304,6 +339,7 @@ namespace Diagnostics.Eventing
                         TraceEventNativeMethods.CloseTrace(handle);
                 handles = null;
             }
+            logFiles = null;       
             base.Dispose(disposing);
             GC.SuppressFinalize(this);
         }
@@ -327,7 +363,10 @@ namespace Diagnostics.Eventing
                 }
                 // Annoying.  The OS resets the LogFileMode field, so I have to set it up again.   
                 if (!useClassicETW)
+                {
                     logFiles[i].LogFileMode = TraceEventNativeMethods.PROCESS_TRACE_MODE_EVENT_RECORD;
+                    logFiles[i].LogFileMode |= TraceEventNativeMethods.PROCESS_TRACE_MODE_RAW_TIMESTAMP;
+                }
 
                 handles[i] = TraceEventNativeMethods.OpenTrace(ref logFiles[i]);
 
@@ -337,7 +376,7 @@ namespace Diagnostics.Eventing
         }
 
         // Private data / methods 
-        [SecuritySafeCritical]
+        // [SecuritySafeCritical]
         [AllowReversePInvokeCalls]
         private bool TraceEventBufferCallback(IntPtr rawLogFile)
         {

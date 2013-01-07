@@ -4,24 +4,28 @@
 // This program uses code hyperlinks available as part of the HyperAddin Visual Studio plug-in.
 // It is available from http://www.codeplex.com/hyperAddin 
 // #define DEBUG_SERIALIZE
+
 using System;
 using System.Collections.Generic;
-using System.Text;
 using System.Diagnostics;
+using System.Diagnostics.Tracing;
 using System.IO;
-using System.ComponentModel; // For Win32Excption;
-using System.Runtime.InteropServices;
-using FastSerialization;
 using System.Reflection;
-using Diagnostics.Eventing;
+using System.Text;
+using System.Text.RegularExpressions;
+using Diagnostics.Tracing.Parsers;
+// For Win32Excption;
+using FastSerialization;
 using Symbols;
+using Utilities;
+using Address = System.UInt64;
 
 /* TODO current interesting places */
 /* code:#UniqueAddress code:TraceCodeAddresses.LookupSymbols */
 /* code:TraceLog.CopyRawEvents code:TraceLog.ToStream */
 
 // See code:#Introduction
-namespace Diagnostics.Eventing
+namespace Diagnostics.Tracing
 {
     /// <summary>
     /// #Introduction
@@ -59,7 +63,7 @@ namespace Diagnostics.Eventing
     ///     * code:TraceCallStack - represents a call stack associated with the event (on VISTA). It is
     ///         logically a list of code addresses (from callee to caller).    
     ///     * code:TraceCodeAddress - represents instruction pointer into the code. This can be decorated
-    ///         with symbolic informaition, (methodIndex, source line, source file) information.
+    ///         with symbolic information, (methodIndex, source line, source file) information.
     ///     * code:TraceMethod - represents a particular method.  This class allows information that is
     ///         common to many samples (it method name and source file), to be shared.  
     ///     
@@ -68,7 +72,7 @@ namespace Diagnostics.Eventing
     /// * See also code:#ProcessHandlersCalledFromTraceLog for callbacks made from code:TraceLog.CopyRawEvents
     /// * See also code:#ModuleHandlersCalledFromTraceLog for callbacks made from code:TraceLog.CopyRawEvents
     /// </summary>
-    public class TraceLog : TraceEventSource, IDisposable, IFastSerializable
+    public class TraceLog : TraceEventSource, IDisposable, IFastSerializable, IFastSerializableVersion
     {
         /// <summary>
         /// If etlxFilePath exists, it simply calls the constuctor.  However it it does not exist and a
@@ -83,12 +87,27 @@ namespace Diagnostics.Eventing
 
             // See if the etl file exists. 
             string etlFilePath = Path.ChangeExtension(etlxFilePath, ".etl");
+            bool created = false;
             if (File.Exists(etlFilePath))
             {
                 // Check that etlx is up to date.  
                 if (!File.Exists(etlxFilePath) || File.GetLastWriteTimeUtc(etlxFilePath) < File.GetLastWriteTimeUtc(etlFilePath))
+                {
                     CreateFromETL(etlFilePath, etlxFilePath, options);
+                    created = true;
+                }
             }
+            try
+            {
+                return new TraceLog(etlxFilePath);
+            }
+            catch (Exception)
+            {
+                if (created)
+                    throw;
+            }
+            // Try again to create from scratch.  
+            CreateFromETL(etlFilePath, etlxFilePath, options);
             return new TraceLog(etlxFilePath);
         }
         public static TraceLog OpenOrConvert(string etlxFilePath)
@@ -120,7 +139,11 @@ namespace Diagnostics.Eventing
             if (etlxFilePath == null)
                 etlxFilePath = Path.ChangeExtension(etlFilePath, ".etlx");
             using (ETWTraceEventSource source = new ETWTraceEventSource(etlFilePath))
+            {
+                if (source.EventsLost != 0 && options != null && options.OnLostEvents != null)
+                    options.OnLostEvents(source.EventsLost);
                 CreateFromSource(source, etlxFilePath, options);
+            }
             return etlxFilePath;
         }
         /// <summary>
@@ -142,18 +165,13 @@ namespace Diagnostics.Eventing
         /// serialization' behavior and if they are differnet we know we hav a bug.  This routine should be
         /// removed eventually, after we have high confidence that the log file works well.  
         /// </summary>
-        //TODO remove
-        // [Obsolete("Only for testing, please use CreateFromSource and open the resultint TraceLog instead")]
-        public static TraceLog CreateFromSourceTESTONLY(TraceEventDispatcher source, string etlxFilePath, TraceLogOptions options)
+        //TODO fold into CreateFromSource
+        private static TraceLog CreateFromSourceTESTONLY(TraceEventDispatcher source, string etlxFilePath, TraceLogOptions options)
         {
             if (options == null)
                 options = new TraceLogOptions();
 
             // TODO copy the additional data from a ETLX file if the source is ETLX 
-
-            // TODO handle this for real.  
-            Debug.Assert(source.EventsLost == 0, "There were " + source.EventsLost + " Events lost (can ignore)");
-
             TraceLog newLog = new TraceLog();
             newLog.rawEventSourceToConvert = source;
             newLog.options = options;
@@ -163,15 +181,40 @@ namespace Diagnostics.Eventing
                 newLog.UserData[key] = source.UserData[key];
 
             // We always create these parsers that the TraceLog knows about.
-            new KernelTraceEventParser(newLog);
-            new ClrTraceEventParser(newLog);
-            new ClrStressTraceEventParser(newLog);
             new ClrRundownTraceEventParser(newLog);
-            new DynamicTraceEventParser(newLog);
-            new WPFTraceEventParser(newLog);
-            new SymbolTraceEventParser(newLog);
-            new HeapTraceProviderTraceEventParser(source);
+            var kernelParser = newLog.Kernel;
+            var clrParser = newLog.Clr;
+            var dynamicParser = newLog.Dynamic;
 
+            // Add any Manifest.xml files to the dynamic parser 
+            if (options.ExplicitManifestDir != null)
+            {
+                if (Directory.Exists(options.ExplicitManifestDir))
+                {
+                    options.ConversionLog.WriteLine("Looking for explicit manifests in {0}", options.ExplicitManifestDir);
+                    dynamicParser.ReadAllManifests(options.ExplicitManifestDir);
+                }
+            }
+
+            dynamicParser.All += null;                  // TODO can we avoid this?  
+            new ClrStressTraceEventParser(newLog);
+            new Diagnostics.Tracing.Parsers.JScriptTraceEventParser(newLog);
+            new Diagnostics.Tracing.Parsers.JSDumpHeapTraceEventParser(newLog);
+            new AspNetTraceEventParser(newLog);
+            new TplEtwProviderTraceEventParser(newLog);
+            new SymbolTraceEventParser(newLog);
+            new HeapTraceProviderTraceEventParser(newLog);
+
+            if (options.ExplicitManifestDir != null)
+            {
+                var tmfDir = Path.Combine(options.ExplicitManifestDir, "TMF");
+                if (Directory.Exists(tmfDir))
+                {
+                    options.ConversionLog.WriteLine("Looking for WPP metaData in {0}", tmfDir);
+                    new WppTraceEventParser(newLog, tmfDir);
+                }
+            }
+            new RegisteredTraceEventParser(newLog);
 
             // Avoid partially written files by writing to a temp and moving atomically to the
             // final destination.  
@@ -222,6 +265,11 @@ namespace Diagnostics.Eventing
         public TraceCodeAddresses CodeAddresses { get { return codeAddresses; } }
 
         /// <summary>
+        /// Has summary statistics on the events in the log.  
+        /// </summary>
+        public TraceEventStats Stats { get { return stats; } }
+
+        /// <summary>
         /// If the event has a call eventToStack associated with it, retrieve it. 
         /// </summary>
         public TraceCallStack GetCallStackForEvent(TraceEvent anEvent)
@@ -240,15 +288,22 @@ namespace Diagnostics.Eventing
             return codeAddresses[codeAddressIndex];
         }
 
-        public CallStackIndex GetCallStackIndexForEvent(TraceEvent anEvent)
+        // Allow caller to store EventIndex and only convert to CallStackIndex when needed
+        public CallStackIndex GetCallStackIndexForEventIndex(EventIndex eventIndex)
         {
             // TODO optimize for sequential access.  
             lazyEventsToStacks.FinishRead();
             int index;
-            if (eventsToStacks.BinarySearch(anEvent.EventIndex, out index, stackComparer))
+            if (eventsToStacks.BinarySearch(eventIndex, out index, stackComparer))
                 return eventsToStacks[index].CallStackIndex;
             return CallStackIndex.Invalid;
         }
+
+        public CallStackIndex GetCallStackIndexForEvent(TraceEvent anEvent)
+        {
+            return GetCallStackIndexForEventIndex(anEvent.EventIndex);
+        }
+
         public CodeAddressIndex GetCodeAddressIndexAtEvent(Address address, TraceEvent context)
         {
             // TODO optimize for sequential access.  
@@ -285,6 +340,21 @@ namespace Diagnostics.Eventing
             TraceEvent anEvent = null;
             return anEvent;
         }
+        /// <summary>
+        /// The size of the log file.  
+        /// </summary>
+        public override long Size
+        {
+            get
+            {
+                return new FileInfo(etlxFilePath).Length;
+            }
+        }
+
+        /// <summary>
+        /// There is a size limit for ETLX files.  If we had to truncate becasue of this set this bit.  
+        /// </summary>
+        public bool Truncated { get { return truncated; } }
 
         /// <summary>
         /// The total number of events in the log.  
@@ -300,6 +370,24 @@ namespace Diagnostics.Eventing
         /// The machine one which the log was collected.  Returns empty string if unknown. 
         /// </summary>
         public string MachineName { get { return machineName; } }
+        /// <summary>
+        /// The name of the Operating system.  Return empty string if unknown
+        /// </summary>
+        public string OSName { get { return osName; } }
+        /// <summary>
+        /// The build number information for the OS.  Return empty string if unknown
+        /// </summary>
+        public string OSBuild { get { return osBuild; } }
+        /// <summary>
+        /// The time the machine was booted (note it can be 0 if we don't know)
+        /// </summary>
+        public DateTime BootTime { get { return DateTime.FromFileTime(bootTime100ns); } }
+        /// <summary>
+        /// Returns true if the log has information necessary to look up PDBS associated with the images
+        /// in the trace.  
+        /// </summary>
+        public bool HasPdbInfo { get { return hasPdbInfo; } }
+
         /// <summary>
         /// The size of the main memory (RAM) on the collection machine.  Will return 0 if memory size is unknown 
         /// </summary>
@@ -327,6 +415,22 @@ namespace Diagnostics.Eventing
             return sb.ToString();
         }
 
+        public int SampleProfileInterval100ns { get { return sampleProfileInterval100ns; } }
+        public bool CurrentMachineIsCollectionMachine()
+        {
+            // Trim off the domain, as there is ambiguity about whether to include that or not.  
+            var shortCurrentMachineName = Environment.MachineName;
+            var dotIdx = shortCurrentMachineName.IndexOf('.');
+            if (dotIdx > 0)
+                shortCurrentMachineName = shortCurrentMachineName.Substring(0, dotIdx);
+            var shortDataMachineName = MachineName;
+            dotIdx = shortDataMachineName.IndexOf('.');
+            if (dotIdx > 0)
+                shortDataMachineName = shortDataMachineName.Substring(0, dotIdx);
+
+            return string.Compare(shortDataMachineName, shortCurrentMachineName, StringComparison.OrdinalIgnoreCase) == 0;
+        }
+
         /// <summary>
         /// Agressively releases resources associated with the log. 
         /// </summary>
@@ -334,6 +438,11 @@ namespace Diagnostics.Eventing
         {
             lazyRawEvents.Dispose();
         }
+
+        /// <summary>
+        /// Returns all the TraceEventParsers associated with this log.  
+        /// </summary>
+        public IEnumerable<TraceEventParser> Parsers { get { return parsers; } }
 
         #region ITraceParserServices Members
 
@@ -355,7 +464,7 @@ namespace Diagnostics.Eventing
                 parser.All += null;
         }
 
-        protected override void RegisterUnhandledEventImpl(Action<TraceEvent> callback)
+        protected override void RegisterUnhandledEventImpl(Func<TraceEvent, TraceEvent> callback)
         {
             ((ITraceParserServices)sourceWithRegisteredParsers).RegisterUnhandledEvent(callback);
 
@@ -384,9 +493,26 @@ namespace Diagnostics.Eventing
             this.codeAddresses = new TraceCodeAddresses(this, this.moduleFiles);
             this.callStacks = new TraceCallStacks(this, this.codeAddresses);
             this.parsers = new List<TraceEventParser>();
+            this.stats = new TraceEventStats(this);
             this.sourceWithRegisteredParsers = new ETLXTraceEventSource(new TraceEvents(this));
             this.machineName = "";
+            this.osName = "";
+            this.osBuild = "";
+            this.sampleProfileInterval100ns = 10000;    // default is 1 msec
         }
+
+        internal override unsafe Guid GetRelatedActivityID(TraceEventNativeMethods.EVENT_RECORD* eventRecord)
+        {
+            // See code:TraceLog.ProcessExtendedData for more on our use of ExtendedData to hold a index.   
+            if (eventRecord->ExtendedDataCount == 1)
+            {
+                int idIndex = (int)eventRecord->ExtendedData;
+                if (idIndex < events.log.relatedActivityIDs.Count)
+                    return events.log.relatedActivityIDs[idIndex];
+            }
+            return Guid.Empty;
+        }
+
 
         /// <summary>
         ///  Copies the events from the 'rawEvents' dispatcher to the output stream 'IStreamWriter'.  It
@@ -394,14 +520,36 @@ namespace Diagnostics.Eventing
         ///  modules, address lookup maps...  Basically any information that needs to be determined by
         ///  scanning over the events during TraceLog creation should hook in here.  
         /// </summary>
-        private void CopyRawEvents(TraceEventDispatcher rawEvents, IStreamWriter writer)
+        unsafe private void CopyRawEvents(TraceEventDispatcher rawEvents, IStreamWriter writer)
         {
-            int lastRundownPID = -1;           
-            bool removeEventFromStream = false;
+            bool removeFromStream = false;
+            bool bookKeepingEvent = false;                  // BookKeeping events are removed from the stream by default
+            bool bookeepingEventThatMayHaveStack = false;   // Some bookeeping events (ThreadDCStart) might have stacks 
+            // To avoid firing asserts about orphan stacks, remember that these
+            // events need to be put into the 'prevEvent' info
+            bool noStack = false;                           // This event should never have a stack associated with it. 
             int numberOnPage = eventsPerPage;
             PastEventInfo pastEventInfo = new PastEventInfo(this);
-            long lastDCStart100ns = rawEvents.SessionStartTime100ns;
             eventCount = 0;
+            const int defaultMaxEventCount = 10000000;                   // 10M events produces about 3-4GB of data.  which is close to the limit of ETLX. 
+            int maxEventCount = defaultMaxEventCount;
+            long start100ns = rawEvents.SessionStartTime100ns;
+            if (options != null)
+            {
+                if (options.SkipMSec != 0)
+                    options.ConversionLog.WriteLine("Skipping the {0:n3} MSec of the trace.", options.SkipMSec);
+                if (options.MaxEventCount != 0)
+                    options.ConversionLog.WriteLine("Collecting a maximum of {0:n0} events.", options.MaxEventCount);
+                if (options.MaxEventCount > 10000)          // Numbers smaller than this are almost certainly errors
+                    maxEventCount = options.MaxEventCount;
+
+                start100ns += (long)(options.SkipMSec * 10000);
+            }
+
+            // FIX NOW HACK, because Method and Module unload methods are missing. 
+            var jittedMethods = new List<MethodLoadUnloadVerboseTraceData>();
+            var jsJittedMethods = new List<MethodLoadUnloadJSTraceData>();
+            var sourceFilesByID = new Dictionary<JavaScriptSourceKey, string>();
 
             if (!(rawEvents is ETLXTraceEventSource))
             {
@@ -413,12 +561,19 @@ namespace Diagnostics.Eventing
                 this.sessionEndTime100ns = rawEvents.SessionEndTime100ns;
                 this.sessionStartTime100ns = rawEvents.SessionStartTime100ns;
                 this.cpuSpeedMHz = rawEvents.CpuSpeedMHz;
-                this.perfFreq = rawEvents.PerfFreq;
+                this._QPCFreq = rawEvents._QPCFreq;
                 this.numberOfProcessors = rawEvents.NumberOfProcessors;
                 this.eventsLost = rawEvents.EventsLost;
+                this.osVersion = rawEvents.OSVersion;
 
                 // TODO need all events that might have Addresses in them, can we be more efficient.  
                 rawEvents.Kernel.All += delegate(TraceEvent data) { };
+                // Parse CLR events so that TDH does not try to look them up either.  TODO FIX NOW more efficient 
+                rawEvents.Clr.All += delegate(TraceEvent data) { };
+                // And the CLR Rundown events too.  
+                var ClrRundownParser = parsers[0] as ClrRundownTraceEventParser;
+                Debug.Assert(ClrRundownParser != null);     // We register this one first, so we don't have to search for it.  
+                ClrRundownParser.All += delegate(TraceEvent data) { };
 
                 Debug.Assert(((eventsPerPage - 1) & eventsPerPage) == 0, "eventsPerPage must be a power of 2");
 
@@ -427,7 +582,8 @@ namespace Diagnostics.Eventing
                 // accessed from the log, not the event.  
                 rawEvents.Kernel.EventTraceHeader += delegate(EventTraceHeaderTraceData data)
                 {
-                    removeEventFromStream = true;
+                    bootTime100ns = data.BootTime100ns;
+                    bookKeepingEvent = true;
                 };
 
                 rawEvents.Kernel.SystemConfigCPU += delegate(SystemConfigCPUTraceData data)
@@ -439,51 +595,63 @@ namespace Diagnostics.Eventing
                         this.machineName = data.ComputerName;
                 };
 
+                rawEvents.Kernel.BuildInfo += delegate(BuildInfoTraceData data)
+                {
+                    this.osName = data.ProductName;
+                    this.osBuild = data.BuildLab;
+                };
+
                 // Process level events. 
                 rawEvents.Kernel.ProcessStartGroup += delegate(ProcessTraceData data)
                 {
-                    this.processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns).ProcessStart(data);
-                    if (data.Opcode == TraceEventOpcode.DataCollectionStart)
-                    {
-                        removeEventFromStream = true;
-                        lastDCStart100ns = data.TimeStamp100ns;
-                    }
+                    this.processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns, data.Opcode == TraceEventOpcode.Start).ProcessStart(data);
+                    // Don't filter them out (not that many, useful for finding command line)
                 };
 
                 rawEvents.Kernel.ProcessEndGroup += delegate(ProcessTraceData data)
                 {
                     this.processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns).ProcessEnd(data);
-                    if (data.Opcode == TraceEventOpcode.DataCollectionStop)
-                    {
-                        this.processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns).ProcessEnd(data);
-                        removeEventFromStream = true;
-                    }
+                    // Don't filter them out (not that many, useful for finding command line)
                 };
                 // Thread level events
                 rawEvents.Kernel.ThreadStartGroup += delegate(ThreadTraceData data)
                 {
-                    TraceThread thread = this.Threads.GetOrCreateThread(this.processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns), data.ThreadID, data.TimeStamp100ns);
-                    DebugWarn(thread.startTime100ns == 0 || data.ThreadID == 0, "Thread start on an existing Thread ID " + data.ThreadID, data);
-                    DebugWarn(thread.Process.EndTime100ns == ETWTraceEventSource.MaxTime100ns, "Thread starting on ended process", data);
+                    TraceProcess process = this.processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns);
+                    TraceThread thread = this.Threads.GetOrCreateThread(data.ThreadID, data.TimeStamp100ns, process, data.Opcode == TraceEventOpcode.Start);
                     thread.startTime100ns = data.TimeStamp100ns;
                     if (data.Opcode == TraceEventOpcode.DataCollectionStart)
                     {
-                        removeEventFromStream = true;
+                        bookKeepingEvent = true;
                         thread.startTime100ns = sessionStartTime100ns;
-                        lastDCStart100ns = data.TimeStamp100ns;
+                    }
+                    else if (data.Opcode == TraceEventOpcode.Start)
+                    {
+                        var threadProc = thread.Process;
+                        if (!threadProc.anyThreads)
+                        {
+                            // We saw a real process start (not a DCStart or a non at all)
+                            if (sessionStartTime100ns < threadProc.StartTime100ns && threadProc.StartTime100ns < data.TimeStamp100ns)
+                                thread.threadInfo = "Startup Thread";
+                            threadProc.anyThreads = true;
+                        }
                     }
                 };
                 rawEvents.Kernel.ThreadEndGroup += delegate(ThreadTraceData data)
                 {
-                    TraceThread thread = this.Threads.GetOrCreateThread(this.processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns), data.ThreadID, data.TimeStamp100ns);
-                    DebugWarn(thread.startTime100ns != 0, "Thread end that was not started " + data.ThreadID, data);
-                    DebugWarn(thread.endTime100ns == ETWTraceEventSource.MaxTime100ns || thread.ThreadID == 0, "Thread end on a terminated thread " + data.ThreadID + " that ended at " + RelativeTimeMSec(thread.endTime100ns), data);
+                    TraceProcess process = this.processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns);
+                    TraceThread thread = this.Threads.GetOrCreateThread(data.ThreadID, data.TimeStamp100ns, process);
+                    if (thread.process == null)
+                        thread.process = process;
+                    Debug.Assert(thread.process == process, "Different events disagree on the process object!");
+                    DebugWarn(thread.endTime100ns == ETWTraceEventSource.MaxTime100ns || thread.ThreadID == 0,
+                        "Thread end on a terminated thread " + data.ThreadID + " that ended at " + RelativeTimeMSec(thread.endTime100ns), data);
                     DebugWarn(thread.Process.EndTime100ns == ETWTraceEventSource.MaxTime100ns, "Thread ending on ended process", data);
                     thread.endTime100ns = data.TimeStamp100ns;
                     if (data.Opcode == TraceEventOpcode.DataCollectionStop)
                     {
                         thread.endTime100ns = sessionEndTime100ns;
-                        removeEventFromStream = true;
+                        bookKeepingEvent = true;
+                        bookeepingEventThatMayHaveStack = true;
                     }
                 };
 
@@ -492,9 +660,11 @@ namespace Diagnostics.Eventing
                 ImageIDTraceData lastImageIDData = null;
                 FileVersionTraceData lastFileVersionData = null;
 
-                rawEvents.Kernel.ImageLoadGroup += delegate(ImageLoadTraceData data)
+                rawEvents.Kernel.ImageGroup += delegate(ImageLoadTraceData data)
                 {
-                    var moduleFile = this.processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns).LoadedModules.ImageLoadOrUnload(data, true);
+                    var isLoad = ((data.Opcode == (TraceEventOpcode)10) || (data.Opcode == TraceEventOpcode.DataCollectionStart));
+                    var moduleFile = this.processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns).LoadedModules.ImageLoadOrUnload(data, isLoad);
+                    // TODO FIX NOW review:  is using the timestamp the best way to make the association
                     if (lastDbgData != null && data.TimeStamp100ns == lastDbgData.TimeStamp100ns)
                     {
                         moduleFile.pdbName = lastDbgData.PdbFileName;
@@ -502,48 +672,49 @@ namespace Diagnostics.Eventing
                         moduleFile.pdbAge = lastDbgData.Age;
                     }
                     if (lastImageIDData != null && data.TimeStamp100ns == lastImageIDData.TimeStamp100ns)
-                    {
                         moduleFile.timeDateStamp = lastImageIDData.TimeDateStamp;
-                    }
                     if (lastFileVersionData != null && data.TimeStamp100ns == lastFileVersionData.TimeStamp100ns)
-                    {
                         moduleFile.fileVersion = lastFileVersionData.FileVersion;
-                    }
 
+                    /* allow these to remain in the trace.  Otherwise you can't just look at the events view and look up DLL info
+                     * which is pretty convinient.   If we have a good image view that we can remove these. 
                     if (data.Opcode == TraceEventOpcode.DataCollectionStart)
-                    {
-                        removeEventFromStream = true;
-                        lastDCStart100ns = data.TimeStamp100ns;
-                    }
-                };
-                rawEvents.Kernel.ImageUnloadGroup += delegate(ImageLoadTraceData data)
-                {
-                    this.processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns).LoadedModules.ImageLoadOrUnload(data, false);
-                    if (data.Opcode == TraceEventOpcode.DataCollectionStop)
-                    {
-                        removeEventFromStream = true;
-                    }
+                        bookKeepingEvent = true;
+                    else if (data.Opcode == TraceEventOpcode.DataCollectionStop)
+                        bookKeepingEvent = true;
+                     ***/
                 };
                 var symbolParser = new SymbolTraceEventParser(rawEvents);
 
-
+                symbolParser.None += delegate(EmptyTraceData data)
+                {
+                    // If I don't have this, the code ends up not attaching the stack to the image load which has the same timestamp. 
+                    noStack = true;
+                };
                 symbolParser.DbgIDRSDS += delegate(DbgIDRSDSTraceData data)
                 {
+                    hasPdbInfo = true;
                     lastDbgData = (DbgIDRSDSTraceData)data.Clone();
+                    noStack = true;
                 };
                 symbolParser.ImageID += delegate(ImageIDTraceData data)
                 {
                     lastImageIDData = (ImageIDTraceData)data.Clone();
+                    noStack = true;
                 };
                 symbolParser.FileVersion += delegate(FileVersionTraceData data)
                 {
                     lastFileVersionData = (FileVersionTraceData)data.Clone();
+                    noStack = true;
                 };
-
+                symbolParser.MetaData2Opcode37 += delegate
+                {
+                    noStack = true;
+                };
 
                 rawEvents.Kernel.FileIoName += delegate(FileIoNameTraceData data)
                 {
-                    removeEventFromStream = true;
+                    bookKeepingEvent = true;
                 };
 
                 rawEvents.Clr.LoaderModuleLoad += delegate(ModuleLoadUnloadTraceData data)
@@ -558,210 +729,384 @@ namespace Diagnostics.Eventing
                 {
                     this.processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns).LoadedModules.ManagedModuleLoadOrUnload(data, false);
                 };
+                ClrRundownParser.LoaderModuleDCStop += delegate(ModuleLoadUnloadTraceData data)
+                {
+                    this.processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns).LoadedModules.ManagedModuleLoadOrUnload(data, false);
+                };
 
                 // Method level events
                 rawEvents.Clr.MethodLoadVerbose += delegate(MethodLoadUnloadVerboseTraceData data)
                 {
-                    // WE only caputure data on unload, because we collect the addresses first. 
+                    // We only capture data on unload, because we collect the addresses first. 
                     if (!data.IsDynamic && !data.IsJitted)
-                        removeEventFromStream = true;
+                        bookKeepingEvent = true;
+
+                    if (data.IsJitted)
+                        jittedMethods.Add((MethodLoadUnloadVerboseTraceData)data.Clone());
                 };
                 rawEvents.Clr.MethodUnloadVerbose += delegate(MethodLoadUnloadVerboseTraceData data)
                 {
                     codeAddresses.AddMethod(data);
-
                     if (!data.IsJitted)
-                    {
-                        // Only keep the first of these per process.  This lets us see where rundown starts but otherwise
-                        // does not bloat the file. 
-                        if (data.ProcessID == lastRundownPID)
-                            removeEventFromStream = true;
-                        lastRundownPID = data.ProcessID;
-                    }
+                        bookKeepingEvent = true;
                 };
-                rawEvents.Clr.MethodDCStopVerboseV2 += delegate(MethodLoadUnloadVerboseTraceData data)
+                rawEvents.Clr.MethodILToNativeMap += delegate(MethodILToNativeMapTraceData data)
+                {
+                    codeAddresses.AddILMapping(data);
+                    bookKeepingEvent = true;
+                };
+
+                ClrRundownParser.MethodILToNativeMapDCStop += delegate(MethodILToNativeMapTraceData data)
+                {
+                    codeAddresses.AddILMapping(data);
+                    bookKeepingEvent = true;
+                };
+
+                Action<MethodLoadUnloadVerboseTraceData> onMethodDCStop = delegate(MethodLoadUnloadVerboseTraceData data)
                 {
                     codeAddresses.AddMethod(data);
-                    // Only keep the first of these per process.  This lets us see where rundown starts but otherwise
-                    // does not bloat the file. 
-                    if (data.ProcessID == lastRundownPID)
-                        removeEventFromStream = true;
-                    lastRundownPID = data.ProcessID;
+                    bookKeepingEvent = true;
                 };
 
-                int warningCount = 0;
-                int largeDeltas = 0;
-                QPCInfo[] clockInfos = new QPCInfo[rawEvents.NumberOfProcessors];
-                for (int i = 0; i < clockInfos.Length; i++)
-                    clockInfos[i] = new QPCInfo(i, rawEvents);
+                rawEvents.Clr.MethodDCStopVerboseV2 += onMethodDCStop;
+                ClrRundownParser.MethodDCStopVerbose += onMethodDCStop;
 
+                var jScriptParser = new Diagnostics.Tracing.Parsers.JScriptTraceEventParser(rawEvents);
 
-                rawEvents.Clr.ClrStackWalk += delegate(ClrStackWalkTraceData data)
+                Action<MethodLoadUnloadJSTraceData> onJScriptMethodUnload =
+                    delegate(MethodLoadUnloadJSTraceData data)
+                    {
+                        codeAddresses.AddMethod(data, sourceFilesByID);
+                        bookKeepingEvent = true;
+                    };
+
+                jScriptParser.AddToAllMatching<Diagnostics.Tracing.Parsers.SourceLoadUnloadTraceData>(
+                    delegate(Diagnostics.Tracing.Parsers.SourceLoadUnloadTraceData data)
+                    {
+                        sourceFilesByID[new JavaScriptSourceKey(data.SourceID, data.ScriptContextID)] = data.Url;
+                    });
+
+                jScriptParser.MethodRuntimeMethodUnload += onJScriptMethodUnload;
+                jScriptParser.MethodRundownMethodDCEnd += onJScriptMethodUnload;
+                jScriptParser.MethodRuntimeMethodLoad += delegate(MethodLoadUnloadJSTraceData data)
                 {
-                    PastEventInfoIndex prevEventIndex = pastEventInfo.GetPreviousEventIndex(data);
+                    jsJittedMethods.Add((MethodLoadUnloadJSTraceData)data.Clone());
+                };
+
+                // We know that Disk I/O events should never have a stack associated with them (the init events do)
+                // these sometimes have the same kernel timestamp as CSWITCHs, which cause ambiguity.  
+                rawEvents.Kernel.AddToAllMatching(delegate(DiskIoTraceData data)
+                {
+                    noStack = true;
+                });
+
+                Action<ClrStackWalkTraceData> clrStackWalk = delegate(ClrStackWalkTraceData data)
+                {
+                    bookKeepingEvent = true;
+
+                    // Avoid creating data structures for events we will throw away
+                    if (data.TimeStamp100ns < start100ns || eventCount >= maxEventCount)
+                        return;
+
+                    // Look for the previous CLR event on this same thread.  
+                    PastEventInfoIndex prevEventIndex = pastEventInfo.GetPreviousEventIndex(data, true);
                     if (prevEventIndex != PastEventInfoIndex.Invalid)
                     {
-                        var thread = Threads.GetThread(data.ThreadID, data.TimeStamp100ns);
-                        if (thread != null)
-                        {
-                            DebugWarn(false, "Could not find thread for stack.", data);
-                            return;
-                        }
-                        // TODO really need to only consider CLR events on the same thread. 
-                        CallStackIndex callStackIndex = callStacks.GetStackIndexForStackEvent(data, data.FrameCount, thread);
+                        Debug.Assert(pastEventInfo.IsClrEvent(prevEventIndex));
+                        var process = Processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns);
+                        var thread = Threads.GetOrCreateThread(data.ThreadID, data.TimeStamp100ns, process);
+
+                        CallStackIndex callStackIndex = callStacks.GetStackIndexForStackEvent(
+                            data.TimeStamp100ns, data.InstructionPointers, data.FrameCount, data.PointerSize == 8, thread);
                         Debug.Assert(callStacks.Depth(callStackIndex) == data.FrameCount);
                         DebugWarn(pastEventInfo.GetThreadID(prevEventIndex) == data.ThreadID, "Mismatched thread for CLR Stack Trace", data);
 
                         // Get the previous event on the same thread. 
                         EventIndex eventIndex = pastEventInfo.GetEventIndex(prevEventIndex);
                         eventsToStacks.Add(new EventsToStackIndex(eventIndex, callStackIndex));
+                        pastEventInfo.GetEventCounts(prevEventIndex).m_stackCount++;
                     }
                     else
                         DebugWarn(false, "Could not find a previous event for a CLR stack trace.", data);
                 };
+                rawEvents.Clr.ClrStackWalk += clrStackWalk;
 
-                rawEvents.Kernel.StackWalk += delegate(StackWalkTraceData data)
+                // Matches User and StackKeyKernel and StackKeyUser events 
+                Action<TraceEvent, StackWalkTraceData, StackWalkRefTraceData> processStackWalk = delegate(TraceEvent data, StackWalkTraceData asStackWalk, StackWalkRefTraceData asStackRef)
                 {
-                    removeEventFromStream = true;
-                    long curTimeQPC = data.EventTimeStampQPC;
-                    int procNum = data.ProcessorNumber;
-                    long expectedTime100ns = clockInfos[procNum].ExpectedTime100ns(curTimeQPC);
-#if DEBUG
-                    double expectedTimeRelMSec = RelativeTimeMSec(expectedTime100ns);
-#endif
-                    PastEventInfoIndex prevEventIndex;
-                    bool isInitialized = clockInfos[procNum].Initialized;
-                    if (isInitialized)
+                    bookKeepingEvent = true;
+                    if (data.TimeStamp100ns < start100ns || eventCount >= maxEventCount)
+                        return;
+
+                    Debug.Assert((asStackWalk != null && asStackRef == null) || (asStackRef != null && asStackWalk == null));
+
+                    var eventTimeStampQPC = data.GetInt64At(0); // This is really EventTimeStampQPC, but I need it work work for StackWalkRefTraceData and StackWalkTraceData
+                    PastEventInfoIndex prevEventIndex = pastEventInfo.GetEventForQPC(eventTimeStampQPC, data.ThreadID);
+                    if (prevEventIndex != PastEventInfoIndex.Invalid)   // Could we find an event for this stack?
                     {
-                        /*
-                        options.ConversionLog.WriteLine("Stack at {0,10:f4} Expected target event: {1,10:f4}",
-                            data.TimeStampRelativeMSec, rawEvents.RelativeTimeMSec(expectedTime100ns));
-                         */
-                        prevEventIndex = pastEventInfo.GetEventForTime(expectedTime100ns, data.ThreadID);
+                        var eventIndex = pastEventInfo.GetEventIndex(prevEventIndex);
+                        // Bookeeping events (e.g ThreadStop) that have stacks are given an event index of Invalid.
+                        // Just ignore them.  
+                        if (eventIndex == EventIndex.Invalid)
+                            return;
+
+                        // Do we have any previous stack Information on this 
+                        EventStackInfo stackInfo = pastEventInfo.GetEventStackInfo(prevEventIndex);
+                        if (stackInfo == null)
+                        {
+                            // This is the 'first fragment', create a new EventStackInfo structure.  
+                            var eventTimeStamp100ns = QPCTimeToFileTime(eventTimeStampQPC);
+                            var process = Processes.GetOrCreateProcess(data.ProcessID, eventTimeStamp100ns);
+                            var thread = Threads.GetOrCreateThread(data.ThreadID, eventTimeStamp100ns, process);
+
+                            stackInfo = AllocateEventStackInfo(eventIndex, thread, eventTimeStamp100ns);
+                            pastEventInfo.SetEventStackInfo(prevEventIndex, stackInfo); // Remember that we have info about this event.  
+                            pastEventInfo.GetEventCounts(prevEventIndex).m_stackCount++;
+                        }
+
+                        // If this is a user mode stack part, attach it to all events that have kernel traces between the event that
+                        // the user mode stack is 'attached' to and the current time.   Kernel fragments simply log the Key and exit.  
+                        for (; ; )
+                        {
+                            // Add the information from the event to the stackInfo structure. 
+                            if (stackInfo != null)
+                            {
+                                Debug.Assert(stackInfo.Thread != null);
+
+                                // Add the stack fragement to the stackInfo.  
+                                if (asStackWalk != null)
+                                    UpdateStackInfoForStackEvent(stackInfo, asStackWalk);
+                                else
+                                    UpdateStackInfoForStackEvent(stackInfo, asStackRef);
+
+                                // Check if we are doned, and if so emit the final CallStackIndex and free the StackInfo.    
+                                EmitStackForEventIfReady(stackInfo);
+                            }
+
+                            prevEventIndex = pastEventInfo.GetNextEventIndex(prevEventIndex, data.ThreadID);
+                            if (prevEventIndex == PastEventInfoIndex.Invalid)
+                                break;
+
+                            stackInfo = pastEventInfo.GetEventStackInfo(prevEventIndex);
+                        }
                     }
                     else
                     {
-                        // We have not figured out the relationship between QPC and time, so we
-                        // just look for the 'last' event on the same thread.  
-                        // options.ConversionLog.WriteLine("QPC ratio not found, using last event on same thread");
-                        prevEventIndex = pastEventInfo.GetPreviousEventIndex(data);
+                        // Warn about dropped stacks unless they occur very early in the trace
+                        var expectedTime100ns = data.source.QPCTimeToFileTime(eventTimeStampQPC);
+                        DebugWarn(expectedTime100ns < start100ns + 100000, "Stack looking up event at  " +
+                            rawEvents.RelativeTimeMSec(expectedTime100ns).ToString("f4") +
+                            " failed to find event.  Stack dropped.", data);
                     }
+                };
+                rawEvents.Kernel.AddToAllMatching<StackWalkRefTraceData>(delegate(StackWalkRefTraceData data) { processStackWalk(data, null, data); });
+                rawEvents.Kernel.StackWalk += delegate(StackWalkTraceData data) { processStackWalk(data, data, null); };
 
-                    if (prevEventIndex != PastEventInfoIndex.Invalid)
+                // Matches Delete and Rundown events;
+                rawEvents.Kernel.AddToAllMatching<StackWalkDefTraceData>(delegate(StackWalkDefTraceData data)
+                {
+                    bookKeepingEvent = true;
+
+                    // Delete or Rundown, I don't really care which.  
+                    Debug.Assert(data.Opcode == (TraceEventOpcode)35 || data.Opcode == (TraceEventOpcode)36);
+
+                    // Get the linked list of events that use this stack key.  
+                    EventStackInfo stackInfo;
+                    if (etwStackKeyToInfo.TryGetValue(data.StackKey, out stackInfo))
                     {
-                        Debug.Assert(pastEventInfo.GetThreadID(prevEventIndex) == data.ThreadID || pastEventInfo.GetThreadID(prevEventIndex) == -1);
+                        // Once we have a def, we remove it.  
+                        etwStackKeyToInfo.Remove(data.StackKey);
 
-                        long actualTime100ns = pastEventInfo.GetTimeStamp100ns(prevEventIndex);
-                        long delta = clockInfos[procNum].Update(actualTime100ns, curTimeQPC, expectedTime100ns);
-                        // options.ConversionLog.WriteLine("Found target at {0,10:f4} delta {1,4:f1},", rawEvents.RelativeTimeMSec(actualTime100ns), delta);
-
-                        if (delta > 500)
+                        EventStackInfo nextStackInfo;
+                        for (; stackInfo != null; stackInfo = nextStackInfo)
                         {
-                            if (isInitialized)
+                            Debug.Assert(stackInfo.Thread != null);
+
+                            if (!stackInfo.KernelStackDefined && stackInfo.KernelStackKey == data.StackKey)
                             {
-                                DebugWarn(warningCount > 50, "Delta between expected " +
-                                    rawEvents.RelativeTimeMSec(expectedTime100ns).ToString("f4") +
-                                    " and actual event time " +
-                                    rawEvents.RelativeTimeMSec(actualTime100ns).ToString("f4") +
-                                    " is > 50usec (" + (delta / 10) + "), dropping stack.", data);
-                                clockInfos[procNum].Reset();
-                                warningCount++;
-                            }
-                            return;
-                        }
-                        if (delta > 50 && isInitialized)
-                        {
-                            DebugWarn(warningCount > 50, "Delta between expected " +
-                                rawEvents.RelativeTimeMSec(expectedTime100ns).ToString("f4") +
-                                " and actual event time " +
-                                rawEvents.RelativeTimeMSec(actualTime100ns).ToString("f4") +
-                                " is > 5usec (" + (delta / 10) + ").", data);
-                            largeDeltas++;
-                            if (largeDeltas >= 3)
-                                clockInfos[procNum].Reset();
-                            warningCount++;
-                        }
-                        else
-                            largeDeltas = 0;
+                                nextStackInfo = stackInfo.NextEventWithKernelKey;
+                                stackInfo.NextEventWithKernelKey = null;
+                                Debug.Assert(!stackInfo.KernelStackDefined);
+                                stackInfo.KernelStackDefined = true;         // Indicate we found the def.   
 
-                        var thread = Threads.GetThread(data.ThreadID, data.TimeStamp100ns);
-                        if (thread == null)
-                        {
-                            DebugWarn(false, "Could not find thread for stack.", data);
-                            return;
-                        }
-                        // Log the stack
-                        CallStackIndex callStackIndex = callStacks.GetStackIndexForStackEvent(data, data.FrameCount, thread);
-                        Debug.Assert(callStacks.Depth(callStackIndex) == data.FrameCount || callStacks.Depth(callStackIndex) == 0);
-
-                        int prevEventsToStack = pastEventInfo.GetCallStackIndex(prevEventIndex);
-                        if (prevEventsToStack >= 0)
-                        {
-                            // If there was was already a stack, so we append to it
-                            if (pastEventInfo.GetQPCTime(prevEventIndex) == curTimeQPC)
-                            {
-                                if (data.ThreadID != 0)     // Don't bother for the idle thread (it is not unique)
+                                // If we don't have any fragment converted to a CallStackIndex, this means we have
+                                // not seen any UserMode stack.  We can't convert the kernel stack yet because we 
+                                // don't have the top of the stack yet.  So we simply remember the kernel info and go on.  
+                                // We know that the Idle and System process don't have user stacks, so we can agressively
+                                // convert them 
+                                var processID = stackInfo.Thread.Process.ProcessID;
+                                if (processID == 0 || processID == 4)
                                 {
-                                    // In addition to the event that had the same curTimeQPC, also attach the 
-                                    // stack to any other event between that time and now. 
-                                    do
-                                    {
-                                        EventsToStackIndex eventToStackEntry = eventsToStacks[prevEventsToStack];
-                                        eventToStackEntry.CallStackIndex = callStacks.Combine(eventToStackEntry.CallStackIndex, callStackIndex);
-                                        eventsToStacks[prevEventsToStack] = eventToStackEntry;
-                                        prevEventIndex = pastEventInfo.GetNextEvent(prevEventIndex, data.ThreadID);
-                                    }
-                                    while (prevEventIndex != PastEventInfoIndex.Invalid);
+                                    stackInfo.UserStackKey = ulong.MaxValue;        // Indicate done to EmitStackForEventIfReady
+                                    stackInfo.UserStackDefined = true;
+                                }
+                                else if (stackInfo.StackIndex == CallStackIndex.Invalid)
+                                {
+                                    stackInfo.KernelStackData = (StackWalkDefTraceData)data.Clone();
+                                    continue;
                                 }
                             }
                             else
-                                DebugWarn(false, "Two stack traces want to attach the event at time " +
-                                    RelativeTimeMSec(pastEventInfo.GetTimeStamp100ns(prevEventIndex)).ToString("f4"), data);
-                        }
-                        else
-                        {
-                            // Make a new stack, but also remember the index for it so we
-                            // can find it again quickly if we need to add to it.  
-                            EventIndex eventIndex = pastEventInfo.GetEventIndex(prevEventIndex);
-                            pastEventInfo.SetCallStackIndex(prevEventIndex, eventsToStacks.Count, curTimeQPC);
-                            eventsToStacks.Add(new EventsToStackIndex(eventIndex, callStackIndex));
+                            {
+                                Debug.Assert(!stackInfo.UserStackDefined);
+                                Debug.Assert(stackInfo.UserStackKey == data.StackKey);
+                                nextStackInfo = stackInfo.NextEventWithUserKey;
+                                stackInfo.NextEventWithUserKey = null;
+                                Debug.Assert(!stackInfo.UserStackDefined);
+                                stackInfo.UserStackDefined = true;
+                            }
+
+                            // Accumulate the stack fragment we just got to what we already have.  
+                            stackInfo.StackIndex = callStacks.GetStackIndexForStackEvent(stackInfo.TimeStamp100ns,
+                                data.InstructionPointers, data.FrameCount, data.PointerSize == 8, stackInfo.Thread, stackInfo.StackIndex);
+                            EmitStackForEventIfReady(stackInfo);
                         }
                     }
-                    else
+                });
+
+                // The following 3 callbacks for a small state machine to determine whether the process
+                // is running server GC and what the server GC threads are.   
+                // We assume we are server GC if there are more than one thread doing the 'MarkHandles' event
+                // during a GC, and the threads that do that are the server threads.  We use this to mark the
+                // threads as Server GC Threads.  
+                Clr.GCStart += delegate(GCStartTraceData data)
+                {
+                    var process = Processes.GetProcess(data.ProcessID, data.TimeStamp100ns);
+                    if (process == null)
+                        return;
+                    process.numMarkTheadsInGC = 0;
+                };
+                Clr.GCStop += delegate(GCEndTraceData data)
+                {
+                    var process = Processes.GetProcess(data.ProcessID, data.TimeStamp100ns);
+                    if (process == null)
+                        return;
+                    if (!process.isServerGC && process.numMarkTheadsInGC > 1)
+                        process.isServerGC = true;
+                };
+ 
+                var aspNetParser = new AspNetTraceEventParser(rawEvents);
+                aspNetParser.AspNetReqStart += delegate(AspNetStartTraceData data) { CategorizeThread(data, "Incoming Request Thread"); };
+                Clr.GCFinalizersStart += delegate(GCNoUserDataTraceData data) { CategorizeThread(data, ".NET Finalizer Thread"); };
+                Clr.ThreadPoolWorkerThreadStart += delegate(ThreadPoolWorkerThreadTraceData data) { CategorizeThread(data, ".NET ThreadPool"); };
+                Clr.ThreadPoolWorkerThreadAdjustmentSample += delegate(ThreadPoolWorkerThreadAdjustmentSampleTraceData data)
+                {
+                    CategorizeThread(data, ".NET ThreadPool");
+                };
+
+                // Attribute CPU samples to processes.
+                rawEvents.Kernel.PerfInfoSampleProf += delegate(SampledProfileTraceData data)
+                {
+                    // Avoid creating data structures for events we will throw away
+                    if (data.TimeStamp100ns < start100ns || eventCount >= maxEventCount)
+                        return;
+
+                    if (data.ThreadID == 0)    // Don't count process 0 (idle)
                     {
-                        if (expectedTime100ns > lastDCStart100ns)
-                        {
-                            double delayMsec = (data.TimeStamp100ns - expectedTime100ns) / 10000.0;
-                            if (delayMsec < 5)
-                            {
-                                DebugWarn(warningCount > 50, "Stack points to time " +
-                                    rawEvents.RelativeTimeMSec(expectedTime100ns).ToString("f4") + " but no event found.", data);
-                            }
-                            else
-                            {
-                                DebugWarn(warningCount > 50, "Lost part of stack (event happened at " + rawEvents.RelativeTimeMSec(expectedTime100ns).ToString("f4") + ").", data);
-                            }
-                            warningCount++;
-                        }
+                        removeFromStream = true;
+                        return;
                     }
+
+                    var process = Processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns);
+                    var thread = Threads.GetOrCreateThread(data.ThreadID, data.TimeStamp100ns, process);
+                    thread.cpuSamples++;
+                };
+
+                // We assume that the sampling interval is uniform over the trace.   We pick the start if it 
+                // is there, otherwise the OLD value of the LAST set interval (since we RESET the interval at the end)
+                // OR the OLD value at the end.  
+                bool setSeen = false;
+                bool startSeen = false;
+
+                rawEvents.Kernel.PerfInfoCollectionStart += delegate(SampledProfileIntervalTraceData data)
+                {
+                    startSeen = true;
+                    sampleProfileInterval100ns = data.NewInterval;
+                };
+
+                rawEvents.Kernel.PerfInfoSetInterval += delegate(SampledProfileIntervalTraceData data)
+                {
+                    setSeen = true;
+                    if (!startSeen)
+                        sampleProfileInterval100ns = data.OldInterval;
+                };
+
+                rawEvents.Kernel.PerfInfoSetInterval += delegate(SampledProfileIntervalTraceData data)
+                {
+                    if (!setSeen && !startSeen)
+                        sampleProfileInterval100ns = data.OldInterval;
                 };
             }
 
             // This callback will fire on every event that has an address that needs to be associated with
             // symbolic information (methodIndex, and source file line / name information).  
-            Action<TraceEvent, Address> addToCodeAddressMap = delegate(TraceEvent data, Address address)
+            Func<TraceEvent, Address, bool> addToCodeAddressMap = delegate(TraceEvent data, Address address)
             {
-                CodeAddressIndex codeAddressIndex = codeAddresses.GetCodeAddressIndex(data, address);
+                TraceProcess process = Processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns);
+                CodeAddressIndex codeAddressIndex = codeAddresses.GetOrCreateCodeAddressIndex(process, data.TimeStamp100ns, address);
 
                 // I require that the list be sorted by event ID.  
-                Debug.Assert(eventsToCodeAddresses.Count == 0 || eventsToCodeAddresses[eventsToCodeAddresses.Count - 1].EventIndex <= (EventIndex)eventCount);
+                Debug.Assert(eventsToCodeAddresses.Count == 0 ||
+                    eventsToCodeAddresses[eventsToCodeAddresses.Count - 1].EventIndex <= (EventIndex)eventCount);
 
                 eventsToCodeAddresses.Add(new EventsToCodeAddressIndex(MaxEventIndex, address, codeAddressIndex));
+                return true;
             };
+
+            uint rawEventCount = 0;
+            double rawInputSizeMB = rawEvents.Size / 1000000.0;
+            var startTime = DateTime.Now;
 
             // While scanning over the stream, copy all data to the file. 
             rawEvents.EveryEvent += delegate(TraceEvent data)
             {
+                // TODO FIX NOW, redundant.  Decide what to do here.  
+                if (data.ProcessID > 0)
+                {
+                    // var process = Processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns);
+                }
+
+
+                // Show status every 128K events
+                if ((rawEventCount & 0x1FFFF) == 0)
+                {
+                    if (options != null && options.ConversionLog != null)
+                    {
+                        if (rawEventCount == 0)
+                        {
+                            options.ConversionLog.WriteLine("[Opening a log file of size {0:n0} MB of duration {1:n1} sec.]",
+                                rawInputSizeMB, rawEvents.SessionDuration.TotalSeconds);
+                        }
+                        else
+                        {
+                            var curOutputSizeMB = ((double)(uint)writer.GetLabel()) / 1000000.0;
+                            var curDurationSec = (DateTime.Now - startTime).TotalSeconds;
+
+                            var ratioOutputToInput = (double)eventCount / (double)rawEventCount;
+                            var estimatedFinalSizeMB = Math.Max(rawInputSizeMB * ratioOutputToInput * 1.15, curOutputSizeMB * 1.02);
+                            var ratioSizeComplete = curOutputSizeMB / estimatedFinalSizeMB;
+                            var estTimeLeftSec = (int)(curDurationSec / ratioSizeComplete - curDurationSec);
+
+                            var message = "";
+                            if (data.TimeStamp100ns < start100ns)
+                                message = "  Before StartMSec truncating";
+                            else if (eventCount >= maxEventCount)
+                                message = "  Hit MaxEventCount, truncating.";
+
+                            options.ConversionLog.WriteLine(
+                                "[Sec {0,4:f0} Read {1,10:n0} events. At {2,7:n0}ms.  Wrote {3,4:f0}MB ({4,3:f0}%).  EstDone {5,2:f0} min {6,2:f0} sec.{7}]",
+                                curDurationSec,
+                                rawEventCount,
+                                data.TimeStampRelativeMSec,
+                                curOutputSizeMB,
+                                ratioSizeComplete * 100.0,
+                                estTimeLeftSec / 60,
+                                estTimeLeftSec % 60,
+                                message);
+                        }
+                    }
+                }
+                rawEventCount++;
 #if DEBUG
                 if (data is UnhandledTraceEvent)
                 {
@@ -770,28 +1115,63 @@ namespace Diagnostics.Eventing
                     Debug.Assert(data.OpcodeName != "ERROROPCODE");
                 }
 #endif
-                if (removeEventFromStream)
-                {
-                    removeEventFromStream = false;
+                if (data.TimeStamp100ns < start100ns || eventCount >= maxEventCount)
                     return;
+                // Sadly we have seen cases of merged ETL files where there are events past the end of the session.
+                // This confuses later logic so insure that this does not happen.  Note that we also want the
+                // any module-DCEnds to happen at sessionEndTime so we have to do this after processing all events
+                if (data.TimeStamp100ns > sessionEndTime100ns)
+                    sessionEndTime100ns = data.TimeStamp100ns;
+
+                // Update the counts
+                var countForEvent = stats.GetEventCounts(data);
+                countForEvent.m_count++;
+                countForEvent.m_eventDataLenTotal += data.EventDataLength;
+
+                if (bookKeepingEvent)
+                {
+                    bookKeepingEvent = false;
+                    if (bookeepingEventThatMayHaveStack)
+                    {
+                        // We log the event so that we don't get sperious warnings about not finding the event for a stack,
+                        // but we mark the EventIndex as invalid so that we know not to actually log this stack.  
+                        pastEventInfo.LogEvent(data, EventIndex.Invalid, countForEvent);
+                        bookeepingEventThatMayHaveStack = false;
+                    }
+                    // But unless the user explicitly asked for them, we remove them from the trace.  
+                    if (!options.KeepAllEvents)
+                        return;
+                }
+                else
+                {
+                    // Remember the event (to attach latter Stack Events) and also log event counts in TraceStats
+                    if (!noStack)
+                        pastEventInfo.LogEvent(data, removeFromStream ? EventIndex.Invalid : ((EventIndex)eventCount), countForEvent);
+                    else
+                        noStack = false;
+                    if (removeFromStream)
+                    {
+                        removeFromStream = false;
+                        if (!options.KeepAllEvents)
+                            return;
+                    }
+                    else // Remember any code address in the event.  
+                        data.LogCodeAddresses(addToCodeAddressMap);
                 }
 
-                pastEventInfo.LogEvent(data, (EventIndex)eventCount);
+                var extendedDataCount = data.eventRecord->ExtendedDataCount;
+                if (extendedDataCount != 0)
+                    ProcessExtendedData(data, extendedDataCount, countForEvent);
 
-                // options.ConversionLog.WriteLine("Event at " + data.TimeStampRelativeMSec + " ID 0x" + ((int)eventIndex).ToString("x"));
-
-                data.LogCodeAddresses(addToCodeAddressMap);       // set up Event x Address -> TraceCodeAddress table. 
                 if (numberOnPage >= eventsPerPage)
                 {
                     // options.ConversionLog.WriteLine("Writing page " + this.eventPages.BatchCount, " Start " + writer.GetLabel());
                     this.eventPages.Add(new EventPageEntry(data.TimeStamp100ns, writer.GetLabel()));
                     numberOnPage = 0;
                 }
-#if DEBUG
-                double relativeTime = data.TimeStampRelativeMSec;
-#endif
                 unsafe
                 {
+                    Debug.Assert(data.eventRecord->EventHeader.TimeStamp < long.MaxValue);
                     WriteBlob((IntPtr)data.eventRecord, writer, headerSize);
                     WriteBlob(data.userData, writer, (data.EventDataLength + 3 & ~3));
                 }
@@ -802,6 +1182,96 @@ namespace Diagnostics.Eventing
             };
 
             rawEvents.Process();                  // Run over the data. 
+            if (eventCount >= maxEventCount)
+            {
+                if (options != null && options.ConversionLog != null)
+                    options.ConversionLog.WriteLine("Trucated events to {0:n} events.  Use /MaxEventCount to change.", maxEventCount);
+            }
+
+            // Finish off the processing of the ETW compressed stacks.  This means doing all the deferred Kernel stack processing
+            // and conerting all pseudo-callStack indexes into real ones. 
+            for (int i = 0; i < activeEventStackInfos.Count; i++)
+            {
+                var stackInfo = activeEventStackInfos[i];
+                if (stackInfo.Thread != null)
+                {
+                    // we have a orphan entry.  
+                    EmitStackForEventIfReady(stackInfo, true);
+                }
+            }
+
+            freeEventStackInfos = null;
+            activeEventStackInfos.Clear();
+            etwStackKeyToInfo = null;
+
+            // TODO FIX NOW hack because unloadMethod not present 
+            foreach (var jittedMethod in jittedMethods)
+                codeAddresses.AddMethod(jittedMethod);
+
+            foreach (var jsJittedMethod in jsJittedMethods)
+                codeAddresses.AddMethod(jsJittedMethod, sourceFilesByID);
+
+            // Make sure that all threads have a process 
+            foreach (var thread in Threads)
+            {
+                if (thread.process == null)
+                {
+                    DebugWarn(true, "Warning: could not determine the process for thread " + thread.ThreadID, null);
+                    var unknownProcess = Processes.GetOrCreateProcess(-1, 0);
+                    unknownProcess.imageFileName = "UNKNOWN_PROCESS";
+                    thread.process = unknownProcess;
+                }
+                thread.Process.cpuSamples += thread.cpuSamples;         // Roll up CPU to the process. 
+            }
+
+            // Make sure we are not missing any ImageEnds that we have ImageStarts for.   
+            foreach (var process in Processes)
+            {
+                foreach (var module in process.LoadedModules)
+                {
+                    // We did not unload the module 
+                    if (module.unloadTime100ns == ETWTraceEventSource.MaxTime100ns)
+                    {
+                        // simulate a module unload, and resolve all code addresses in the module's range.   
+                        CodeAddresses.ForAllUnresolvedCodeAddressesInRange(module.ImageBase, module.ModuleFile.ImageSize, process, null,
+                            delegate(TraceProcess proc, ref TraceCodeAddresses.CodeAddressInfo info)
+                            {
+                                if (info.ModuleFileIndex == Diagnostics.Tracing.ModuleFileIndex.Invalid)
+                                    info.ModuleFileIndex = module.ModuleFile.ModuleFileIndex;
+                            });
+                    }
+                    if (module.unloadTime100ns > sessionEndTime100ns)
+                        module.unloadTime100ns = sessionEndTime100ns;
+                }
+
+                if (process.endTime100ns > sessionEndTime100ns)
+                    process.endTime100ns = sessionEndTime100ns;
+            }
+
+            // Sum up the module level statistics for code addresses.  
+            for (int codeAddrIdx = 0; codeAddrIdx < CodeAddresses.MaxCodeAddressIndex; codeAddrIdx++)
+            {
+                var inclusiveCount = CodeAddresses.codeAddresses[codeAddrIdx].InclusiveCount;
+
+                var moduleIdx = CodeAddresses.ModuleFileIndex((CodeAddressIndex)codeAddrIdx);
+                if (moduleIdx != ModuleFileIndex.Invalid)
+                {
+                    var module = CodeAddresses.ModuleFiles[moduleIdx];
+                    module.codeAddressesInModule += inclusiveCount;
+                }
+                CodeAddresses.totalCodeAddresses += inclusiveCount;
+            }
+#if DEBUG
+            // Confirm that the CPU stats make sense.  
+            foreach (var process in Processes)
+            {
+                float cpuFromThreads = 0;
+                foreach (var thread in process.Threads)
+                    cpuFromThreads += thread.CPUMSec;
+                Debug.Assert(Math.Abs(cpuFromThreads - process.CPUMSec) < .01);     // We add up 
+            }
+#endif
+            this.sessionStartTimeQPC = rawEvents.sessionStartTimeQPC;
 
             // Insert the event to stack table is in sorted order.  
             eventsToStacks.Sort(delegate(EventsToStackIndex x, EventsToStackIndex y)
@@ -809,22 +1279,300 @@ namespace Diagnostics.Eventing
                 return (int)x.EventIndex - (int)y.EventIndex;
             });
 
-            Debug.Assert(eventCount % eventsPerPage == numberOnPage || eventCount == 0);
-            options.ConversionLog.WriteLine("Got " + processes.MaxProcessIndex + " distinct processes.");
+            Debug.Assert(eventCount % eventsPerPage == numberOnPage || numberOnPage == eventsPerPage || eventCount == 0);
+            options.ConversionLog.WriteLine("{0} distinct processes.", processes.MaxProcessIndex);
             foreach (TraceProcess process in processes)
             {
                 if (process.StartTime100ns > sessionStartTime100ns && process.ExitStatus.HasValue)
-                    options.ConversionLog.WriteLine("Process " + process.Name +
-                        " started at " + process.StartTimeRelativeMsec.ToString("f3") +
-                        " and ended at " + process.EndTimeRelativeMsec.ToString("f3"));
+                    options.ConversionLog.WriteLine("  Process {0,-16} Start: {1,7:n3} End {1,7:n3}",
+                        process.Name, process.StartTimeRelativeMsec, process.EndTimeRelativeMsec);
             }
-            options.ConversionLog.WriteLine("Got " + eventCount + " events.");
-            options.ConversionLog.WriteLine("Got " + eventsToStacks.Count + " events with stack traces.");
-            options.ConversionLog.WriteLine("Got " + eventsToCodeAddresses.Count + " events with code addresses in them.");
-            options.ConversionLog.WriteLine("Got " + codeAddresses.MaxCodeAddressIndex + " unique code addresses.");
-            options.ConversionLog.WriteLine("Got " + callStacks.MaxCallStackIndex + " unique stacks.");
-            options.ConversionLog.WriteLine("Got " + codeAddresses.Methods.MaxMethodIndex + " unique managed methods parsed.");
-            options.ConversionLog.WriteLine("From " + codeAddresses.ManagedMethodRecordCount + " CLR method event records.");
+            options.ConversionLog.WriteLine("Totals");
+            options.ConversionLog.WriteLine("  {0,8:n0} events.", eventCount);
+            options.ConversionLog.WriteLine("  {0,8:n0} events with stack traces.", eventsToStacks.Count);
+            options.ConversionLog.WriteLine("  {0,8:n0} events with code addresses in them.", eventsToCodeAddresses.Count);
+            options.ConversionLog.WriteLine("  {0,8:n0} total code address instances. (stacks or other)", codeAddresses.TotalCodeAddresses);
+            options.ConversionLog.WriteLine("  {0,8:n0} unique code addresses. ", codeAddresses.MaxCodeAddressIndex);
+            options.ConversionLog.WriteLine("  {0,8:n0} unique stacks.", callStacks.MaxCallStackIndex);
+            options.ConversionLog.WriteLine("  {0,8:n0} unique managed methods parsed.", codeAddresses.Methods.MaxMethodIndex);
+            options.ConversionLog.WriteLine("  {0,8:n0} CLR method event records.", codeAddresses.ManagedMethodRecordCount);
+            this.options.ConversionLog.WriteLine("[Conversion complete {0:n0} events.  Conversion took {1:n0} sec.]",
+                eventCount, (DateTime.Now - startTime).TotalSeconds);
+        }
+
+        private void UpdateStackInfoForStackEvent(EventStackInfo stackInfo, StackWalkRefTraceData asStackRef)
+        {
+            // Insert this eventInfo into the etwStackKeyToInfo list (which holds all events that need that def)
+            EventStackInfo prevStackInfoWithSameKey;
+            etwStackKeyToInfo.TryGetValue(asStackRef.StackKey, out prevStackInfoWithSameKey);
+            var isKernelStackFragment = (asStackRef.Opcode == (TraceEventOpcode)37);
+            if (isKernelStackFragment)
+            {
+                if (stackInfo.KernelStackKey != 0)
+                {
+                    DebugWarn(stackInfo.TimeStamp100ns != QPCTimeToFileTime(asStackRef.EventTimeStampQPC), "Two kernel fragments for the same event, dropping second one.", asStackRef);
+                    return;
+                }
+                Debug.Assert(prevStackInfoWithSameKey == null || prevStackInfoWithSameKey.KernelStackKey == asStackRef.StackKey);
+                stackInfo.KernelStackKey = asStackRef.StackKey;
+                stackInfo.NextEventWithKernelKey = prevStackInfoWithSameKey;
+                etwStackKeyToInfo[asStackRef.StackKey] = stackInfo;   // Add this to the list of events needing this key defintion.  
+            }
+            else
+            {
+                Debug.Assert(asStackRef.Opcode == (TraceEventOpcode)38);    // User stack Ref. 
+                if (stackInfo.UserStackKey != 0)
+                {
+                    DebugWarn(false, "Two user fragments for the same event, dropping second one.", asStackRef);
+                    return;
+                }
+                Debug.Assert(prevStackInfoWithSameKey == null || prevStackInfoWithSameKey.UserStackKey == asStackRef.StackKey);
+                stackInfo.UserStackKey = asStackRef.StackKey;
+                stackInfo.NextEventWithUserKey = prevStackInfoWithSameKey;
+                etwStackKeyToInfo[asStackRef.StackKey] = stackInfo;   // Add this to the list of events needing this key defintion.  
+            }
+        }
+
+        unsafe private void UpdateStackInfoForStackEvent(EventStackInfo stackInfo, StackWalkTraceData asStackWalk)
+        {
+            // If we don't have a kernel entry, and this has a kernel address then we assume it is a kernel stack fragment, otherwise we assume user stack fragment. 
+            if (IsKernelAddress(asStackWalk.InstructionPointer(0), asStackWalk.PointerSize))
+            {
+                if (stackInfo.KernelStackKey != 0)
+                {
+                    DebugWarn(stackInfo.TimeStamp100ns != QPCTimeToFileTime(asStackWalk.EventTimeStampQPC), "Two kernel fragments for the same event, dropping second one.", asStackWalk);
+                    return;
+                }
+                stackInfo.KernelStackKey = ulong.MaxValue;  // we use this special value to represent 'defined by a StackWalkEvent'
+                stackInfo.KernelStackDefined = true;
+
+                // If we don't have any fragment converted to a CallStackIndex, this means we have
+                // not seen any UserMode stack.  We can't convert the kernel stack yet because we 
+                // don't have the top of the stack yet.  So we simply remember the kernel info and go on.  
+                // We know that the Idle and System process don't have user stacks, so we can agressively
+                // convert them 
+                var processID = stackInfo.Thread.Process.ProcessID;
+                if (processID == 0 || processID == 4)
+                {
+                    stackInfo.UserStackKey = ulong.MaxValue;        // Indicate done to EmitStackForEventIfReady
+                    stackInfo.UserStackDefined = true;
+                }
+                else if (stackInfo.StackIndex == CallStackIndex.Invalid)
+                {
+                    stackInfo.KernelStackData = asStackWalk.Clone();
+                    return;
+                }
+            }
+            else
+            {
+                if (stackInfo.UserStackKey != 0)
+                {
+                    DebugWarn(false, "Two user fragments for the same event, dropping second one.", asStackWalk);
+                    return;
+                }
+                stackInfo.UserStackKey = ulong.MaxValue;  // we use this special value to represent 'defined by a StackWalkEvent'
+                stackInfo.UserStackDefined = true;
+            }
+
+            // Accumulate the stack fragment we just got to what we already have.  
+            stackInfo.StackIndex = callStacks.GetStackIndexForStackEvent(stackInfo.TimeStamp100ns,
+                asStackWalk.InstructionPointers, asStackWalk.FrameCount, asStackWalk.PointerSize == 8, stackInfo.Thread, stackInfo.StackIndex);
+        }
+
+        /// <summary>
+        /// Determine if 'stackInfo' is complete and if so emit it to the 'eventsToStacks' array.  If 'force' is true 
+        /// then force what information there is out even if it is not complete (there is nothing else comming). 
+        /// </summary>
+        unsafe private void EmitStackForEventIfReady(EventStackInfo stackInfo, bool force = false)
+        {
+            if (stackInfo.UserStackDefined || force)
+            {
+                if (force)
+                {
+                    DebugWarn(stackInfo.UserStackKey == 0 || stackInfo.UserStackDefined, "Could not find Def for user stack key " + stackInfo.UserStackKey.ToString("x"), null);
+                    DebugWarn(stackInfo.KernelStackKey == 0 || stackInfo.KernelStackDefined, "Could not find Def for kernel stack key " + stackInfo.UserStackKey.ToString("x"), null);
+                }
+
+                if (stackInfo.KernelStackData != null)  // If we had to defer some KernelStack processing, do it now.  
+                {
+                    Debug.Assert(stackInfo.KernelStackDefined);
+                    var asStackWalk = stackInfo.KernelStackData as StackWalkTraceData;
+                    if (asStackWalk != null)
+                    {
+                        stackInfo.StackIndex = callStacks.GetStackIndexForStackEvent(stackInfo.TimeStamp100ns,
+                            asStackWalk.InstructionPointers, asStackWalk.FrameCount, asStackWalk.PointerSize == 8,
+                            stackInfo.Thread, stackInfo.StackIndex);
+                    }
+                    else
+                    {
+                        var asStackRef = stackInfo.KernelStackData as StackWalkDefTraceData;
+                        stackInfo.StackIndex = callStacks.GetStackIndexForStackEvent(stackInfo.TimeStamp100ns,
+                            asStackRef.InstructionPointers, asStackRef.FrameCount, asStackRef.PointerSize == 8,
+                            stackInfo.Thread, stackInfo.StackIndex);
+                    }
+                    stackInfo.KernelStackData = null;
+                }
+
+                // Do we have everything?  If so Emit the actual EventsToStackIndex entry and free the StackInfo structure. 
+                if (stackInfo.KernelStackDefined || stackInfo.KernelStackKey == 0)
+                {
+                    eventsToStacks.Add(new EventsToStackIndex(stackInfo.EventIndex, stackInfo.StackIndex));
+                    // We don't free when we force because we know we will throw things away in bulk shortly afterward.  
+                    if (!force)
+                        FreeEventStackInfo(stackInfo);
+                }
+            }
+        }
+
+        private void FreeEventStackInfo(EventStackInfo toFree)
+        {
+            toFree.Thread = null;                       // Mark as free.  
+            toFree.NextEventWithUserKey = null;         // Not strictly needed.  
+            toFree.NextEventWithKernelKey = freeEventStackInfos;
+            freeEventStackInfos = toFree;
+        }
+
+        private EventStackInfo AllocateEventStackInfo(EventIndex eventIndex, TraceThread thread, long timeStamp100ns)
+        {
+            var ret = freeEventStackInfos;
+            if (ret == null)
+            {
+                ret = new EventStackInfo();
+#if DEBUG
+                ret.Index = activeEventStackInfos.Count;        // Lets me find it
+#endif
+                activeEventStackInfos.Add(ret);     // Keep track of it.  
+            }
+            else
+            {
+                freeEventStackInfos = ret.NextEventWithKernelKey;
+                ret.NextEventWithKernelKey = null;
+                ret.NextEventWithUserKey = null;
+                ret.KernelStackData = null;
+                ret.KernelStackKey = 0;
+                ret.UserStackKey = 0;
+                ret.UserStackDefined = false;
+                ret.KernelStackDefined = false;
+            }
+            ret.StackIndex = CallStackIndex.Invalid;
+            ret.EventIndex = eventIndex;
+            ret.Thread = thread;
+            ret.TimeStamp100ns = timeStamp100ns;
+            return ret;
+        }
+
+        // Note that this contains both stack infos that are incomplete as well as free stack infos (those with Thread == null)
+        // This is used after event processing to pick up 'stragglers' that have only partial information (but we can still
+        // emit that partial infomation).  
+        GrowableArray<EventStackInfo> activeEventStackInfos;
+
+        // this is a linked list of unused EventStackInfos.  
+        EventStackInfo freeEventStackInfos;
+
+        // For event ETWStackKey we hold a linked list of EventStackInfo of events that used that key.  
+        Dictionary<Address, EventStackInfo> etwStackKeyToInfo = new Dictionary<Address, EventStackInfo>();
+
+        /// <summary>
+        /// Holds information Stacks associated with an event.  THis is a transient strucutre.  We only need it 
+        /// until all the information is collected for a particular event, at which point we can create a 
+        /// CallStackIndex for the stack and eventsToStacks table.  
+        /// </summary>
+        internal class EventStackInfo
+        {
+            // Stuff about the event itself.  
+            public EventIndex EventIndex;
+            public TraceThread Thread;      // Needed to compute very top of call stack. 
+            public long TimeStamp100ns;     // Used to look up the module.  
+            public double TimeStampRelMSec { get { return Thread.Process.Log.RelativeTimeMSec(TimeStamp100ns); } }
+
+            // The raw stack keys used in ETW compressed stacks to represent the stack fragments. 
+            public Address KernelStackKey;
+            public Address UserStackKey;
+            public bool UserStackDefined;
+            public bool KernelStackDefined;
+
+            public EventStackInfo NextEventWithKernelKey;     // We form a linked list of all events with a certain key
+            public EventStackInfo NextEventWithUserKey;       // We form a linked list of all events with a certain key
+
+            // If the kernel data comes in before the user stack (a common case), we can't create a stack index
+            // (because we don't know the thread-end of the stack), so we simply remember it. 
+            public TraceEvent KernelStackData;
+
+            // If data for the user stack comes in first, we can convert it immediately to a stack index.
+            public CallStackIndex StackIndex;
+#if DEBUG
+            public int Index;
+#endif
+        }
+
+        /// <summary>
+        /// Put the thread that owns 'data' in to the cateory 'category.  
+        /// </summary>
+        private void CategorizeThread(TraceEvent data, string category)
+        {
+            var thread = Threads.GetThread(data.ThreadID, data.TimeStamp100ns);
+            if (thread == null)
+                return;
+
+            if (thread.threadInfo == null)
+                thread.threadInfo = category;
+        }
+
+        internal static bool IsKernelAddress(Address ip, int pointerSize)
+        {
+            if (pointerSize == 4)
+                return ip >= 0x80000000;
+            return ip >= 0xFFFF000000000000;        // TODO I don't know what the true cutoff is.  
+        }
+
+        /// <summary>
+        /// Process any extended data (like Win7 style stack traces) associated with 'data'
+        /// </summary>
+        private unsafe void ProcessExtendedData(TraceEvent data, ushort extendedDataCount, TraceEventCounts countForEvent)
+        {
+            var extendedData = data.eventRecord->ExtendedData;
+            Debug.Assert(extendedData != null && extendedDataCount != 0);
+            Guid* relatedActivityIDPtr = null;
+            for (int i = 0; i < extendedDataCount; i++)
+            {
+                if (extendedData[i].ExtType == TraceEventNativeMethods.EVENT_HEADER_EXT_TYPE_STACK_TRACE64 ||
+                    extendedData[i].ExtType == TraceEventNativeMethods.EVENT_HEADER_EXT_TYPE_STACK_TRACE32)
+                {
+                    bool is64BitStacks = extendedData[i].ExtType == TraceEventNativeMethods.EVENT_HEADER_EXT_TYPE_STACK_TRACE64;
+
+                    var stackRecord = (TraceEventNativeMethods.EVENT_EXTENDED_ITEM_STACK_TRACE32*)extendedData->DataPtr;
+                    // TODO Debug.Assert(stackRecord->MatchId == 0);
+                    var addresses = &stackRecord->Address[0];
+                    var addressesCount = (extendedData->DataSize - sizeof(ulong)) / sizeof(uint);
+                    if (is64BitStacks)
+                        addressesCount /= 2;
+
+                    TraceProcess process = this.processes.GetOrCreateProcess(data.ProcessID, data.TimeStamp100ns);
+                    TraceThread thread = this.Threads.GetOrCreateThread(data.ThreadID, data.TimeStamp100ns, process);
+                    CallStackIndex callStackIndex = callStacks.GetStackIndexForStackEvent(
+                        data.TimeStamp100ns, addresses, addressesCount, is64BitStacks, thread);
+                    Debug.Assert(callStacks.Depth(callStackIndex) == addressesCount);
+
+                    // Get the previous event on the same thread. 
+                    var eventIndex = (EventIndex)eventCount;
+                    eventsToStacks.Add(new EventsToStackIndex(eventIndex, callStackIndex));
+
+                    countForEvent.m_stackCount++;   // Update stack counts
+                }
+                else if (extendedData[i].ExtType == TraceEventNativeMethods.EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID)
+                {
+                    relatedActivityIDPtr = (Guid*)(extendedData->DataPtr);
+                }
+            }
+
+            if (relatedActivityIDPtr != null)
+            {
+                // TODO This is a bit of a hack.   We wack these fields in place 
+                // We encode this as index into the relatedActivityID GrowableArray.
+                data.eventRecord->ExtendedDataCount = 1;
+                data.eventRecord->ExtendedData = (TraceEventNativeMethods.EVENT_HEADER_EXTENDED_DATA_ITEM*)relatedActivityIDs.Count;
+                relatedActivityIDs.Add(*relatedActivityIDPtr);
+            }
         }
 
         protected override internal string ProcessName(int processID, long time100ns)
@@ -841,7 +1589,7 @@ namespace Diagnostics.Eventing
         }
         unsafe private static void WriteBlob(IntPtr source, IStreamWriter writer, int byteCount)
         {
-            Debug.Assert((int)source % 4 == 0);
+            Debug.Assert(unchecked((int)source) % 4 == 0);
             Debug.Assert(byteCount % 4 == 0);
             int* sourcePtr = (int*)source;
             int intCount = byteCount >> 2;
@@ -936,10 +1684,11 @@ namespace Diagnostics.Eventing
                     positions[i] = reader.Current;
                 TraceEventNativeMethods.EVENT_RECORD* ptr = (TraceEventNativeMethods.EVENT_RECORD*)reader.GetPointer(headerSize);
 
+                // Header sanity checks.
                 Debug.Assert(ptr->EventHeader.Level <= 6);
-                Debug.Assert(ptr->EventHeader.Version <= 3);
+                Debug.Assert(ptr->EventHeader.Version <= 4);
 
-                long eventTime100ns = ptr->EventHeader.TimeStamp;
+                long eventTime100ns = QPCTimeToFileTime(ptr->EventHeader.TimeStamp);
                 Debug.Assert(sessionStartTime100ns <= eventTime100ns && eventTime100ns < DateTime.Now.Ticks || eventTime100ns == long.MaxValue);
 
                 if (eventTime100ns >= time100ns)
@@ -984,7 +1733,7 @@ namespace Diagnostics.Eventing
             // If this Assert files, fix the declaration of code:headerSize to match
             Debug.Assert(sizeof(TraceEventNativeMethods.EVENT_HEADER) == 0x50 && sizeof(TraceEventNativeMethods.ETW_BUFFER_CONTEXT) == 4);
 
-            Deserializer deserializer = new Deserializer(new PinnedStreamReader(etlxFilePath), etlxFilePath);
+            Deserializer deserializer = new Deserializer(new PinnedStreamReader(etlxFilePath, 0x10000), etlxFilePath);
 
             // when the deserializer needs a TraceLog we return the current instance.  We also assert that
             // we only do this once.  
@@ -998,16 +1747,25 @@ namespace Diagnostics.Eventing
             deserializer.RegisterFactory(typeof(TraceThreads), delegate { return new TraceThreads(null); });
             deserializer.RegisterFactory(typeof(TraceThread), delegate { return new TraceThread(0, null, (ThreadIndex)0); });
             deserializer.RegisterFactory(typeof(TraceModuleFiles), delegate { return new TraceModuleFiles(null); });
-            deserializer.RegisterFactory(typeof(TraceModuleFile), delegate { return new TraceModuleFile(null, Address.Null, 0); });
-            deserializer.RegisterFactory(typeof(TraceMethods), delegate { return new TraceMethods(); });
+            deserializer.RegisterFactory(typeof(TraceModuleFile), delegate { return new TraceModuleFile(null, 0, 0); });
+            deserializer.RegisterFactory(typeof(TraceMethods), delegate { return new TraceMethods(null); });
             deserializer.RegisterFactory(typeof(TraceCodeAddresses), delegate { return new TraceCodeAddresses(null, null); });
             deserializer.RegisterFactory(typeof(TraceCallStacks), delegate { return new TraceCallStacks(null, null); });
+            deserializer.RegisterFactory(typeof(TraceEventStats), delegate { return new TraceEventStats(null); });
+            deserializer.RegisterFactory(typeof(TraceEventCounts), delegate { return new TraceEventCounts(null, null); });
 
             deserializer.RegisterFactory(typeof(TraceLoadedModules), delegate { return new TraceLoadedModules(null); });
             deserializer.RegisterFactory(typeof(TraceLoadedModule), delegate { return new TraceLoadedModule(null, null, 0UL); });
             deserializer.RegisterFactory(typeof(TraceManagedModule), delegate { return new TraceManagedModule(null, null, 0L); });
 
-            deserializer.RegisterFactory(typeof(ProviderManifest), delegate { return new ProviderManifest(null, ManifestEnvelope.ManifestFormats.SimpleXmlFormat, 0, 0); });
+            deserializer.RegisterFactory(typeof(ProviderManifest), delegate
+            {
+                return new ProviderManifest(null, ManifestEnvelope.ManifestFormats.SimpleXmlFormat, 0, 0);
+            });
+            deserializer.RegisterFactory(typeof(DynamicTraceEventData), delegate
+            {
+                return new DynamicTraceEventData(null, 0, 0, null, Guid.Empty, 0, null, Guid.Empty, null);
+            });
 
             // when the serserializer needs any TraceEventParser class, we assume that its constructor
             // takes an argument of type TraceEventSource and that you can pass null to make an
@@ -1029,7 +1787,7 @@ namespace Diagnostics.Eventing
 
             // Sanity checking.  
             Debug.Assert(pointerSize == 4 || pointerSize == 8, "Bad pointer size");
-            Debug.Assert(100 <= cpuSpeedMHz && cpuSpeedMHz <= 10000, "Bad cpu speed");
+            Debug.Assert(10 <= cpuSpeedMHz && cpuSpeedMHz <= 100000, "Bad cpu speed");
             Debug.Assert(0 < numberOfProcessors && numberOfProcessors < 1024, "Bad number of processors");
             Debug.Assert(0 < MaxEventIndex);
 
@@ -1080,7 +1838,7 @@ namespace Diagnostics.Eventing
                 for (int i = 0; i < 11; i++)
                 {
                     if (i == 2)
-                        serializer.Write(long.MaxValue);    // This is the important field, the timestamp. 
+                        serializer.Write(long.MaxValue);
                     else
                         serializer.Write((long)0);          // The important field here is the EventDataSize field 
                 }
@@ -1096,7 +1854,12 @@ namespace Diagnostics.Eventing
             serializer.Write(pointerSize);
             serializer.Write(numberOfProcessors);
             serializer.Write(cpuSpeedMHz);
-            serializer.Write(perfFreq);
+            serializer.Write((byte)osVersion.Major);
+            serializer.Write((byte)osVersion.Minor);
+            serializer.Write((byte)osVersion.MajorRevision);
+            serializer.Write((byte)osVersion.MinorRevision);
+            serializer.Write(QPCFreq);
+            serializer.Write(sessionStartTimeQPC);
             serializer.Write(eventsLost);
             serializer.Write(machineName);
             serializer.Write(memorySizeMeg);
@@ -1104,6 +1867,7 @@ namespace Diagnostics.Eventing
             serializer.Write(processes);
             serializer.Write(threads);
             serializer.Write(codeAddresses);
+            serializer.Write(stats);
             serializer.Write(callStacks);
             serializer.Write(moduleFiles);
 
@@ -1167,14 +1931,19 @@ namespace Diagnostics.Eventing
             serializer.Write(parsers.Count);                    // redundant as a checksum
             serializer.Log("</WriteColection>\r\n");
 
-            string shortName = MachineName;
-            int dot = shortName.IndexOf('.');
-            if (dot >= 0)
-                shortName = shortName.Substring(0, dot);
-            if (shortName.Length > 0 && string.Compare(Environment.MachineName, shortName, StringComparison.OrdinalIgnoreCase) != 0)
-                options.ConversionLog.WriteLine("ERROR! Collection Machine: " + shortName +
-                    " differs from ETL conversion machine: " + Environment.MachineName + "\r\n" +
-                    "File names and symbols will not be correct!");
+            serializer.Write(sampleProfileInterval100ns);
+            serializer.Write(osName);
+            serializer.Write(osBuild);
+            serializer.Write(bootTime100ns);
+            serializer.Write(hasPdbInfo);
+
+            serializer.Log("<WriteColection name=\"m_relatedActivityIds\" count=\"" + relatedActivityIDs.Count + "\">\r\n");
+            serializer.Write(relatedActivityIDs.Count);
+            for (int i = 0; i < relatedActivityIDs.Count; i++)
+                serializer.Write(relatedActivityIDs[i]);
+            serializer.Log("</WriteColection>\r\n");
+
+            serializer.Write(truncated);
         }
         void IFastSerializable.FromStream(Deserializer deserializer)
         {
@@ -1199,7 +1968,9 @@ namespace Diagnostics.Eventing
             deserializer.Read(out pointerSize);
             deserializer.Read(out numberOfProcessors);
             deserializer.Read(out cpuSpeedMHz);
-            deserializer.Read(out perfFreq);
+            osVersion = new Version(deserializer.ReadByte(), deserializer.ReadByte(), deserializer.ReadByte(), deserializer.ReadByte());
+            deserializer.Read(out _QPCFreq);
+            deserializer.Read(out sessionStartTimeQPC);
             deserializer.Read(out eventsLost);
             deserializer.Read(out machineName);
             deserializer.Read(out memorySizeMeg);
@@ -1207,6 +1978,7 @@ namespace Diagnostics.Eventing
             deserializer.Read(out processes);
             deserializer.Read(out threads);
             deserializer.Read(out codeAddresses);
+            deserializer.Read(out stats);
             deserializer.Read(out callStacks);
             deserializer.Read(out moduleFiles);
 
@@ -1287,11 +2059,53 @@ namespace Diagnostics.Eventing
                 if (constructor == null)
                     throw new SerializationException("Type: " + fullTypeName + " does not have a constructor taking a TraceSource");
                 TraceEventParser parser = (TraceEventParser)constructor.Invoke(new object[] { this });
+
+                var asDynamic = parser as DynamicTraceEventParser;
+                if (asDynamic != null)
+                    _Dynamic = asDynamic;
+
+                var asKernel = parser as KernelTraceEventParser;
+                if (asKernel != null)
+                    _Kernel = asKernel;
+
+                var asClr = parser as ClrTraceEventParser;
+                if (asClr != null)
+                    _CLR = asClr;
+
                 parsers.Add(parser);
             }
             checkCount = deserializer.ReadInt();    // TODO make this checksumming automatic. 
             if (count != checkCount)
                 throw new SerializationException("Redundant count check fail.");
+
+            deserializer.Read(out sampleProfileInterval100ns);
+            deserializer.Read(out osName);
+            deserializer.Read(out osBuild);
+            deserializer.Read(out bootTime100ns);
+            deserializer.Read(out hasPdbInfo);
+
+            count = deserializer.ReadInt();
+            Guid guid;
+            relatedActivityIDs.Clear();
+            for (int i = 0; i < count; i++)
+            {
+                deserializer.Read(out guid);
+                relatedActivityIDs.Add(guid);
+            }
+        }
+        int IFastSerializableVersion.Version
+        {
+            get { return 36; }
+        }
+        int IFastSerializableVersion.MinimumVersionCanRead
+        {
+            // We don't support backward compatibility for now.  
+            get { return ((IFastSerializableVersion)this).Version; }
+        }
+        int IFastSerializableVersion.MinimumReaderVersion
+        {
+            // We don't support old readers reading new formats.  
+            get { return ((IFastSerializableVersion)this).Version; }
         }
 
         // headerSize is the size we persist of code:TraceEventNativeMethods.EVENT_RECORD which is up to and
@@ -1306,11 +2120,18 @@ namespace Diagnostics.Eventing
         private string etlxFilePath;
         protected long firstEventTime100ns;
         private int memorySizeMeg;
+        private string osName;
+        private string osBuild;
+        private long bootTime100ns;
+        private bool hasPdbInfo;
+        private bool truncated;     // stopped because the file was too large.  
+        private int sampleProfileInterval100ns;
         private string machineName;
         private TraceProcesses processes;
         private TraceThreads threads;
         private TraceCallStacks callStacks;
         private TraceCodeAddresses codeAddresses;
+        private TraceEventStats stats;
 
         private DeferedRegion lazyRawEvents;
         private DeferedRegion lazyEventsToStacks;
@@ -1322,11 +2143,12 @@ namespace Diagnostics.Eventing
         private GrowableArray<EventsToStackIndex> eventsToStacks;
         private GrowableArray<EventsToCodeAddressIndex> eventsToCodeAddresses;
 
-
         private TraceEventDispatcher freeLookup;    // Try to reused old ones. 
         private PinnedStreamReader freeReader;
 
         private List<TraceEventParser> parsers;
+        internal GrowableArray<Guid> relatedActivityIDs;
+
         internal ETLXTraceEventSource sourceWithRegisteredParsers;
 
         #region EventPages
@@ -1356,13 +2178,12 @@ namespace Diagnostics.Eventing
         {
             public PastEventInfo(TraceLog log)
             {
-#if DEBUG
                 this.log = log;
-#endif
                 pastEventInfo = new PastEventInfoEntry[historySize];
                 curPastEventInfo = 0;
+                Debug.Assert(((historySize - 1) & historySize) == 0);       // historySize is a power of 2 
             }
-            public void LogEvent(TraceEvent data, EventIndex eventIndex)
+            public void LogEvent(TraceEvent data, EventIndex eventIndex, TraceEventCounts countForEvent)
             {
                 int threadID = data.ThreadID;
                 // Thread an process events need to be munged slightly.  
@@ -1371,17 +2192,17 @@ namespace Diagnostics.Eventing
                     Debug.Assert(data is ProcessTraceData || data is ThreadTraceData);
                     threadID = data.ParentThread;
                 }
+
                 pastEventInfo[curPastEventInfo].ThreadID = threadID;
-                pastEventInfo[curPastEventInfo].TimeStamp100ns = data.TimeStamp100ns;
+                pastEventInfo[curPastEventInfo].QPCTime = data.TimeStampQPC;
                 pastEventInfo[curPastEventInfo].EventIndex = eventIndex;
-                pastEventInfo[curPastEventInfo].StackIndex = -1;
-#if DEBUG
-                pastEventInfo[curPastEventInfo].log = log;
-#endif
+
+                pastEventInfo[curPastEventInfo].CountForEvent = countForEvent;
+                pastEventInfo[curPastEventInfo].isClrEvent = (data.ProviderGuid == ClrTraceEventParser.ProviderGuid);
                 curPastEventInfo = (curPastEventInfo + 1) & (historySize - 1);
             }
 
-            public PastEventInfoIndex GetPreviousEventIndex(TraceEvent anEvent)
+            public PastEventInfoIndex GetPreviousEventIndex(TraceEvent anEvent, bool clrEventsOnly)
             {
                 int idx = curPastEventInfo;
                 for (int i = 0; i < historySize; i++)
@@ -1390,48 +2211,103 @@ namespace Diagnostics.Eventing
                     if (idx < 0)
                         idx = historySize - 1;
                     if (pastEventInfo[idx].ThreadID == anEvent.ThreadID)
-                        return (PastEventInfoIndex)idx;
-                    // Don't go back more than 2msec. 
-                    if (anEvent.TimeStamp100ns - pastEventInfo[idx].TimeStamp100ns > 20000)
-                        break;
-                }
-                return PastEventInfoIndex.Invalid;
-            }
-
-            // Find the closest event event on thread threadID to the given timestamp
-            public PastEventInfoIndex GetEventForTime(long timeStamp100ns, int threadID)
-            {
-                PastEventInfoIndex retIdx = PastEventInfoIndex.Invalid;
-                long lastTimeStamp100ns = long.MaxValue;
-                int idx = curPastEventInfo;
-                for (int i = 0; i < historySize; i++)
-                {
-                    --idx;
-                    if (idx < 0)
-                        idx = historySize - 1;
-                    long curTimeStamp100ns = pastEventInfo[idx].TimeStamp100ns;
-                    if (((ulong)curTimeStamp100ns + (ulong)lastTimeStamp100ns) / 2 < (ulong)timeStamp100ns)
-                        return retIdx;
-                    if (threadID == pastEventInfo[idx].ThreadID || pastEventInfo[idx].ThreadID == -1)
                     {
-                        retIdx = (PastEventInfoIndex)idx;
-                        lastTimeStamp100ns = curTimeStamp100ns;
+                        if (!clrEventsOnly || pastEventInfo[idx].isClrEvent)
+                            return (PastEventInfoIndex)idx;
                     }
                 }
                 return PastEventInfoIndex.Invalid;
             }
 
+            // Find the event event on thread threadID to the given QPC timestamp
+            public PastEventInfoIndex GetEventForQPC(long QPCTime, int threadID)
+            {
+                // There are times when we have the same timestamp for different events, thus we need to
+                // choose the best one (thread IDs match), when we also have a 'poorer' match (when we don't
+                // have a thread ID for the event) 
+                int idx = curPastEventInfo;
+                var ret = PastEventInfoIndex.Invalid;
+                bool exactMatch = false;
+                bool updateThread = false;
+                for (int i = 0; i < historySize; i++)
+                {
+                    --idx;
+                    if (idx < 0)
+                        idx = historySize - 1;
+
+                    // We match timestamps.  This is the main criteria 
+                    if (QPCTime == pastEventInfo[idx].QPCTime)
+                    {
+                        if (threadID == pastEventInfo[idx].ThreadID)
+                        {
+                            if (exactMatch)
+                            {
+                                // We hope this does not happen, ambiguity: two events with the same timestamp and thread ID. 
+                                // This seems to happen for CSWITCH and SAMPLING on the phone (where timestamps are coarse); 
+                                log.DebugWarn(false, "Two events with the same Timestamp " +
+                                    log.RelativeTimeMSec(log.QPCTimeToFileTime(QPCTime)).ToString("f4"), null);
+                            }
+
+                            exactMatch = true;
+                            ret = (PastEventInfoIndex)idx;
+                            updateThread = false;
+                        }
+                        // Some events, (like VirtualAlloc, ReadyThread) don't have the thread ID set
+                        if (pastEventInfo[idx].ThreadID == -1 && !exactMatch)
+                        {
+                            ret = (PastEventInfoIndex)idx;
+                            updateThread = true;                // we match against ThreadID == -1, remember the true thread forever.  
+                        }
+                    }
+                    // Once we found a timestamp match, we stop searching when the timestamps no longer match.   
+                    else if (ret != PastEventInfoIndex.Invalid)
+                        break;
+                }
+                // Remember the thread ID that we were 'attached to'.  
+                if (updateThread)
+                {
+                    Debug.Assert(pastEventInfo[(int)ret].ThreadID == -1);
+                    pastEventInfo[(int)ret].ThreadID = threadID;
+                }
+                return ret;
+            }
+
+            /// <summary>
+            /// Searches forward in time (until the current time) after 'eventIndex'
+            /// for events on 'threadID'.   Returns PastEventInfoIndex.Invalid if there are none
+            /// </summary>
+            public PastEventInfoIndex GetNextEventIndex(PastEventInfoIndex eventIndex, int threadID)
+            {
+                int idx = (int)eventIndex;
+                for (; ; )
+                {
+                    idx++;
+                    if (idx >= historySize)
+                        idx = 0;
+                    if (idx == curPastEventInfo)
+                        return PastEventInfoIndex.Invalid;
+                    if (pastEventInfo[idx].ThreadID == threadID)
+                        return (PastEventInfoIndex)idx;
+                }
+            }
+            public bool IsClrEvent(PastEventInfoIndex index) { return pastEventInfo[(int)index].isClrEvent; }
             public int GetThreadID(PastEventInfoIndex index) { return pastEventInfo[(int)index].ThreadID; }
             public EventIndex GetEventIndex(PastEventInfoIndex index) { return pastEventInfo[(int)index].EventIndex; }
-            public long GetTimeStamp100ns(PastEventInfoIndex index) { return pastEventInfo[(int)index].TimeStamp100ns; }
+            public TraceEventCounts GetEventCounts(PastEventInfoIndex index) { return pastEventInfo[(int)index].CountForEvent; }
             public long GetQPCTime(PastEventInfoIndex index) { return pastEventInfo[(int)index].QPCTime; }
-            public int GetCallStackIndex(PastEventInfoIndex index) { return pastEventInfo[(int)index].StackIndex; }
-
-            public void SetCallStackIndex(PastEventInfoIndex index, int stackIndex, long QPCTime)
+            public EventStackInfo GetEventStackInfo(PastEventInfoIndex index)
             {
-                pastEventInfo[(int)index].StackIndex = stackIndex;
-                pastEventInfo[(int)index].QPCTime = QPCTime;
+                var stackInfo = pastEventInfo[(int)index].EventStackInfo;
+                if (stackInfo == null)
+                    return null;
+
+                // We reuse EventStackInfos agressively, make sure that this one is for us
+                var eventIndex = GetEventIndex(index);
+                if (stackInfo.EventIndex != eventIndex || stackInfo.Thread == null)
+                    return null;
+                return stackInfo;
             }
+            public void SetEventStackInfo(PastEventInfoIndex index, EventStackInfo stackInfo) { pastEventInfo[(int)index].EventStackInfo = stackInfo; }
 
             /// <summary>
             /// Gets the next event between index and now that has a matching 'threadID'.  
@@ -1457,115 +2333,25 @@ namespace Diagnostics.Eventing
             private struct PastEventInfoEntry
             {
 #if DEBUG
-                public double TimeStampRelativeMSec { get { return log.RelativeTimeMSec(TimeStamp100ns); } }
-                public TraceLog log;
+                public double TimeStampRelativeMSec(PastEventInfo pastEventInfo)
+                { return pastEventInfo.log.RelativeTimeMSec(pastEventInfo.log.QPCTimeToFileTime(QPCTime)); }
 #endif
-                public long TimeStamp100ns;
+                public bool isClrEvent;
                 public long QPCTime;
                 public int ThreadID;
-                public int StackIndex;
+
+                public EventStackInfo EventStackInfo;   // If this event actually had a stack, this holds info about it.  
                 public EventIndex EventIndex;
+                public TraceEventCounts CountForEvent;
             }
 
-            const int historySize = 1024;          // Must be a power of 2
+            const int historySize = 8192 * 2;          // Must be a power of 2
             PastEventInfoEntry[] pastEventInfo;
             int curPastEventInfo;                   // points at the first INVALD entry.  
-#if DEBUG
             TraceLog log;
-#endif
             #endregion
-
         }
         #endregion
-
-
-        /// <summary>
-        /// Stack traces have a tick count that indicats the event associated with that stack.  We
-        /// need to convert these tick counts to normal time (adjusting for clock skew) That is
-        /// what these variables are for. 
-        /// </summary>
-        struct QPCInfo
-        {
-            public QPCInfo(int procNum, TraceEventSource source)
-            {
-                this.procNum = procNum;
-                this.source = source;
-                this.goodEstimates = 0;
-                this.baseTimeQPC = 0;
-                this.baseTime100ns = 0;
-                this.firstTimeQPC = 0;
-                this.firstTime100ns = 0;
-                this.QPCsPer100ns = 0;
-            }
-            public bool Initialized { get { return goodEstimates >= 4; } }
-            public void Reset() { goodEstimates = 0; }
-            public long ExpectedTime100ns(long curTimeQPC) { return (long)(((curTimeQPC - baseTimeQPC) / QPCsPer100ns) + .5) + baseTime100ns; }
-
-            public long Update(long actualTime100ns, long actualTimeQPC, long expectedTime100ns)
-            {
-                long delta100ns = actualTime100ns - firstTime100ns;
-                if (QPCsPer100ns == 0)
-                {
-                    if (firstTime100ns == 0)
-                    {
-                        firstTimeQPC = baseTimeQPC = actualTimeQPC;
-                        firstTime100ns = baseTime100ns = actualTime100ns;
-                    }
-                    else if (delta100ns != 0)
-                        QPCsPer100ns = ((double)(actualTimeQPC - firstTimeQPC)) / delta100ns;
-                    return long.MaxValue;
-                }
-
-                long delta = actualTime100ns - expectedTime100ns;
-                if (delta < 0)
-                    delta = -delta;
-                if (!Initialized)
-                {
-                    QPCsPer100ns = ((double)(actualTimeQPC - firstTimeQPC)) / delta100ns;
-                    baseTimeQPC = actualTimeQPC;
-                    baseTime100ns = actualTime100ns;
-
-                    // Are we pretty certain that our estimate hit the 'right' event.  
-                    if (delta < 5)
-                    {
-                        if (goodEstimates == 0)
-                        {
-                            firstTime100ns = actualTime100ns;
-                            firstTimeQPC = actualTimeQPC;
-                        }
-                        goodEstimates++;
-                    }
-                    else
-                        goodEstimates = 0;
-
-                    if (Initialized)
-                    {
-                        long startOfYear = new DateTime(DateTime.Now.Year, 1, 1).ToFileTime();
-                        double QPCStartTime = (firstTime100ns - startOfYear) - (firstTimeQPC / QPCsPer100ns);
-                        /* options.ConversionLog.WriteLine("Got QPC params. proc:{0} QPCsPerf100ns:{1:f4} QPCStart:{2:f7} sec.",
-                            procNum, QPCsPer100ns, QPCStartTime / 10000000.0);
-                         */
-                    }
-                }
-                else if (delta <= 50)
-                {
-                    if (delta < 5)
-                        QPCsPer100ns = ((double)(actualTimeQPC - firstTimeQPC)) / delta100ns;
-                    baseTimeQPC = actualTimeQPC;
-                    baseTime100ns = actualTime100ns;
-                }
-                return delta;
-            }
-
-            long baseTimeQPC;                           // The time in QueryPerformanceCounter ticks
-            long baseTime100ns;                         // The time in standard 100ns ticks
-            long firstTimeQPC;
-            long firstTime100ns;
-            double QPCsPer100ns;                        // Number of QueryPerformanceCounter ticks per 100ns
-            int goodEstimates;
-            int procNum;                                // Processor number (used for diagnostics)
-            TraceEventSource source;                    // Used for diagnostics
-        };
 
         #region EventsToStackIndex
         internal struct EventsToStackIndex
@@ -1603,10 +2389,256 @@ namespace Diagnostics.Eventing
 
         #endregion
 
-
         // These are only used when converting from ETL
-        private TraceEventDispatcher rawEventSourceToConvert;      // used to convert from raw format only.  Null for ETLX files.
+        internal TraceEventDispatcher rawEventSourceToConvert;      // used to convert from raw format only.  Null for ETLX files.
         internal TraceLogOptions options;
+        #endregion
+    }
+
+    public class TraceEventStats : IEnumerable<TraceEventCounts>, IFastSerializable
+    {
+        public int Count { get { return m_counts.Count; } }
+        public override string ToString()
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("<TraceEventStats Count=").Append(XmlUtilities.XmlQuote(Count)).AppendLine(">");
+            foreach (var counts in this)
+                sb.Append("  ").Append(counts.ToString()).AppendLine();
+            sb.AppendLine("</TraceEventStats>");
+            return sb.ToString();
+        }
+        /// <summary>
+        /// Given an event 'data' look up the statistics for events that type.  
+        /// </summary>
+        public TraceEventCounts GetEventCounts(TraceEvent data)
+        {
+            var countsForEvent = data.EventTypeUserData as TraceEventCounts;
+            if (countsForEvent == null)
+            {
+                TraceEventCounts key = new TraceEventCounts(this, data);
+                if (!m_counts.TryGetValue(key, out countsForEvent))
+                {
+                    countsForEvent = key;
+                    m_counts.Add(key, key);
+                }
+                if (!(data is UnhandledTraceEvent))
+                    data.EventTypeUserData = countsForEvent;
+            }
+#if DEBUG
+            if (data.ClassicProvider)
+            {
+                Debug.Assert(countsForEvent.m_classicProvider);
+                Debug.Assert(countsForEvent.TaskGuid == data.taskGuid);
+                if (!data.lookupAsWPP)
+                    Debug.Assert(countsForEvent.Opcode == data.Opcode);
+            }
+            else
+            {
+                Debug.Assert(!countsForEvent.m_classicProvider);
+                Debug.Assert(countsForEvent.ProviderGuid == data.ProviderGuid);
+                Debug.Assert(countsForEvent.EventID == data.ID);
+            }
+
+#endif
+            return countsForEvent;
+        }
+        #region private
+
+        void IFastSerializable.ToStream(Serializer serializer)
+        {
+            serializer.Write(m_log);
+            serializer.Write(m_counts.Count);
+            foreach (var counts in m_counts.Keys)
+                serializer.Write(counts);
+        }
+        void IFastSerializable.FromStream(Deserializer deserializer)
+        {
+            deserializer.Read(out m_log);
+            m_counts.Clear();
+            int count = deserializer.ReadInt();
+            for (int i = 0; i < count; i++)
+            {
+                TraceEventCounts elem; deserializer.Read(out elem);
+                m_counts.Add(elem, elem);
+            }
+        }
+
+        IEnumerator<TraceEventCounts> IEnumerable<TraceEventCounts>.GetEnumerator()
+        {
+            return m_counts.Keys.GetEnumerator();
+        }
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() { throw new NotImplementedException(); }
+        internal TraceEventStats(TraceLog log)
+        {
+            m_counts = new Dictionary<TraceEventCounts, TraceEventCounts>();
+            m_log = log;
+        }
+
+        Dictionary<TraceEventCounts, TraceEventCounts> m_counts;      // really a set. 
+        internal TraceLog m_log;
+        #endregion
+    }
+
+    /// <summary>
+    /// TraceEventCounts remembers some statistics about a particular event type.
+    /// An event is determined by its ETW identity (provider guid and event id for
+    /// manifest, task-opcode for classic).   This structure looks up the guid
+    /// LAZILY to find the name, which means it is the providers at USE time
+    /// not COLLECTION time that determine if names are found.  
+    /// </summary>
+    public class TraceEventCounts : IFastSerializable, IEquatable<TraceEventCounts>
+    {
+        public TraceEvent Template
+        {
+            get
+            {
+                if (!m_templateInited)
+                {
+                    m_template = m_stats.m_log.sourceWithRegisteredParsers.LookupTemplate(m_providerGuid, m_eventId, m_classicProvider);
+                    m_templateInited = true;
+                }
+                return m_template;
+            }
+        }
+        public string ProviderName
+        {
+            get
+            {
+                var template = Template;
+                if (template == null)
+                {
+                    var name = ((ITraceParserServices)m_stats.m_log).ProviderNameForGuid(m_providerGuid);
+                    if (name != null)
+                        return name;
+                    if (m_classicProvider)
+                        return "UnknownProvider";
+                    return "Provider(" + m_providerGuid.ToString() + ")";
+                }
+                return template.ProviderName;
+            }
+        }
+        public string EventName
+        {
+            get
+            {
+                var template = Template;
+                if (template == null)
+                {
+                    if (m_classicProvider)
+                    {
+                        var taskName = ((ITraceParserServices)m_stats.m_log).TaskNameForGuid(m_providerGuid);
+                        if (taskName == null)
+                            taskName = "Task(" + m_providerGuid.ToString() + ")";
+                        if (m_eventId == 0)
+                            return taskName;
+                        return taskName + "/Opcode(" + ((int)m_eventId).ToString() + ")";
+                    }
+                    return "EventID(" + ((int)m_eventId).ToString() + ")";
+                }
+                return template.EventName;
+            }
+        }
+        public bool IsClassic { get { return m_classicProvider; } }
+
+        // Only meaningful if event is Manifest based (not classic)
+        public Guid ProviderGuid { get { if (m_classicProvider) return Guid.Empty; else return m_providerGuid; } }
+        public TraceEventID EventID { get { if (m_classicProvider) return TraceEventID.Illegal; else return m_eventId; } }
+
+        // Only meaningful if the event is classic 
+        public Guid TaskGuid { get { if (m_classicProvider) return m_providerGuid; else return Guid.Empty; } }
+        public TraceEventOpcode Opcode { get { if (m_classicProvider) return (TraceEventOpcode)m_eventId; else return TraceEventOpcode.Info; } }
+
+        public double AveragePayloadSize { get { return ((double)m_eventDataLenTotal) / m_count; } }
+        public int Count { get { return m_count; } }
+        public int StackCount { get { return m_stackCount; } }
+        public string FullName
+        {
+            get
+            {
+                return ProviderName + "/" + EventName;
+            }
+        }
+        public override string ToString()
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("<TraceEventCounts");
+            // TODO put in GUID, ID?  
+            sb.Append(" ProviderName=").Append(XmlUtilities.XmlQuote(Template.ProviderName));
+            sb.Append(" EventName=").Append(XmlUtilities.XmlQuote(Template.EventName));
+            sb.Append(" Count=").Append(XmlUtilities.XmlQuote(Count));
+            sb.Append(" StackCount=").Append(XmlUtilities.XmlQuote(StackCount));
+            sb.AppendLine("/>");
+            return sb.ToString();
+        }
+        #region private
+        internal unsafe TraceEventCounts(TraceEventStats stats, TraceEvent data)
+        {
+            if (data == null)       // This happens in the deserialization case.  
+                return;
+            m_stats = stats;
+
+            if (data.ClassicProvider)
+            {
+                m_providerGuid = data.taskGuid;
+
+                // We use the sum of the opcode and eventID so that it works with WPP as well as classic.  
+                Debug.Assert(data.eventRecord->EventHeader.Id == 0 || data.eventRecord->EventHeader.Opcode == 0);
+                m_eventId = (TraceEventID)(data.eventRecord->EventHeader.Id + data.eventRecord->EventHeader.Opcode);
+                m_classicProvider = true;
+            }
+            else
+            {
+                m_providerGuid = data.ProviderGuid;
+                m_eventId = data.ID;
+            }
+        }
+
+        bool IEquatable<TraceEventCounts>.Equals(TraceEventCounts other)
+        {
+            if (m_eventId != other.m_eventId)
+                return false;
+            if (m_classicProvider != other.m_classicProvider)
+                return false;
+            return (m_providerGuid == other.m_providerGuid);
+        }
+        public override int GetHashCode()
+        {
+            return m_providerGuid.GetHashCode() + (int)m_eventId;
+        }
+
+        void IFastSerializable.ToStream(Serializer serializer)
+        {
+            serializer.Write(m_stats);
+            serializer.Write(m_providerGuid);
+            serializer.Write((int)m_eventId);
+            serializer.Write(m_classicProvider);
+            serializer.Write(m_count);
+            serializer.Write(m_stackCount);
+            serializer.Write(m_eventDataLenTotal);
+        }
+        void IFastSerializable.FromStream(Deserializer deserializer)
+        {
+            deserializer.Read(out m_stats);
+            deserializer.Read(out m_providerGuid);
+            m_eventId = (TraceEventID)deserializer.ReadInt();
+            deserializer.Read(out m_classicProvider);
+            deserializer.Read(out m_count);
+            deserializer.Read(out m_stackCount);
+            deserializer.Read(out m_eventDataLenTotal);
+        }
+
+        TraceEventStats m_stats;
+        internal bool m_classicProvider;     // This changes the meaning of m_providerGuid and m_eventId;
+        internal Guid m_providerGuid;        // If classic this is task Guid
+        TraceEventID m_eventId;              // If classic this is the opcode
+
+        internal long m_eventDataLenTotal;
+        internal int m_count;
+        internal int m_stackCount;
+
+        // Not serialized
+        bool m_templateInited;
+        TraceEvent m_template;
         #endregion
     }
 
@@ -1634,13 +2666,6 @@ namespace Diagnostics.Eventing
             return new TraceEvents(log, startTime100ns, endTime100ns, predicate, true);
         }
         /// <summary>
-        /// Filter the events by time.  Startime is INCLUSIVE. 
-        /// </summary>
-        public TraceEvents FilterByTime(DateTime startTime)
-        {
-            return FilterByTime(startTime.ToFileTime());
-        }
-        /// <summary>
         /// Filter the events by time.  both startime and endTime are INCLUSIVE. 
         /// </summary>
         public TraceEvents FilterByTime(DateTime startTime, DateTime endTime)
@@ -1648,11 +2673,11 @@ namespace Diagnostics.Eventing
             return FilterByTime(startTime.ToFileTime(), endTime.ToFileTime());
         }
         /// <summary>
-        /// Filter the events by time.  Startime is INCLUSIVE. 
+        /// Filters by time expressed as MSec from the start of the trace. 
         /// </summary>
-        public TraceEvents FilterByTime(long startTime100ns)
+        public TraceEvents FilterByTime(double startTimeRelMSec, double endTimeRelMSec)
         {
-            return Filter(startTime100ns, long.MaxValue, null);
+            return FilterByTime(Log.RelativeTimeMSecTo100ns(startTimeRelMSec), Log.RelativeTimeMSecTo100ns(endTimeRelMSec));
         }
         /// <summary>
         /// Filter the events by time.  both startTime100ns and endTime100ns are INCLUSIVE. 
@@ -1684,7 +2709,7 @@ namespace Diagnostics.Eventing
         internal TraceEvents(TraceLog log)
         {
             this.log = log;
-            this.endTime100ns = long.MaxValue;
+            this.endTime100ns = long.MaxValue - 100000000; // ten seconds from infinity
         }
         internal TraceEvents(TraceLog log, long startTime100ns, long endTime100ns, Predicate<TraceEvent> predicate, bool backwards)
         {
@@ -1756,16 +2781,15 @@ namespace Diagnostics.Eventing
                 // Confirm we have a half-way sane event, to catch obvious loss of sync.  
                 Debug.Assert(ret.Level <= (TraceEventLevel)64);
                 Debug.Assert(ret.Version <= 4);
-                Debug.Assert(ret.TimeStamp100ns == long.MaxValue ||
-                    events.Log.SessionStartTime100ns <= ret.TimeStamp100ns && ret.TimeStamp100ns <= events.Log.SessionEndTime100ns + 50000000);
-                // TODO 50000000 arbitrary.   Fix underlying problem with merged ETL files.  
 
                 // We have to insure we have a pointer to the whole blob, not just the header.  
                 int totalLength = TraceLog.headerSize + (ret.EventDataLength + 3 & ~3);
-                Debug.Assert(totalLength < 0x20000);
+                Debug.Assert(totalLength < 0x10000);
                 ret.eventRecord = (TraceEventNativeMethods.EVENT_RECORD*)reader.GetPointer(totalLength);
                 ret.userData = TraceEventRawReaders.Add((IntPtr)ret.eventRecord, TraceLog.headerSize);
                 reader.Skip(totalLength);
+
+                ret.DebugValidate();
                 return ret;
             }
 
@@ -1792,7 +2816,7 @@ namespace Diagnostics.Eventing
                 for (; ; )
                 {
                     current = GetNext();
-                    if (current.TimeStamp100ns > events.endTime100ns || current.TimeStamp100ns == long.MaxValue)
+                    if (current.TimeStampQPC == long.MaxValue || current.TimeStamp100ns > events.endTime100ns)
                         return false;
 
                     // TODO confirm this works with nested predicates
@@ -1861,7 +2885,7 @@ namespace Diagnostics.Eventing
     /// <summary>
     /// We give each process a unique index from 0 to code:TraceProcesses.MaxProcessIndex. Thus it is unique
     /// within the whole code:TraceLog. You are explictly allowed take advantage of the fact that this number
-    /// is in the range from 0 to code:TracesProcesses.BatchCount (you can create arrays indexed by
+    /// is in the range from 0 to code:TracesProcesses.MaxProcessIndex (you can create arrays indexed by
     /// code:ProcessIndex). We create the Enum because the strong typing avoids a class of user errors.
     /// </summary>
     public enum ProcessIndex { Invalid = -1 };
@@ -1905,24 +2929,16 @@ namespace Diagnostics.Eventing
         }
         /// <summary>
         /// Given a OS process ID and a time, return the last code:TraceProcess that has the same process ID,
-        /// and whose offset time is less than 'time100ns'. If 'time100ns' is during the threads lifetime this
+        /// and whose offset start time is less than 'time100ns'. If 'time100ns' is during the threads lifetime this
         /// is guarenteed to be the correct process. Using time100ns = code:TraceLog.SessionEndTime100ns will return the
         /// last process with the given PID, even if it had died.
         /// </summary>
         public TraceProcess GetProcess(int processID, long time100ns)
         {
             int index;
-            return FindProcessAndIndex(processID, time100ns, out index);
+            var ret = FindProcessAndIndex(processID, time100ns, out index);
+            return ret;
         }
-        /// <summary>
-        /// Given a thread ID and a time, find the process associated with the thread.  
-        /// </summary>
-        [Obsolete("Use log.Threads.GetThread(int threadID, long time100ns).Process")]
-        public TraceProcess GetProcessForThreadID(int threadID, long time100ns)
-        {
-            return log.Threads.GetThread(threadID, time100ns).Process;
-        }
-
         /// <summary>
         /// Return the last process in the log with the given process ID.  Useful when the logging session
         /// was stopped just after the processes completed (a common scenario).  
@@ -1935,27 +2951,32 @@ namespace Diagnostics.Eventing
         }
 
         /// <summary>
-        /// Gets the first process (in time) that has the name 'processName'. The name of a process is the file
-        /// name (not full path), without its extension. Returns null on failure
-        /// </summary>
-        public TraceProcess FirstProcessWithName(string processName)
-        {
-            return FirstProcessWithName(processName, 0);
-        }
-        /// <summary>
         /// Gets the first process (in time) that has the name 'processName' that started after 'afterTime'
         /// (inclusive). The name of a process is the file name (not full path), without its extension. Returns
         /// null on failure
         /// </summary>
-        public TraceProcess FirstProcessWithName(string processName, long afterTime100ns)
+        public TraceProcess FirstProcessWithName(string processName, long afterTime100ns = 0)
         {
             for (int i = 0; i < MaxProcessIndex; i++)
             {
                 TraceProcess process = processes[i];
-                if (afterTime100ns <= process.StartTime100ns && string.Compare(process.Name, processName, StringComparison.OrdinalIgnoreCase) == 0)
+                if (afterTime100ns <= process.StartTime100ns &&
+                    string.Compare(process.Name, processName, StringComparison.OrdinalIgnoreCase) == 0)
                     return process;
             }
             return null;
+        }
+        public TraceProcess LastProcessWithName(string processName, long afterTime100ns = 0)
+        {
+            TraceProcess ret = null;
+            for (int i = 0; i < MaxProcessIndex; i++)
+            {
+                TraceProcess process = processes[i];
+                if (afterTime100ns <= process.StartTime100ns &&
+                    string.Compare(process.Name, processName, StringComparison.OrdinalIgnoreCase) == 0)
+                    ret = process;
+            }
+            return ret;
         }
 
         public override string ToString()
@@ -1982,19 +3003,34 @@ namespace Diagnostics.Eventing
             this.processes = new GrowableArray<TraceProcess>(64);
             this.processesByPID = new GrowableArray<TraceProcess>(64);
         }
-        internal TraceProcess GetOrCreateProcess(int processID, long time100ns)
+        internal TraceProcess GetOrCreateProcess(int processID, long time100ns, bool isProcessStartEvent = false)
         {
             Debug.Assert(processes.Count == processesByPID.Count);
             int index;
-            TraceProcess newProcess = FindProcessAndIndex(processID, time100ns, out index);
-            if (newProcess == null)
+            TraceProcess retProcess = FindProcessAndIndex(processID, time100ns, out index);
+            if (retProcess == null || isProcessStartEvent)
             {
-                newProcess = new TraceProcess(processID, log, (ProcessIndex)processes.Count);
-                processes.Add(newProcess);
-                processesByPID.Insert(index + 1, newProcess);
+                // We can have events before process start, (sigh) so fix that.  
+                if (retProcess != null && isProcessStartEvent)
+                {
+                    // If the process entry we found does not have a start or an end, then it is orphaned 
+                    if (retProcess.StartTime100ns == 0 && retProcess.EndTime100ns == ETWTraceEventSource.MaxTime100ns)
+                    {
+                        // it should be within 10msec (or it is the Process DCStart and this firstEvent was the log header (which has time offset 0
+                        log.DebugWarn(time100ns - retProcess.firstEvent100ns < 10 * 10000 || retProcess.firstEvent100ns == 0,
+                            "Events occured > 10msec before process " + processID.ToString() +
+                            " start at " + log.RelativeTimeMSec(retProcess.firstEvent100ns).ToString("f3") + " msec", null);
+                        return retProcess;
+                    }
+                }
+                retProcess = new TraceProcess(processID, log, (ProcessIndex)processes.Count);
+                retProcess.firstEvent100ns = time100ns;
+                processes.Add(retProcess);
+                processesByPID.Insert(index + 1, retProcess);
             }
-            return newProcess;
+            return retProcess;
         }
+
         internal TraceProcess FindProcessAndIndex(int processID, long time100ns, out int index)
         {
             if (processesByPID.BinarySearch(processID, out index, compareByProcessID))
@@ -2005,20 +3041,10 @@ namespace Diagnostics.Eventing
                     if (candidate.ProcessID != processID)
                         break;
 
-                    // Note that I take the last process that has a offset time that preceeds this one. We do this
-                    // because some events associated with the process (eg ImageUnload, can seem to occur after
-                    // the process has indicated it ended)
-                    if (candidate.StartTime100ns <= time100ns)
+                    if (candidate.firstEvent100ns <= time100ns)
                     {
                         index = candidateIndex;
                         return candidate;
-                    }
-                    else
-                    {
-                        // Early in the log, before all the Process DCStart have happened, you can get this.
-                        // TODO This is mostly for my debugging, as it should rarely happen 
-                        if (Log.RelativeTimeMSec(time100ns) > 1000)
-                            Log.DebugWarn(false, "Event at " + Log.RelativeTimeMSec(time100ns) + " used process ID " + processID + " before process start.", null);
                     }
                 }
             }
@@ -2092,8 +3118,8 @@ namespace Diagnostics.Eventing
         /// </summary>
         public int ProcessID { get { return processID; } }
         /// <summary>
-        /// The index into the logical array of code:TraceProcesses for this process.  Unlike ProcessIndex (which
-        /// may be reused after the process dies, the process index is unique over the log.  
+        /// The index into the logical array of code:TraceProcesses for this process.  Unlike ProcessID (which
+        /// may be reused after the process dies, the process index is unique in the log. 
         /// </summary>
         public ProcessIndex ProcessIndex { get { return processIndex; } }
         /// <summary>
@@ -2140,6 +3166,19 @@ namespace Diagnostics.Eventing
         public int ParentID { get { return parentID; } }
         public TraceProcess Parent { get { return parent; } }
         public int? ExitStatus { get { return exitStatus; } }
+        public float CPUMSec { get { return cpuSamples * (Log.SampleProfileInterval100ns / 10000.0F); } }
+        /// <summary>
+        /// Is the process a 64 bit process
+        /// </summary>
+        public bool Is64Bit
+        {
+            get
+            {
+                // We are 64 bit if any module was loaded high or
+                // (if we are on a 64 bit and there were no modules loaded, we assume we are the OS system process)
+                return loadedAModuleHigh || (!anyModuleLoaded && log.PointerSize == 8);
+            }
+        }
 
         /// <summary>
         /// Filters events to only those for a particular process. 
@@ -2187,6 +3226,8 @@ namespace Diagnostics.Eventing
             sb.Append("End=").Append(XmlUtilities.XmlQuote(EndTimeRelativeMsec)).Append(" ");
             if (ExitStatus.HasValue)
                 sb.Append("ExitStatus=").Append(XmlUtilities.XmlQuote(ExitStatus.Value)).Append(" ");
+            sb.Append("CPUMSec=").Append(XmlUtilities.XmlQuote(CPUMSec)).Append(" ");
+            sb.Append("Is64Bit=").Append(XmlUtilities.XmlQuote(Is64Bit)).Append(" ");
             sb.Append("CommandLine=").Append(XmlUtilities.XmlQuote(CommandLine)).Append(" ");
             sb.Append("/>");
             return sb.ToString();
@@ -2199,7 +3240,7 @@ namespace Diagnostics.Eventing
         // called from code:TraceLog.CopyRawEvents
         internal void ProcessStart(ProcessTraceData data)
         {
-            Log.DebugWarn(StartTime100ns == 0, "Events for process happen before process start.  PrevEventTime: " + Log.RelativeTimeMSec(StartTime100ns), data);
+            Log.DebugWarn(parentID == 0, "Events for process happen before process start.  PrevEventTime: " + Log.RelativeTimeMSec(StartTime100ns), data);
 
             if (data.Opcode == TraceEventOpcode.DataCollectionStart)
                 this.startTime100ns = log.SessionStartTime100ns;
@@ -2216,11 +3257,16 @@ namespace Diagnostics.Eventing
         }
         internal void ProcessEnd(ProcessTraceData data)
         {
-            Log.DebugWarn(StartTime100ns != 0, "Process End without a start.", data);
+            if (this.commandLine.Length == 0)
+                this.commandLine = data.CommandLine;
+            this.imageFileName = data.ImageFileName;        // Always overwrite as we might have guessed via the image loads
+            if (this.parentID == 0 && data.ParentID != 0)
+            {
+                this.parentID = data.ParentID;
+                this.parent = log.Processes.GetProcess(data.ParentID, data.TimeStamp100ns);
+            }
 
-            if (data.Opcode == TraceEventOpcode.DataCollectionStop)
-                this.endTime100ns = log.SessionEndTime100ns;
-            else
+            if (data.Opcode != TraceEventOpcode.DataCollectionStop)
             {
                 Debug.Assert(data.Opcode == TraceEventOpcode.Stop);
                 // Only set the exit code if it really is a process exit (not a DCEnd). 
@@ -2255,13 +3301,16 @@ namespace Diagnostics.Eventing
             serializer.Write(log);
             serializer.Write(commandLine);
             serializer.Write(imageFileName);
+            serializer.Write(firstEvent100ns);
             serializer.Write(startTime100ns);
             serializer.Write(endTime100ns);
             serializer.Write(exitStatus);
             serializer.Write(parentID);
             serializer.Write(parent);
-            serializer.Write(threads);
             serializer.Write(loadedModules);
+            serializer.Write(cpuSamples);
+            serializer.Write(loadedAModuleHigh);
+            serializer.Write(anyModuleLoaded);
         }
 
         void IFastSerializable.FromStream(Deserializer deserializer)
@@ -2271,13 +3320,16 @@ namespace Diagnostics.Eventing
             deserializer.Read(out log);
             deserializer.Read(out commandLine);
             deserializer.Read(out imageFileName);
+            deserializer.Read(out firstEvent100ns);
             deserializer.Read(out startTime100ns);
             deserializer.Read(out endTime100ns);
             deserializer.Read(out exitStatus);
             deserializer.Read(out parentID);
             deserializer.Read(out parent);
-            deserializer.Read(out threads);
             deserializer.Read(out loadedModules);
+            deserializer.Read(out cpuSamples);
+            deserializer.Read(out loadedAModuleHigh);
+            deserializer.Read(out anyModuleLoaded);
         }
 
         private int processID;
@@ -2285,16 +3337,24 @@ namespace Diagnostics.Eventing
         private TraceLog log;
 
         private string commandLine;
-        private string imageFileName;
+        internal string imageFileName;
         private string name;
-        private long startTime100ns;
-        private long endTime100ns;
+        internal long firstEvent100ns;      // Sadly there are events before process start.   This is minimum of those times.  
+        internal long startTime100ns;
+        internal long endTime100ns;
         private int? exitStatus;
         private int parentID;
         private TraceProcess parent;
 
+        internal int cpuSamples;
+        internal bool loadedAModuleHigh;    // Was any module loaded above 0x100000000?  (which indicates it is a 64 bit process)
+        internal bool anyModuleLoaded;
+        internal bool anyThreads;
+
+        internal bool isServerGC;
+        internal byte numMarkTheadsInGC;   // Used during collection to determine if we are server GC or not. 
+
         private TraceLoadedModules loadedModules;
-        private TraceThreads threads;
         #endregion
     }
 
@@ -2344,20 +3404,40 @@ namespace Diagnostics.Eventing
         /// </summary>
         public TraceThread GetThread(int threadID, long time100ns)
         {
-            // Create a cache for this because it can be common
-            if (threadIDtoThread == null)
-            {
-                threadIDtoThread = new HistoryDictionary<TraceThread>(1000);
-                for (int i = 0; i < threads.Count; i++)
-                {
-                    var thread = threads[i];
-                    threadIDtoThread.Add((Address)thread.ThreadID, thread.startTime100ns, thread);
-                }
-            }
-
+            InitThread();
             TraceThread ret;
             threadIDtoThread.TryGetValue((Address)threadID, time100ns, out ret);
             return ret;
+        }
+        /// <summary>
+        /// Get the thread for threadID and time100ns.   Create if necessary.  If 'isThreadCreateEvent' is true, 
+        /// then force  the creation of a new thread EVEN if the thread exist since we KNOW it is a new thread 
+        /// (and somehow we missed the threadEnd event).   Process is the process associated with the thread.  
+        /// It can be null if you really don't know the process ID.  We will try to fill it in on another event
+        /// where we DO know the process id (ThreadEnd event).     
+        /// </summary>
+        internal TraceThread GetOrCreateThread(int threadID, long time100ns, TraceProcess process, bool isThreadCreateEvent = false)
+        {
+            TraceThread retThread = GetThread(threadID, time100ns);
+            if (retThread == null || isThreadCreateEvent)
+            {
+                InitThread();
+
+                if (process == null)
+                    process = log.Processes.GetOrCreateProcess(-1, time100ns);      // Unknown process
+
+                retThread = new TraceThread(threadID, process, (ThreadIndex)threads.Count);
+                if (isThreadCreateEvent)
+                    retThread.startTime100ns = time100ns;
+                threads.Add(retThread);
+                threadIDtoThread.Add((Address)threadID, time100ns, retThread);
+            }
+
+            // Set the process if we had to set this threads process ID to the 'unknown' process.  
+            if (process != null && retThread.process.ProcessID == -1)
+                retThread.process = process;
+
+            return retThread;
         }
 
         public override string ToString()
@@ -2378,17 +3458,18 @@ namespace Diagnostics.Eventing
         {
             this.log = log;
         }
-        internal TraceThread GetOrCreateThread(TraceProcess process, int threadID, long time100ns)
+        private void InitThread()
         {
-            Debug.Assert(threads.Count == threads.Count);
-            TraceThread newThread = GetThread(threadID, time100ns);
-            if (newThread == null)
+            // Create a cache for this because it can be common
+            if (threadIDtoThread == null)
             {
-                newThread = new TraceThread(threadID, process, (ThreadIndex)threads.Count);
-                threads.Add(newThread);
-                threadIDtoThread.Add((Address)threadID, time100ns, newThread);
+                threadIDtoThread = new HistoryDictionary<TraceThread>(1000);
+                for (int i = 0; i < threads.Count; i++)
+                {
+                    var thread = threads[i];
+                    threadIDtoThread.Add((Address)thread.ThreadID, thread.startTime100ns, thread);
+                }
             }
-            return newThread;
         }
 
         void IFastSerializable.ToStream(Serializer serializer)
@@ -2437,8 +3518,8 @@ namespace Diagnostics.Eventing
         /// </summary>
         public int ThreadID { get { return threadID; } }
         /// <summary>
-        /// The index into the logical array of code:TraceProcesses for this process.  Unlike ProcessIndex (which
-        /// may be reused after the process dies, the process index is unique over the log.  
+        /// The index into the logical array of code:TraceThreads for this process.  Unlike ThreadId (which
+        /// may be reused after the trhead dies, the T index is unique over the log.  
         /// </summary>
         public ThreadIndex ThreadIndex { get { return threadIndex; } }
         /// <summary>
@@ -2451,6 +3532,7 @@ namespace Diagnostics.Eventing
         public DateTime EndTime { get { return DateTime.FromFileTime(EndTime100ns); } }
         public double EndTimeRelative { get { return process.Log.RelativeTimeMSec(EndTime100ns); } }
         public long EndTime100ns { get { return endTime100ns; } }
+        public float CPUMSec { get { return cpuSamples * Process.Log.SampleProfileInterval100ns / 10000.0F; } }
         /// <summary>
         /// Filters events to only those for a particular thread. 
         /// </summary>
@@ -2485,26 +3567,26 @@ namespace Diagnostics.Eventing
                    "/>";
         }
 
+        /// <summary>
+        /// ThreadInfo is a string that tries to identify the thread symbolically.   e.g. .NET THreadpool, .NET GC 
+        /// </summary>
+        public string ThreadInfo { get { return threadInfo; } }
+
+        public string VerboseThreadName
+        {
+            get
+            {
+                if (verboseThreadName == null)
+                {
+                    verboseThreadName = string.Format("Thread ({0}) CPU={1:f0}ms", ThreadID, CPUMSec);
+                    if (ThreadInfo != null)
+                        verboseThreadName += " (" + ThreadInfo + ")";
+                }
+                return verboseThreadName;
+            }
+        }
+
         #region Private
-        #region EventHandlersCalledFromTraceLog
-        // #EventHandlersCalledFromTraceLog
-        internal void ThreadStart(ThreadTraceData data)
-        {
-            process.Log.DebugWarn(StartTime100ns == 0, "Events for process happen before process start.  PrevEventTime: " + process.Log.RelativeTimeMSec(StartTime100ns), data);
-            Debug.Assert(EndTime100ns == ETWTraceEventSource.MaxTime100ns); // We would create a new Thread record otherwise 
-
-            this.startTime100ns = data.TimeStamp100ns;
-        }
-        internal void ThreadEnd(ThreadTraceData data)
-        {
-            process.Log.DebugWarn(EndTime100ns == ETWTraceEventSource.MaxTime100ns, "Multiple Ends for process. PrevEndTime: " + process.Log.RelativeTimeMSec(EndTime100ns), data);
-            process.Log.DebugWarn(StartTime100ns != 0, "Thread End without a start.", data);
-
-            this.endTime100ns = data.TimeStamp100ns;
-            process.Log.DebugWarn(StartTime100ns <= EndTime100ns, "Thread Ends before it starts! StartTime: " + process.Log.RelativeTimeMSec(StartTime100ns), data);
-        }
-        #endregion
-
         /// <summary>
         /// Create a new code:TraceProcess.  It should only be done by code:log.CreateTraceProcess because
         /// only code:TraceLog is responsible for generating a new ProcessIndex which we need.   'processIndex'
@@ -2525,6 +3607,8 @@ namespace Diagnostics.Eventing
             serializer.Write(process);
             serializer.Write(startTime100ns);
             serializer.Write(endTime100ns);
+            serializer.Write(cpuSamples);
+            serializer.Write(threadInfo);
         }
 
         void IFastSerializable.FromStream(Deserializer deserializer)
@@ -2534,14 +3618,19 @@ namespace Diagnostics.Eventing
             deserializer.Read(out process);
             deserializer.Read(out startTime100ns);
             deserializer.Read(out endTime100ns);
+            deserializer.Read(out cpuSamples);
+            deserializer.Read(out threadInfo);
         }
 
         private int threadID;
         private ThreadIndex threadIndex;
-        private TraceProcess process;
+        internal TraceProcess process;
         internal long startTime100ns;
         internal long endTime100ns;
-
+        internal int cpuSamples;
+        internal string threadInfo;
+        internal bool threadDidGCMark;
+        private string verboseThreadName;
         #endregion
     }
 
@@ -2597,37 +3686,55 @@ namespace Diagnostics.Eventing
         public override string ToString()
         {
             StringBuilder sb = new StringBuilder();
-            sb.Append("<TraceLoadedeModules Count=").Append(XmlUtilities.XmlQuote(modules.Count)).AppendLine(">");
+            sb.Append("<TraceLoadedModules Count=").Append(XmlUtilities.XmlQuote(modules.Count)).AppendLine(">");
             foreach (TraceLoadedModule module in this)
                 sb.Append("  ").Append(module.ToString()).AppendLine();
             sb.AppendLine("</TraceLoadedModules>");
             return sb.ToString();
         }
+
         #region Private
         // #ModuleHandlersCalledFromTraceLog
         internal TraceModuleFile ImageLoadOrUnload(ImageLoadTraceData data, bool isLoad)
         {
             int index;
+            string dataFileName = data.FileName;
             TraceLoadedModule module = FindModuleAndIndexContainingAddress(data.ImageBase, data.TimeStamp100ns, out index);
             if (module == null)
             {
                 // We need to make a new module 
-                TraceModuleFile newModuleFile = process.Log.ModuleFiles.GetOrCreateModuleFile(data.FileName, data.ImageBase);
+                TraceModuleFile newModuleFile = process.Log.ModuleFiles.GetOrCreateModuleFile(dataFileName, data.ImageBase);
                 newModuleFile.imageSize = data.ImageSize;
                 module = new TraceLoadedModule(process, newModuleFile, data.ImageBase);
                 InsertAndSetOverlap(index + 1, module);
             }
 
+            // If we load a module higher than 32 bits can do, then we must be a 64 bit process.  
+            if (!process.loadedAModuleHigh && (ulong)data.ImageBase >= 0x100000000L)
+            {
+                //  On win8 ntdll gets loaded into 32 bit processes so ignore it
+                if (!dataFileName.EndsWith("ntdll.dll", StringComparison.OrdinalIgnoreCase))
+                    process.loadedAModuleHigh = true;
+            }
+            process.anyModuleLoaded = true;
+
             TraceModuleFile moduleFile = module.ModuleFile;
             Debug.Assert(moduleFile != null);
 
+            // WORK-AROUND.   I have had problem on 64 bit systems with image load (but not the unload being only a prefix of
+            // the full file path.   We 'fix it' here.   
+            if (!isLoad && module.ModuleFile.FilePath.Length < dataFileName.Length)
+            {
+                process.Log.DebugWarn(false, "Needed to fix up a truncated load file path at unload time.", data);
+                module.ModuleFile.fileName = dataFileName;
+            }
+
             // TODO we get different prefixes. skip it 
-            string dataFileName = data.FileName;
-            int len = Math.Max(Math.Min(module.ModuleFile.FileName.Length - 4, dataFileName.Length - 4), 0);
-            int start1 = module.ModuleFile.FileName.Length - len;
+            int len = Math.Max(Math.Min(module.ModuleFile.FilePath.Length - 4, dataFileName.Length - 4), 0);
+            int start1 = module.ModuleFile.FilePath.Length - len;
             int start2 = dataFileName.Length - len;
-            process.Log.DebugWarn(string.Compare(module.ModuleFile.FileName, start1, dataFileName, start2, len, StringComparison.OrdinalIgnoreCase) == 0,
-                "Filename Load/Unload mismatch.\r\n    FILE1: " + module.ModuleFile.FileName, data);
+            process.Log.DebugWarn(string.Compare(module.ModuleFile.FilePath, start1, dataFileName, start2, len, StringComparison.OrdinalIgnoreCase) == 0,
+                "Filename Load/Unload mismatch.\r\n    FILE1: " + module.ModuleFile.FilePath, data);
             process.Log.DebugWarn(module.ModuleFile.ImageSize == 0 || module.ModuleFile.ImageSize == data.ImageSize,
                 "ImageSize not consistant over all Loads Size 0x" + module.ModuleFile.ImageSize.ToString("x"), data);
             /* TODO this one fails.  decide what to do about it. 
@@ -2649,12 +3756,24 @@ namespace Diagnostics.Eventing
             else
             {
                 process.Log.DebugWarn(module.loadTime100ns < data.TimeStamp100ns, "Unload time < load time!", data);
-                process.Log.DebugWarn(module.unloadTime100ns == ETWTraceEventSource.MaxTime100ns, "Unloading a image twice PrevUnloadTime: " + process.Log.RelativeTimeMSec(module.unloadTime100ns), data);
-                module.unloadTime100ns = data.TimeStamp100ns;
+                process.Log.DebugWarn(module.unloadTime100ns == ETWTraceEventSource.MaxTime100ns,
+                    "Unloading a image twice PrevUnloadTime: " + process.Log.RelativeTimeMSec(module.unloadTime100ns), data);
                 if (data.Opcode == TraceEventOpcode.DataCollectionStop)
-                    module.unloadTime100ns = process.Log.SessionEndTime100ns;
+                {
+                    // For circular logs, we don't have the process name but we can infer it from the module DCEnd events
+                    if (Process.imageFileName.Length == 0 && dataFileName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                        Process.imageFileName = dataFileName;
+                }
                 else
-                    process.Log.DebugWarn(module.loadTime100ns != 0, "Unloading image not loaded.", data);
+                {
+                    module.unloadTime100ns = data.TimeStamp100ns;
+                    // TODO there seem to be unmatched unloads in many traces.  This has make this diagnostic too noisy.
+                    // ideally we could turn this back on. 
+                    // process.Log.DebugWarn(module.loadTime100ns != 0, "Unloading image not loaded.", data);
+                }
+
+                // Look for all code addresses those that don't have modules that are in my range are assumed to be mine.  
+                Process.Log.CodeAddresses.AddNativeModule(data, module.ModuleFile.ModuleFileIndex);
             }
             CheckClassInvarients();
             return moduleFile;
@@ -2678,6 +3797,25 @@ namespace Diagnostics.Eventing
                 module.nativeModule = GetLoadedModule(data.ModuleNativePath, data.TimeStamp100ns);
             if (module.ModuleFile.fileName == null)
                 process.Log.ModuleFiles.SetModuleFileName(module.ModuleFile, data.ModuleILPath);
+            if (data.ManagedPdbSignature != Guid.Empty && module.ModuleFile.pdbSignature == Guid.Empty)
+            {
+                module.ModuleFile.pdbSignature = data.ManagedPdbSignature;
+                module.ModuleFile.pdbAge = data.ManagedPdbAge;
+                module.ModuleFile.pdbName = data.ManagedPdbBuildPath;
+            }
+            if (module.NativeModule != null)
+            {
+                Debug.Assert(module.NativeModule.managedModule == null ||
+                    module.NativeModule.ModuleFile.managedModule.FilePath == module.ModuleFile.FilePath);
+
+                module.NativeModule.ModuleFile.managedModule = module.ModuleFile;
+                if (data.NativePdbSignature != Guid.Empty && module.NativeModule.ModuleFile.pdbSignature == Guid.Empty)
+                {
+                    module.NativeModule.ModuleFile.pdbSignature = data.NativePdbSignature;
+                    module.NativeModule.ModuleFile.pdbAge = data.NativePdbAge;
+                    module.NativeModule.ModuleFile.pdbName = data.NativePdbBuildPath;
+                }
+            }
 
             // TODO factor this with the unmanaged case.  
             if (isLoad)
@@ -2693,9 +3831,8 @@ namespace Diagnostics.Eventing
             {
                 process.Log.DebugWarn(module.loadTime100ns < data.TimeStamp100ns, "Managed Unload time < load time!", data);
                 process.Log.DebugWarn(module.unloadTime100ns == ETWTraceEventSource.MaxTime100ns, "Unloading a managed image twice PrevUnloadTime: " + process.Log.RelativeTimeMSec(module.unloadTime100ns), data);
-                module.unloadTime100ns = data.TimeStamp100ns;
-                if (data.Opcode == TraceEventOpcode.DataCollectionStop)
-                    module.unloadTime100ns = process.Log.SessionEndTime100ns;
+                if (data.Opcode != TraceEventOpcode.DataCollectionStop)
+                    module.unloadTime100ns = data.TimeStamp100ns;
             }
             CheckClassInvarients();
         }
@@ -2764,7 +3901,7 @@ namespace Diagnostics.Eventing
                     // Have we found a match? 
                     if ((ulong)canidateModule.ImageBase <= (ulong)address)
                     {
-                        if (canidateModule.LoadTime100ns <= time100ns && time100ns < canidateModule.UnloadTime100ns)
+                        if (canidateModule.LoadTime100ns <= time100ns && time100ns <= canidateModule.UnloadTime100ns)
                         {
                             index = candidateIndex;
                             return canidateModule;
@@ -2836,8 +3973,6 @@ namespace Diagnostics.Eventing
                 else
                 {
                     Debug.Assert((ulong)module.ImageBase == module.key);
-                    if (lastModule != null && (ulong)lastModule.ImageBase + (uint)lastModule.ModuleFile.ImageSize > (ulong)module.ImageBase)
-                        Debug.Assert(lastModule.overlaps && module.overlaps, "Modules overlap but don't delcare that they do");
                 }
                 lastkey = module.key;
                 lastModule = module;
@@ -2888,7 +4023,7 @@ namespace Diagnostics.Eventing
         /// <summary>
         /// 0 for managed modules without NGEN images.  
         /// </summary>
-        public Address ImageBase { get { if (moduleFile == null) return Address.Null; else return moduleFile.ImageBase; } }
+        public Address ImageBase { get { if (moduleFile == null) return 0; else return moduleFile.ImageBase; } }
         /// <summary>
         /// The load time is the time the LoadLibrary was done if it was loaded from a file, otherwise is the
         /// time the CLR loaded the module. 
@@ -2901,12 +4036,13 @@ namespace Diagnostics.Eventing
         public long UnloadTime100ns { get { return unloadTime100ns; } }
         public TraceProcess Process { get { return process; } }
         virtual public long ModuleID { get { return (long)ImageBase; } }
+
         /// <summary>
         /// If this managedModule was a file that was mapped into memory (eg LoadLibary), then ModuleFile points at
         /// it.  If a managed module does not have a file associated with it, this can be null.  
         /// </summary>
         public TraceModuleFile ModuleFile { get { return moduleFile; } }
-        public string FileName { get { if (ModuleFile == null) return ""; else return ModuleFile.FileName; } }
+        public string FileName { get { if (ModuleFile == null) return ""; else return ModuleFile.FilePath; } }
         public string Name { get { if (ModuleFile == null) return ""; else return ModuleFile.Name; } }
         public override string ToString()
         {
@@ -2975,6 +4111,8 @@ namespace Diagnostics.Eventing
         internal TraceManagedModule managedModule;
         private TraceProcess process;
         private TraceModuleFile moduleFile;         // Can be null (modules with files)
+
+        internal int stackVisitedID;                // Used to determine if we have already visited this node or not.   
         #endregion
     }
 
@@ -3084,7 +4222,7 @@ namespace Diagnostics.Eventing
                     yield return (CallStackIndex)i;
             }
         }
-        public ThreadIndex Thread(CallStackIndex stackIndex)
+        public ThreadIndex ThreadIndex(CallStackIndex stackIndex)
         {
             // Go to the theads of the stack
             while (stackIndex >= 0)
@@ -3096,6 +4234,10 @@ namespace Diagnostics.Eventing
             ThreadIndex ret = (ThreadIndex)((-((int)stackIndex)) - 2);
             Debug.Assert(-1 <= (int)ret && (int)ret < log.Threads.MaxThreadIndex);
             return ret;
+        }
+        public TraceThread Thread(CallStackIndex stackIndex)
+        {
+            return log.Threads[ThreadIndex(stackIndex)];
         }
         public override string ToString()
         {
@@ -3123,17 +4265,6 @@ namespace Diagnostics.Eventing
             callStacks.RemoveRange(origSize, callStacks.Count - origSize);
         }
 
-        internal CallStackIndex Combine(CallStackIndex part1, CallStackIndex part2)
-        {
-            if (part1 == CallStackIndex.Invalid)
-                return part2;
-            if (part2 == CallStackIndex.Invalid)
-                return part1;
-
-            CallStackIndex caller = Combine(Caller(part1), part2);
-            return InternCallStackIndex(CodeAddressIndex(part1), caller);
-        }
-
         /// <summary>
         /// Returns an index that represents the 'theads' of the stack.  It encodes the thread which owns this stack into this. 
         /// We encode this as -ThreadIndex - 2 (since -1 is the Invalid node)
@@ -3149,40 +4280,26 @@ namespace Diagnostics.Eventing
             return ret;
         }
 
-        internal CallStackIndex GetStackIndexForStackEvent(ClrStackWalkTraceData stackData, int depth, TraceThread thread)
+        unsafe internal CallStackIndex GetStackIndexForStackEvent(long timeStamp100ns, void* addresses,
+            int addressCount, bool is64BitAddresses, TraceThread thread, CallStackIndex start = CallStackIndex.Invalid)
         {
-            Debug.Assert(depth >= 0);
-            Debug.Assert(depth <= stackData.FrameCount);
-
-            if (depth > 0)
+            var ret = start;
+            if (ret == CallStackIndex.Invalid)
+                ret = GetRootForThread(thread.ThreadIndex);
+            for (int i = addressCount - 1; 0 <= i; --i)
             {
-                CallStackIndex caller = GetStackIndexForStackEvent(stackData, depth - 1, thread);
-                CodeAddressIndex codeAddress = codeAddresses.GetCodeAddressIndex(stackData, stackData.InstructionPointer(stackData.FrameCount - depth));
-                var ret = InternCallStackIndex(codeAddress, caller);
-                Debug.Assert(depth == Depth(ret));  // TODO comment out. 
-                return ret;
+                Address address;
+                if (is64BitAddresses)
+                    address = ((ulong*)addresses)[i];
+                else
+                    address = ((uint*)addresses)[i];
+
+                CodeAddressIndex codeAddress = codeAddresses.GetOrCreateCodeAddressIndex(thread.Process, timeStamp100ns, address);
+                ret = InternCallStackIndex(codeAddress, ret);
             }
-            else
-                return GetRootForThread(thread.ThreadIndex);
+            return ret;
         }
 
-        // TODO this is a clone of the above (except for the first arg).  This is annoying.  
-        internal CallStackIndex GetStackIndexForStackEvent(StackWalkTraceData stackData, int depth, TraceThread thread)
-        {
-            Debug.Assert(depth >= 0);
-            Debug.Assert(depth <= stackData.FrameCount);
-
-            if (depth > 0)
-            {
-                CallStackIndex caller = GetStackIndexForStackEvent(stackData, depth - 1, thread);
-                CodeAddressIndex codeAddress = codeAddresses.GetCodeAddressIndex(stackData, stackData.InstructionPointer(stackData.FrameCount - depth));
-                var ret = InternCallStackIndex(codeAddress, caller);
-                Debug.Assert(depth == Depth(ret));  // TODO comment out. 
-                return ret;
-            }
-            else
-                return GetRootForThread(thread.ThreadIndex);
-        }
         private CallStackIndex InternCallStackIndex(CodeAddressIndex codeAddressIndex, CallStackIndex callerIndex)
         {
             if (callStacks.Count == 0)
@@ -3342,6 +4459,37 @@ namespace Diagnostics.Eventing
     public class TraceMethods : IFastSerializable, IEnumerable<TraceMethod>
     {
         public int MaxMethodIndex { get { return methods.Count; } }
+        public int MethodToken(MethodIndex methodIndex)
+        {
+            if (methodIndex == MethodIndex.Invalid)
+                return 0;
+            else
+            {
+                var value = methods[(int)methodIndex].methodDefOrRva;
+                if (value < 0)
+                    value = 0;      // unmanaged code, return 0
+                return value;
+            }
+        }
+        public int MethodRva(MethodIndex methodIndex)
+        {
+            if (methodIndex == MethodIndex.Invalid)
+                return 0;
+            else
+            {
+                var value = methods[(int)methodIndex].methodDefOrRva;
+                if (value > 0)
+                    value = 0;      // managed code, return 0
+                return -value;
+            }
+        }
+        public ModuleFileIndex MethodModuleFileIndex(MethodIndex methodIndex)
+        {
+            if (methodIndex == MethodIndex.Invalid)
+                return ModuleFileIndex.Invalid;
+            else
+                return methods[(int)methodIndex].moduleIndex;
+        }
         public string FullMethodName(MethodIndex methodIndex)
         {
             if (methodIndex == MethodIndex.Invalid)
@@ -3349,13 +4497,7 @@ namespace Diagnostics.Eventing
             else
                 return methods[(int)methodIndex].fullMethodName;
         }
-        public string SourceFileName(MethodIndex methodIndex)
-        {
-            if (methodIndex == MethodIndex.Invalid)
-                return "";
-            else
-                return methods[(int)methodIndex].sourceFileName;
-        }
+
         public TraceMethod this[MethodIndex methodIndex]
         {
             get
@@ -3400,12 +4542,12 @@ namespace Diagnostics.Eventing
             return sb.ToString();
         }
         #region private
-        internal TraceMethods() { }
+        internal TraceMethods(TraceCodeAddresses codeAddresses) { this.codeAddresses = codeAddresses; }
 
-        internal MethodIndex NewMethod(string fullMethodName, string sourceFileName)
+        internal MethodIndex NewMethod(string fullMethodName, ModuleFileIndex moduleIndex, int methodToken)
         {
             MethodIndex ret = (MethodIndex)methods.Count;
-            methods.Add(new MethodInfo(fullMethodName, sourceFileName));
+            methods.Add(new MethodInfo(fullMethodName, moduleIndex, methodToken));
             return ret;
         }
 
@@ -3413,13 +4555,14 @@ namespace Diagnostics.Eventing
         {
             lazyMethods.Write(serializer, delegate
             {
+                serializer.Write(codeAddresses);
                 serializer.Write(methods.Count);
                 serializer.Log("<WriteColection name=\"methods\" count=\"" + methods.Count + "\">\r\n");
                 for (int i = 0; i < methods.Count; i++)
                 {
                     serializer.Write(methods[i].fullMethodName);
-                    // TODO string interning on currentSourceFileName
-                    serializer.Write(methods[i].sourceFileName);
+                    serializer.Write(methods[i].methodDefOrRva);
+                    serializer.Write((int)methods[i].moduleIndex);
                 }
                 serializer.Log("</WriteColection>\r\n");
             });
@@ -3429,6 +4572,7 @@ namespace Diagnostics.Eventing
         {
             lazyMethods.Read(deserializer, delegate
             {
+                deserializer.Read(out codeAddresses);
                 int count = deserializer.ReadInt();
                 deserializer.Log("<Marker name=\"methods\" count=\"" + count + "\"/>");
                 MethodInfo methodInfo = new MethodInfo();
@@ -3437,10 +4581,8 @@ namespace Diagnostics.Eventing
                 for (int i = 0; i < count; i++)
                 {
                     deserializer.Read(out methodInfo.fullMethodName);
-                    deserializer.Read(out methodInfo.sourceFileName);
-                    // TODO remove when we have real interning
-                    if (methodInfo.sourceFileName.Length == 0)
-                        methodInfo.sourceFileName = string.Empty;
+                    deserializer.Read(out methodInfo.methodDefOrRva);
+                    methodInfo.moduleIndex = (ModuleFileIndex)deserializer.ReadInt();
                     methods.Add(methodInfo);
                 }
             });
@@ -3454,18 +4596,21 @@ namespace Diagnostics.Eventing
 
         private struct MethodInfo
         {
-            internal MethodInfo(string fullMethodName, string sourceFileName)
+            internal MethodInfo(string fullMethodName, ModuleFileIndex moduleIndex, int methodToken)
             {
                 this.fullMethodName = fullMethodName;
-                this.sourceFileName = sourceFileName;
+                this.moduleIndex = moduleIndex;
+                this.methodDefOrRva = methodToken;
             }
             internal string fullMethodName;
-            internal string sourceFileName;
+            internal ModuleFileIndex moduleIndex;
+            internal int methodDefOrRva;               // For managed code, this is the token, for unmanged it is -rva (rvas have to be < 2Gig).  
         }
 
         private DeferedRegion lazyMethods;
         private GrowableArray<MethodInfo> methods;
         private TraceMethod[] methodObjects;
+        internal TraceCodeAddresses codeAddresses;
         #endregion
     }
 
@@ -3478,8 +4623,17 @@ namespace Diagnostics.Eventing
     public class TraceMethod
     {
         public MethodIndex MethodIndex { get { return methodIndex; } }
-        public string SourceFileName { get { return methods.SourceFileName(methodIndex); } }
         public string FullMethodName { get { return methods.FullMethodName(methodIndex); } }
+        /// <summary>
+        /// returns 0 for unmanged code or method not found. 
+        /// </summary>
+        public int MethodToken { get { return methods.MethodToken(methodIndex); } }
+        /// <summary>
+        /// Returns 0 for managed code or method not found;
+        /// </summary>
+        public int MethodRva { get { return methods.MethodRva(methodIndex); } }
+        public ModuleFileIndex MethodModuleFileIndex { get { return methods.MethodModuleFileIndex(methodIndex); } }
+        public TraceModuleFile MethodModuleFile { get { return methods.codeAddresses.ModuleFiles[MethodModuleFileIndex]; } }
 
         public override string ToString()
         {
@@ -3491,9 +4645,9 @@ namespace Diagnostics.Eventing
             sb.Append("  <TraceMethod ");
             if (FullMethodName.Length > 0)
                 sb.Append(" FullMethodName=\"").Append(XmlUtilities.XmlEscape(FullMethodName, false)).Append("\"");
-            if (SourceFileName.Length > 0)
-                sb.Append(" SourceFileName=\"").Append(XmlUtilities.XmlEscape(SourceFileName, false)).Append("\"");
             sb.Append(" MethodIndex=\"").Append(XmlUtilities.XmlEscape(MethodIndex, false)).Append("\"");
+            sb.Append(" MethodToken=\"").Append(XmlUtilities.XmlEscape(MethodToken, false)).Append("\"");
+            sb.Append(" MethodRva=\"").Append(XmlUtilities.XmlEscape(MethodRva, false)).Append("\"");
             sb.Append("/>");
             return sb;
         }
@@ -3516,7 +4670,8 @@ namespace Diagnostics.Eventing
     /// can be used to 'attach' data to a method.
     /// </summary>
     public enum CodeAddressIndex { Invalid = -1 };
-    public class TraceCodeAddresses : IFastSerializable, IEnumerable<TraceCodeAddress>
+    public class
+        TraceCodeAddresses : IFastSerializable, IEnumerable<TraceCodeAddress>
     {
         public int MaxCodeAddressIndex { get { return codeAddresses.Count; } }
         public string Name(CodeAddressIndex codeAddressIndex)
@@ -3528,12 +4683,12 @@ namespace Diagnostics.Eventing
             {
                 string moduleName = "?";
                 ModuleFileIndex moduleIdx = ModuleFileIndex(codeAddressIndex);
-                if (moduleIdx != Diagnostics.Eventing.ModuleFileIndex.Invalid)
+                if (moduleIdx != Diagnostics.Tracing.ModuleFileIndex.Invalid)
                     moduleName = moduleFiles[moduleIdx].Name;
 
                 string methodName;
                 MethodIndex methodIndex = MethodIndex(codeAddressIndex);
-                if (methodIndex != Diagnostics.Eventing.MethodIndex.Invalid)
+                if (methodIndex != Diagnostics.Tracing.MethodIndex.Invalid)
                     methodName = Methods.FullMethodName(methodIndex);
                 else
                     methodName = "0x" + ((ulong)Address(codeAddressIndex)).ToString("x");
@@ -3541,11 +4696,39 @@ namespace Diagnostics.Eventing
             }
             return name;
         }
-        public Address Address(CodeAddressIndex codeAddressIndex) { return codeAddresses[(int)codeAddressIndex].address; }
-        public int SourceLineNumber(CodeAddressIndex codeAddressIndex) { return codeAddresses[(int)codeAddressIndex].sourceLineNumber; }
-        public ModuleFileIndex ModuleFileIndex(CodeAddressIndex codeAddressIndex) { return codeAddresses[(int)codeAddressIndex].moduleFileIndex; }
-        public MethodIndex MethodIndex(CodeAddressIndex codeAddressIndex) { return codeAddresses[(int)codeAddressIndex].methodIndex; }
+        public Address Address(CodeAddressIndex codeAddressIndex) { return codeAddresses[(int)codeAddressIndex].Address; }
+        public ModuleFileIndex ModuleFileIndex(CodeAddressIndex codeAddressIndex)
+        {
+            var ret = codeAddresses[(int)codeAddressIndex].ModuleFileIndex;
+            // If we have a method index, fetch the module file from the method. 
+            if (ret == Diagnostics.Tracing.ModuleFileIndex.Invalid)
+                ret = Methods.MethodModuleFileIndex(MethodIndex(codeAddressIndex));
+            return ret;
+        }
+        public MethodIndex MethodIndex(CodeAddressIndex codeAddressIndex) { return codeAddresses[(int)codeAddressIndex].GetMethodIndex(this); }
         public TraceModuleFile ModuleFile(CodeAddressIndex codeAddressIndex) { return ModuleFiles[ModuleFileIndex(codeAddressIndex)]; }
+        /// <summary>
+        /// returns -1 if the code address is not managed (or unknown). 
+        /// </summary>
+        public int ILOffset(CodeAddressIndex codeAddressIndex)
+        {
+            ILToNativeMap ilMap = NativeMap(codeAddressIndex);
+            if (ilMap == null)
+                return -1;
+            return ilMap.GetILOffsetForNativeAddress(Address(codeAddressIndex));
+        }
+        /// <summary>
+        /// We expose ILToNativeMap internally so we can do diagnostics.   
+        /// </summary>
+        internal ILToNativeMap NativeMap(CodeAddressIndex codeAddressIndex)
+        {
+            var ilMapIdx = codeAddresses[(int)codeAddressIndex].GetILMapIndex(this);
+            if (ilMapIdx == ILMapIndex.Invalid)
+                return null;
+
+            return ILToNativeMaps[(int)ilMapIdx];
+        }
+
         public TraceCodeAddress this[CodeAddressIndex codeAddressIndex]
         {
             get
@@ -3581,9 +4764,190 @@ namespace Diagnostics.Eventing
         public TraceMethods Methods { get { return methods; } }
         public TraceModuleFiles ModuleFiles { get { return moduleFiles; } }
         /// <summary>
-        /// Indicates the number of managed method record that were encountered.
+        /// Indicates the number of managed method records that were encountered.
         /// </summary>
         public int ManagedMethodRecordCount { get { return managedMethodRecordCount; } }
+        public void LookupSymbolsForModule(SymbolReader reader, TraceModuleFile file)
+        {
+            var codeAddrs = new List<CodeAddressIndex>();
+            for (int i = 0; i < MaxCodeAddressIndex; i++)
+            {
+                if (codeAddresses[i].ModuleFileIndex == file.ModuleFileIndex &&
+                    codeAddresses[i].GetMethodIndex(this) == Diagnostics.Tracing.MethodIndex.Invalid)
+                    codeAddrs.Add((CodeAddressIndex)i);
+            }
+
+            if (codeAddrs.Count == 0)
+            {
+                reader.m_log.WriteLine("No code addresses are in {0} that have not already been looked up.", file.Name);
+                return;
+            }
+
+            // sort them.  TODO can we get away without this?
+            codeAddrs.Sort(delegate(CodeAddressIndex x, CodeAddressIndex y)
+            {
+                ulong addrX = (ulong)Address(x);
+                ulong addrY = (ulong)Address(y);
+                if (addrX > addrY)
+                    return 1;
+                if (addrX < addrY)
+                    return -1;
+                return 0;
+            });
+
+            int totalAddressCount;
+
+            // Skip to the addresses in this module 
+            var codeAddrEnum = codeAddrs.GetEnumerator();
+            for (; ; )
+            {
+                if (!codeAddrEnum.MoveNext())
+                    return;
+                if (Address(codeAddrEnum.Current) >= file.ImageBase)
+                    break;
+            }
+            try
+            {
+                LookupSymbolsForModule(reader, file, codeAddrEnum, true, out totalAddressCount);
+            }
+            catch (OutOfMemoryException)
+            {
+                // TODO find out why this happens?   I think this is because we try to do a ReadRVA 
+                // a managed-only module 
+                reader.m_log.WriteLine("Error: Caught out of memory exception on file " + file.Name + ".   Skipping.");
+            }
+        }
+        public SourceLocation GetSourceLine(SymbolReader reader, CodeAddressIndex codeAddressIndex)
+        {
+            reader.m_log.WriteLine("GetSourceLine: Getting source line for code address index {0:x}", codeAddressIndex);
+
+            if (codeAddressIndex == CodeAddressIndex.Invalid)
+            {
+                reader.m_log.WriteLine("GetSourceLine: Invalid code address");
+                return null;
+            }
+
+            var moduleFile = log.CodeAddresses.ModuleFile(codeAddressIndex);
+            if (moduleFile == null)
+            {
+                reader.m_log.WriteLine("GetSourceLine: Could not find moduleFile {0:x}.", log.CodeAddresses.Address(codeAddressIndex));
+                return null;
+            }
+
+            SymbolModule symbolReaderModule;
+            // Is this address in the native code of the module (inside the bounds of module)
+            var address = log.CodeAddresses.Address(codeAddressIndex);
+            reader.m_log.WriteLine("GetSourceLine: address for code address is {0:x} module {1}", address, moduleFile.Name);
+            if (moduleFile.ImageBase != 0 && moduleFile.ImageBase <= address && address < moduleFile.ImageEnd)
+            {
+                var methodRva = (uint)(address - moduleFile.ImageBase);
+                reader.m_log.WriteLine("GetSourceLine: address within module: native case, RVA = {0:x}", methodRva);
+                symbolReaderModule = GetSymbolReaderModule(reader, moduleFile);
+                if (symbolReaderModule != null)
+                {
+                    var ret = symbolReaderModule.SourceLocationForRva(methodRva);
+                    // TODO FIX NOW, deal with this rather than simply warn. 
+                    if (ret == null && symbolReaderModule.PdbPath.EndsWith(".ni.pdb", StringComparison.OrdinalIgnoreCase))
+                    {
+                        reader.m_log.WriteLine("GetSourceLine: Warning could not find line information in {0}", symbolReaderModule.PdbPath);
+                        reader.m_log.WriteLine("GetSourceLine: Maybe because the NGEN pdb was generated without being able to reach the IL PDB");
+                        reader.m_log.WriteLine("GetSourceLine: If you are on the machine where the data was collected, deleting the file may help");
+                    }
+
+                    return ret;
+                }
+                reader.m_log.WriteLine("GetSourceLine: Failed to look up {0:x} in a PDB, checking for JIT", log.CodeAddresses.Address(codeAddressIndex));
+            }
+
+            // The address is not in the module, or we could not find the PDB, see if we have JIT information 
+            var methodIndex = log.CodeAddresses.MethodIndex(codeAddressIndex);
+            if (methodIndex == Diagnostics.Tracing.MethodIndex.Invalid)
+            {
+                reader.m_log.WriteLine("GetSourceLine: Could not find method for {0:x}", log.CodeAddresses.Address(codeAddressIndex));
+                return null;
+            }
+
+            var methodToken = log.CodeAddresses.Methods.MethodToken(methodIndex);
+            if (methodToken == 0)
+            {
+                reader.m_log.WriteLine("GetSourceLine: Could not find method for {0:x}", log.CodeAddresses.Address(codeAddressIndex));
+                return null;
+            }
+            reader.m_log.WriteLine("GetSourceLine: Found JITTed method {0}, index {1:x} token {2:x}",
+                log.CodeAddresses.Methods.FullMethodName(methodIndex), methodIndex, methodToken);
+
+            // See if we have il offset information for the method. 
+            // var ilOffset = log.CodeAddresses.ILOffset(codeAddressIndex);
+            var ilMap = log.CodeAddresses.NativeMap(codeAddressIndex);
+            int ilOffset = 0;
+            if (ilMap != null)
+            {
+                reader.m_log.WriteLine("GetSourceLine: Found an il-to-native mapping MethodIdx {0:x} Start {1:x} Len {2:x}",
+                    ilMap.MethodIndex, ilMap.MethodStart, ilMap.MethodLength);
+
+                // TODO remove after we are happy that this works properly.   
+                for (int i = 0; i < ilMap.Map.Count; i++)
+                    reader.m_log.WriteLine("GetSourceLine:    {0,3} native {1,5:x} -> {2:x}",
+                        i, ilMap.Map[i].NativeOffset, ilMap.Map[i].ILOffset);
+
+                ilOffset = ilMap.GetILOffsetForNativeAddress(address);
+                reader.m_log.WriteLine("GetSourceLine: NativeOffset {0:x} ILOffset = {1:x}", 
+                    address - ilMap.MethodStart, ilOffset);
+
+                if (ilOffset < 0)
+                    ilOffset = 0;       // If we return the special ILProlog or ILEpilog values.  
+            }
+
+            // Get the IL file even if we are in an NGEN image.
+            if (moduleFile.ManagedModule != null)
+                moduleFile = moduleFile.ManagedModule;
+
+            symbolReaderModule = GetSymbolReaderModule(reader, moduleFile);
+            if (symbolReaderModule == null)
+            {
+                reader.m_log.WriteLine("GetSourceLine: Failed to look up PDB for {0}", moduleFile.FilePath);
+                return null;
+            }
+
+            return symbolReaderModule.SourceLocationForManagedCode((uint)methodToken, ilOffset);
+        }
+
+        /// <summary>
+        /// Calls OpenModuleFile and caches the last entry
+        /// </summary>
+        private unsafe SymbolModule GetSymbolReaderModule(SymbolReader reader, TraceModuleFile moduleFile)
+        {
+            SymbolModule symbolReaderModule;
+            if (m_lastModuleFile == moduleFile)
+                symbolReaderModule = m_lastSymbolModule;
+            else
+            {
+                symbolReaderModule = OpenPdbForModuleFile(reader, moduleFile);
+                if (symbolReaderModule == null)
+                {
+                    reader.m_log.WriteLine("GetSourceLine: Could not open PDB for {0}", moduleFile.FilePath);
+                    return null;
+                }
+                m_lastModuleFile = moduleFile;
+                m_lastSymbolModule = symbolReaderModule;
+            }
+            return symbolReaderModule;
+        }
+
+        SymbolModule m_lastSymbolModule;
+        TraceModuleFile m_lastModuleFile;
+
+        /// <summary>
+        /// The number of times a code address appears in the log.   Unlike MaxCodeAddressIndex, TotalCodeAddresses counts the same address
+        /// in different places (even if in the same stack) as distinct.   
+        /// 
+        /// The sum of ModuleFile.CodeAddressesInModule for all modules should sum to this number.
+        /// </summary>
+        public int TotalCodeAddresses { get { return totalCodeAddresses; } }
+        /// <summary>
+        /// Will look up PDBs without validating that the GUID is OK.   Pretty dangerous, don't use it if you avoid it.
+        /// </summary>
+        public bool UnsafePDBMatching;
 
         public override string ToString()
         {
@@ -3599,26 +4963,25 @@ namespace Diagnostics.Eventing
         {
             this.log = log;
             this.moduleFiles = moduleFiles;
-            this.methods = new TraceMethods();
+            this.methods = new TraceMethods(this);
         }
 
+        internal delegate void ForAllCodeAddrAction(TraceProcess process, ref CodeAddressInfo codeAddrInfo);
         /// <summary>
-        /// Called when JIT CLR Rundown events are processed. It will look if there is any
-        /// address that falls into the range of the JIT compiled method and if so log the
-        /// symbolic information (otherwise we simply ignore it)
+        /// Allows you to get a callback for each code address that is in the range from start to 
+        /// start+length within the process 'process'.   It is legal to have process==0 if you supply 'context'
+        /// (which is used to find the context).  This is useful because we only look up the process lazily
         /// </summary>
-        internal void AddMethod(MethodLoadUnloadVerboseTraceData data)
+        internal void ForAllUnresolvedCodeAddressesInRange(Address start, int length,
+            TraceProcess process, TraceEvent context, ForAllCodeAddrAction body)
         {
-            managedMethodRecordCount++;
             // If there are no code address of interest, then we have nothing to do.  
             if (codeAddressBuckets == null)
                 return;
 
-            Address address = data.MethodStartAddress;
-            Address endAddressInclusive = (Address)((long)address + data.MethodSize - 1);
-            long curBucket = RoundToBucket((long)address);
+            Address endAddressInclusive = (Address)((long)start + length - 1);
+            long curBucket = RoundToBucket((long)start);
             long endBucket = RoundToBucket((long)endAddressInclusive);
-            MethodIndex methodIndex = Diagnostics.Eventing.MethodIndex.Invalid;
             for (; ; )
             {
                 if (curBucket > endBucket)
@@ -3630,41 +4993,28 @@ namespace Diagnostics.Eventing
                     do
                     {
                         Address entryAddress = codeAddressEntry.address;
-                        if (address <= entryAddress && entryAddress <= endAddressInclusive)
+                        // Does this address fall within the range of the method the 'data' event describes?
+                        if (start <= entryAddress && entryAddress <= endAddressInclusive)
                         {
-                            if (MethodIndex(codeAddressEntry.codeAddressIndex) == Diagnostics.Eventing.MethodIndex.Invalid)
-                            {
-                                if (methodIndex == Diagnostics.Eventing.MethodIndex.Invalid)
-                                {
-                                    string fullName = TraceLog.GetFullName(data);
-#if DEBUG
-                                    Debug.Assert(TraceLog.NormalChars(fullName));
-#endif
-                                    methodIndex = methods.NewMethod(fullName, "");
-                                    // options.ConversionLog.WriteLine("CREATED methodIndex " + methodIndex + " for address 0x" + ((long)codeAddressEntry.address).ToString("x") + " name " + verboseName);
-                                }
+                            // If the entry already has symbolic info (a MethodIndex) then we are done 
+                            CodeAddressInfo info = codeAddresses[(int)codeAddressEntry.codeAddressIndex];
 
-                                CodeAddressInfo info = codeAddresses[(int)codeAddressEntry.codeAddressIndex];
-                                info.methodIndex = methodIndex;
-                                TraceProcess process = log.Processes.GetProcess(data.ProcessID, data.TimeStamp100ns);
-                                if (process != null)
-                                {
-                                    TraceManagedModule module = process.LoadedModules.GetOrCreateManagedModule(data.ModuleID, data.TimeStamp100ns);
-                                    if (module != null)
-                                        info.moduleFileIndex = module.ModuleFile.ModuleFileIndex;
-                                    else
-                                        log.DebugWarn(false, "Could not find managed module for moduleID " + data.ModuleID.ToString("x"), data);
-                                }
-                                log.DebugWarn(info.moduleFileIndex != Eventing.ModuleFileIndex.Invalid, "Could not find a managed module for module for moduleID 0x" + data.ModuleID.ToString("x"), data);
-                                codeAddresses[(int)codeAddressEntry.codeAddressIndex] = info;
-                                // options.ConversionLog.WriteLine("FOUND methodIndex " + methodIndex + " for address 0x" + ((long)codeAddressEntry.address).ToString("x") + " name " + methods.FullMethodName(MethodIndex(codeAddressEntry.codeAddressIndex)));
-                            }
-                            else
+                            // OK we need the process, to check that the processes match.  
+                            // Get the moduleFileIndex and methodIndex while we are at it.    
+                            if (process == null)
                             {
-                                // TODO remove after a while.  Just here because it is true most of the
-                                // time.  
-                                log.DebugWarn(Methods.FullMethodName(MethodIndex(codeAddressEntry.codeAddressIndex)) == TraceLog.GetFullName(data), "Different methods for the same address", data);
+                                process = log.Processes.GetProcess(context.ProcessID, context.TimeStamp100ns);
+                                if (process == null)
+                                {
+                                    log.DebugWarn(false, "Could not find process with ID " + context.ProcessID.ToString("x"), context);
+                                    return;
+                                }
                             }
+
+                            // Do we match the process? then call the body.  
+                            // The kernel (ProcessID 0 matches any process because these DLLs are mapped into every process).  
+                            if (info.GetProcessIndex(this) == process.ProcessIndex || process.ProcessID == 0)
+                                body(process, ref codeAddresses.UnderlyingArray[(int)codeAddressEntry.codeAddressIndex]);
                         }
                         codeAddressEntry = codeAddressEntry.next;
                     } while (codeAddressEntry != null);
@@ -3673,9 +5023,91 @@ namespace Diagnostics.Eventing
             }
         }
 
-        internal CodeAddressIndex GetCodeAddressIndex(TraceEvent context, Address address)
+        internal void AddNativeModule(ImageLoadTraceData data, ModuleFileIndex moduleFileIndex)
         {
-            return GetCodeAddressEntry(context, address).codeAddressIndex;
+            ForAllUnresolvedCodeAddressesInRange(data.ImageBase, data.ImageSize, null, data,
+                delegate(TraceProcess process, ref CodeAddressInfo info)
+                {
+                    if (info.ModuleFileIndex == Diagnostics.Tracing.ModuleFileIndex.Invalid)
+                        info.ModuleFileIndex = moduleFileIndex;
+                });
+        }
+
+        /// <summary>
+        /// Called when JIT CLR Rundown events are processed. It will look if there is any
+        /// address that falls into the range of the JIT compiled method and if so log the
+        /// symbolic information (otherwise we simply ignore it)
+        /// </summary>
+        internal void AddMethod(MethodLoadUnloadVerboseTraceData data)
+        {
+            managedMethodRecordCount++;
+            MethodIndex methodIndex = Diagnostics.Tracing.MethodIndex.Invalid;
+            ILMapIndex ilMap = ILMapIndex.Invalid;
+            ModuleFileIndex moduleFileIndex = Diagnostics.Tracing.ModuleFileIndex.Invalid;
+            TraceManagedModule module = null;
+            ForAllUnresolvedCodeAddressesInRange(data.MethodStartAddress, data.MethodSize, null, data,
+                delegate(TraceProcess process, ref CodeAddressInfo info)
+                {
+                    // If we already resolved, that means that the address was reused, so only add something if it does not already have 
+                    // information associated with it.  
+                    if (info.GetMethodIndex(this) == Diagnostics.Tracing.MethodIndex.Invalid)
+                    {
+                        // Lazily create the method since many methods never have code samples in them. 
+                        if (module == null)
+                        {
+                            module = process.LoadedModules.GetOrCreateManagedModule(data.ModuleID, data.TimeStamp100ns);
+                            moduleFileIndex = module.ModuleFile.ModuleFileIndex;
+                            methodIndex = methods.NewMethod(TraceLog.GetFullName(data), moduleFileIndex, data.MethodToken);
+                            if (data.IsJitted)
+                                ilMap = UnloadILMapForMethod(methodIndex, data);
+                        }
+                        // Set the info 
+                        info.SetMethodIndex(this, methodIndex);
+                        if (ilMap != ILMapIndex.Invalid)
+                            info.SetILMapIndex(this, ilMap);
+                    }
+                });
+        }
+
+        /// <summary>
+        /// Adss a JScript method 
+        /// </summary>
+        internal void AddMethod(MethodLoadUnloadJSTraceData data, Dictionary<JavaScriptSourceKey, string> sourceById)
+        {
+            MethodIndex methodIndex = Diagnostics.Tracing.MethodIndex.Invalid;
+
+            ForAllUnresolvedCodeAddressesInRange(data.MethodStartAddress, (int)data.MethodSize, null, data,
+                delegate(TraceProcess process, ref CodeAddressInfo info)
+                {
+                    // If we already resolved, that means that the address was reused, so only add something if it does not already have 
+                    // information associated with it.  
+                    if (info.GetMethodIndex(this) == Diagnostics.Tracing.MethodIndex.Invalid)
+                    {
+                        // Lazily create the method since many methods never have code samples in them. 
+                        if (methodIndex == Diagnostics.Tracing.MethodIndex.Invalid)
+                        {
+                            string sourceName = null;
+                            /* TODO FIX NOW decide what to do here */
+                            if (sourceById.TryGetValue(new JavaScriptSourceKey(data.SourceID, data.ScriptContextID), out sourceName))
+                            {
+                                var lastSlashIdx = sourceName.LastIndexOf('/');
+                                if (0 < lastSlashIdx)
+                                    sourceName = sourceName.Substring(lastSlashIdx + 1);
+                            }
+                            if (sourceName == null)
+                                sourceName = "JAVASCRIPT";
+
+                            var methodName = data.MethodName;
+                            if (data.Line != 0)
+                                methodName = methodName + " Line: " + data.Line.ToString();
+
+                            var moduleFile = log.ModuleFiles.GetOrCreateModuleFile(sourceName, 0);
+                            methodIndex = methods.NewMethod(methodName, moduleFile.ModuleFileIndex, data.MethodID);
+                        }
+                        // Set the info 
+                        info.SetMethodIndex(this, methodIndex);
+                    }
+                });
         }
 
         // This supports the lookup of CodeAddresses by range.  
@@ -3692,7 +5124,7 @@ namespace Diagnostics.Eventing
         /// information is found, however, an entry is created for it, so every unique address has an entry
         /// in this table.  
         /// </summary>
-        private CodeAddressBucketEntry GetCodeAddressEntry(TraceEvent context, Address address)
+        internal CodeAddressIndex GetOrCreateCodeAddressIndex(TraceProcess process, long time100ns, Address address)
         {
             CodeAddressBucketEntry codeAddressInfo;
             long roundedAddress = RoundToBucket((long)address);
@@ -3704,61 +5136,71 @@ namespace Diagnostics.Eventing
             }
             if (!codeAddressBuckets.TryGetValue(roundedAddress, out codeAddressInfo))
             {
-                codeAddressInfo = NewEntry(context, address, null);
+                codeAddressInfo = NewCodeAddressEntry(process, address, null);
                 codeAddressBuckets.Add(roundedAddress, codeAddressInfo);
             }
             else if (address < codeAddressInfo.address)
             {
-                codeAddressInfo = NewEntry(context, address, codeAddressInfo);
+                codeAddressInfo = NewCodeAddressEntry(process, address, codeAddressInfo);
                 codeAddressBuckets[roundedAddress] = codeAddressInfo;
             }
             else
             {
                 for (; ; )
                 {
-                    // TODO - check file name too.  
-                    if (codeAddressInfo.address == address && MethodIndex(codeAddressInfo.codeAddressIndex) == Diagnostics.Eventing.MethodIndex.Invalid)
-                        break;
+                    // have we found an existing entry?, first the addresses have to match.
+                    if (codeAddressInfo.address == address)
+                    {
+                        // We only match 'empty' entries.   This is because we add method or modulefile entries when a DLL or method
+                        // unloads, which means that if the entry is non-empty, it means that the code address has actually been
+                        // unloaded, and the address used for a new method.  Thus we don't want to match this entry but let a new
+                        var codeAddressMethodIndex = MethodIndex(codeAddressInfo.codeAddressIndex);
+                        if (codeAddressMethodIndex == Diagnostics.Tracing.MethodIndex.Invalid)
+                        {
+                            // Is the module empty?  
+                            var codeAddressModuleFileIndex = ModuleFileIndex(codeAddressInfo.codeAddressIndex);
+                            if (codeAddressModuleFileIndex == Diagnostics.Tracing.ModuleFileIndex.Invalid)
+                            {
+                                // We have an empty entry and the the process matches we have found an existing entry to return!
+                                var codeAddressProcessIndex = codeAddresses[(int)codeAddressInfo.codeAddressIndex].GetProcessIndex(this);
+                                if (codeAddressProcessIndex == process.ProcessIndex)
+                                    break;
+                            }
+                            else
+                            {
+                                // Optimization.   If the code address has a ModuleFile and that matches what we would have set this entry
+                                // to be, then even though the processes don't match we can reuse the entry because all interesting infromation
+                                // in the CodeAddress is the same.   This allows us to share code addresses across process (eg for all Kernel32, 
+                                // and other OS dlls which can be significant in multi-process scenarios). 
+
+                                // This optimziation does not work for the circular buffer case, because we may not know that a module is loaded
+                                // but, hey, this is just an optimization. 
+                                TraceLoadedModule module = process.LoadedModules.GetModuleContainingAddress(address, time100ns);
+                                if (module != null && module.ModuleFile.ModuleFileIndex == codeAddressModuleFileIndex)
+                                    break;
+                            }
+                        }
+                    }
 
                     CodeAddressBucketEntry nextEntry = codeAddressInfo.next;
                     if (nextEntry == null || address < nextEntry.address)
                     {
-                        codeAddressInfo.next = NewEntry(context, address, nextEntry);
+                        codeAddressInfo.next = NewCodeAddressEntry(process, address, nextEntry);
+                        codeAddressInfo = codeAddressInfo.next;
                         break;
                     }
                     codeAddressInfo = codeAddressInfo.next;
                 }
             }
-            return codeAddressInfo;
+
+            this.codeAddresses.UnderlyingArray[(int)codeAddressInfo.codeAddressIndex].UpdateStats();
+            return codeAddressInfo.codeAddressIndex;
         }
 
-        private CodeAddressBucketEntry NewEntry(TraceEvent context, Address address, CodeAddressBucketEntry next)
+        private CodeAddressBucketEntry NewCodeAddressEntry(TraceProcess process, Address address, CodeAddressBucketEntry next)
         {
-            TraceProcess process = log.Processes.GetOrCreateProcess(context.ProcessID, context.TimeStamp100ns);
-            TraceLoadedModule module = process.LoadedModules.GetModuleContainingAddress(address, context.TimeStamp100ns);
-            if (module == null)
-            {
-                // Not mapped in process address space, maybe it is a kernel address.  
-                // Uniformly, kernel modules are above this (even on 64 bit and even with 3Gig etc). 
-                if ((ulong)address >= (ulong)0x80000000)
-                {
-                    // The kernel is represented as the process with id 0,  It is logically mappped into
-                    // every process.  
-                    // We pick a time in the middle arbitrarily.  
-                    long midTime100ns = (log.SessionStartTime100ns + log.SessionEndTime100ns) / 2;
-                    if (kernelProcess == null)
-                        kernelProcess = log.Processes.GetProcess(0, midTime100ns);
-                    if (kernelProcess != null)
-                        module = kernelProcess.LoadedModules.GetModuleContainingAddress(address, midTime100ns);
-                }
-            }
-
-            Diagnostics.Eventing.ModuleFileIndex moduleFileIndex = Diagnostics.Eventing.ModuleFileIndex.Invalid;
-            if (module != null)
-                moduleFileIndex = module.ModuleFile.ModuleFileIndex;
-
             CodeAddressIndex codeAddressIndex = (CodeAddressIndex)codeAddresses.Count;
-            codeAddresses.Add(new CodeAddressInfo(address, moduleFileIndex));
+            codeAddresses.Add(new CodeAddressInfo(address, process.ProcessIndex));
 
             CodeAddressBucketEntry codeAddressInfo = new CodeAddressBucketEntry(address, codeAddressIndex, next);
             return codeAddressInfo;
@@ -3813,7 +5255,7 @@ namespace Diagnostics.Eventing
             if (options.SourceLineNumbers)
                 options.ConversionLog.WriteLine("Looking up symbolic information for line number and methods.");
             else
-                options.ConversionLog.WriteLine("Looking up symbolic information for just methods.");
+                options.ConversionLog.WriteLine("Looking up symbolic information for methods (no line numbers).");
 
             SymbolReader reader = null;
             int totalAddressCount = 0;
@@ -3825,17 +5267,22 @@ namespace Diagnostics.Eventing
                 TraceModuleFile moduleFile = moduleFiles[ModuleFileIndex(codeAddressIndexCursor.Current)];
                 if (moduleFile != null)
                 {
-                    if (options.ShouldResolveSymbols(moduleFile.FileName))
+                    if (options.ShouldResolveSymbols(moduleFile.FilePath))
                     {
                         if (reader == null)
                         {
-                            SymPath.Clean_NT_SYMBOL_PATH(options.LocalSymbolsOnly, options.ConversionLog);
-                            reader = new SymbolReader(options.ConversionLog);
+                            var symPath = SymPath.CleanSymbolPath();
+                            if (options.LocalSymbolsOnly)
+                                symPath = symPath.LocalOnly();
+                            var path = symPath.ToString();
+                            options.ConversionLog.WriteLine("_NT_SYMBOL_PATH={0}", path);
+                            reader = new SymbolReader(options.ConversionLog, path);
                         }
                         int moduleAddressCount = 0;
                         try
                         {
-                            notDone = LookupSymbolsForModule(reader, moduleFile, codeAddressIndexCursor, options, out moduleAddressCount);
+                            notDone = true;
+                            LookupSymbolsForModule(reader, moduleFile, codeAddressIndexCursor, false, out moduleAddressCount);
                         }
                         catch (Exception e)
                         {
@@ -3872,126 +5319,487 @@ namespace Diagnostics.Eventing
                 noModulePercent = noModuleAddressCount * 100.0 / totalAddressCount;
             options.ConversionLog.WriteLine("A total of " + totalAddressCount + " symbolic addresses were looked up.");
             options.ConversionLog.WriteLine("Addresses outside any module: " + noModuleAddressCount + " out of " + totalAddressCount + " (" + noModulePercent.ToString("f1") + "%)");
-            options.ConversionLog.WriteLine("Done with symbolic lookup");
+            options.ConversionLog.WriteLine("Done with symbolic lookup.");
         }
 
-        /// <summary>
-        /// LookupSymbolsForModule takes a IEumerator respresenting the 'cursor' to a list of
-        /// sorted code addresses, and this IEnumerator's 'Current' property is the first code
-        /// address in the module 'moduleFile'.  LookupSymbolsForModule should resolve all the
-        /// symbols that are in 'moduleFile' updating the cursor (which now points to the first
-        /// code address outside that module).  It should also increment 'totalAddressCount' for
-        /// each address it finds.   It will return 'true' if the updated cursor is not at the end
-        /// of the enumeration (that is Current is valid), and false otherwise.
-        /// </summary>
-        private bool LookupSymbolsForModule(SymbolReader reader, TraceModuleFile moduleFile, IEnumerator<CodeAddressIndex> codeAddressIndexCursor, TraceLogOptions options, out int totalAddressCount)
+        // TODO number of args is getting messy.
+        private void LookupSymbolsForModule(SymbolReader reader, TraceModuleFile moduleFile,
+            IEnumerator<CodeAddressIndex> codeAddressIndexCursor, bool enumerateAll, out int totalAddressCount)
         {
-            Debug.Assert(moduleFiles[ModuleFileIndex(codeAddressIndexCursor.Current)] == moduleFile);
+            // TODO getSourceLineNumbers is not implemented.  
             totalAddressCount = 0;
             int existingSymbols = 0;
             int distinctSymbols = 0;
             int unmatchedSymbols = 0;
             int repeats = 0;
 
-            options.ConversionLog.WriteLine("[Loading symbols for " + Path.GetFileName(moduleFile.FileName) + "]");
+            // We can get the same name for different addresses, which makes us for distinct methods
+            // which in turn cause the treeview to have multiple children with the same name.   This
+            // is confusing, so we intern the symobls, insuring that code address with the same name
+            // always use the same method.   This dictionary does that.  
+            var methodIntern = new Dictionary<string, MethodIndex>();
 
-            using (SymbolReaderModule moduleReader = OpenModuleFile(reader, moduleFile))
+            reader.m_log.WriteLine("[Loading symbols for " + moduleFile.FilePath + "]");
+
+            SymbolModule moduleReader = OpenPdbForModuleFile(reader, moduleFile);
+            if (moduleReader == null)
             {
-                options.ConversionLog.WriteLine("Loaded, resolving symbols");
-                string currentMethodName = "";
-                string currentSourceFileName = "";
-                MethodIndex currentMethodIndex = Diagnostics.Eventing.MethodIndex.Invalid;
-                Address currentMethodEnd = Diagnostics.Eventing.Address.Null;
-                Address endModule = moduleFile.ImageEnd;
-                for (; ; )
+                reader.m_log.WriteLine("Could not find PDB file.");
+                return;
+            }
+
+            reader.m_log.WriteLine("Loaded, resolving symbols");
+            string currentMethodName = "";
+            MethodIndex currentMethodIndex = Diagnostics.Tracing.MethodIndex.Invalid;
+            Address currentMethodEnd = 0;
+            Address endModule = moduleFile.ImageEnd;
+            for (; ; )
+            {
+                // options.ConversionLog.WriteLine("Code address = " + Address(codeAddressIndexCursor.Current).ToString("x"));
+                totalAddressCount++;
+                Address address = Address(codeAddressIndexCursor.Current);
+                if (!enumerateAll && address >= endModule)
+                    break;
+
+                MethodIndex methodIndex = MethodIndex(codeAddressIndexCursor.Current);
+                if (methodIndex == Diagnostics.Tracing.MethodIndex.Invalid)
                 {
-                    // options.ConversionLog.WriteLine("Code address = " + Address(codeAddressIndexCursor.Current).ToString("x"));
-                    totalAddressCount++;
-                    Address address = Address(codeAddressIndexCursor.Current);
-                    if (address >= endModule)
-                        break;
-
-                    MethodIndex methodIndex = MethodIndex(codeAddressIndexCursor.Current);
-                    if (methodIndex == Diagnostics.Eventing.MethodIndex.Invalid)
+                    if (address < currentMethodEnd)
                     {
-                        int line = 0;
-                        string newSourceFilename = "";
-                        if (options.SourceLineNumbers)
-                            moduleReader.FindSourceLineForAddress(address, out line, ref newSourceFilename);
+                        repeats++;
+                        // options.ConversionLog.WriteLine("Repeat of " + currentMethodName + " at " + address.ToString("x"));  
+                    }
+                    else
+                    {
+                        var newMethodName = moduleReader.FindNameForRva((uint)(address - moduleFile.ImageBase));
+                        if (newMethodName.Length > 0)
+                        {
+                            // TODO FIX NOW 
+                            // Debug.WriteLine(string.Format("Info: address  0x{0:x} in sym {1}", address, newMethodName));
+                            // TODO FIX NOW 
+                            currentMethodEnd = address + 1;     // Look up each unique address.  
 
-                        if (address < currentMethodEnd)
-                        {
-                            repeats++;
-                            // options.ConversionLog.WriteLine("Repeat of " + currentMethodName + " at " + address.ToString("x"));  
-                        }
-                        else
-                        {
-                            var newMethodName = moduleReader.FindSymbolForAddress(address, out currentMethodEnd);
-                            if (newMethodName.Length > 0)
+                            // TODO FIX NOW remove 
+                            // newMethodName = newMethodName +  " 0X" + address.ToString("x");
+
+                            // If we get the exact same method name, then again we have a repeat
+                            // In theory this should not happen, but in it seems to happen in
+                            // practice.  
+                            if (newMethodName == currentMethodName)
+                                repeats++;
+                            else
                             {
-
-                                // If we get the exact same method name, then again we have a repeat
-                                // In theory this should not happen, but in it seems to happen in
-                                // practice.  
-                                if (newMethodName == currentMethodName && newSourceFilename == currentSourceFileName)
-                                    repeats++;
-                                else
+                                currentMethodName = newMethodName;
+                                if (!methodIntern.TryGetValue(newMethodName, out currentMethodIndex))
                                 {
-                                    currentMethodName = newMethodName;
-                                    currentSourceFileName = newSourceFilename;
-                                    currentMethodIndex = methods.NewMethod(currentMethodName, currentSourceFileName);
+                                    currentMethodIndex = methods.NewMethod(newMethodName, moduleFile.ModuleFileIndex, 0);
+                                    methodIntern[newMethodName] = currentMethodIndex;
                                     distinctSymbols++;
                                 }
                             }
-                            else
-                            {
-                                unmatchedSymbols++;
-                                currentMethodName = currentSourceFileName = "";
-                                currentMethodIndex = Diagnostics.Eventing.MethodIndex.Invalid;
-                            }
                         }
-
-                        if (currentMethodIndex != Diagnostics.Eventing.MethodIndex.Invalid)
+                        else
                         {
-                            CodeAddressInfo codeAddressInfo = codeAddresses[(int)codeAddressIndexCursor.Current];
-                            codeAddressInfo.methodIndex = currentMethodIndex;
-                            codeAddressInfo.moduleFileIndex = moduleFile.ModuleFileIndex;
-                            Debug.Assert(moduleFile.ModuleFileIndex != Eventing.ModuleFileIndex.Invalid);
-                            codeAddressInfo.sourceLineNumber = line;
-                            codeAddresses[(int)codeAddressIndexCursor.Current] = codeAddressInfo;
+                            unmatchedSymbols++;
+                            currentMethodName = "";
+                            currentMethodIndex = Diagnostics.Tracing.MethodIndex.Invalid;
+                        }
+                    }
+
+                    if (currentMethodIndex != Diagnostics.Tracing.MethodIndex.Invalid)
+                    {
+                        CodeAddressInfo codeAddressInfo = codeAddresses[(int)codeAddressIndexCursor.Current];
+                        codeAddressInfo.SetMethodIndex(this, currentMethodIndex);
+                        Debug.Assert(codeAddressInfo.ModuleFileIndex == moduleFile.ModuleFileIndex);
+                        Debug.Assert(moduleFile.ModuleFileIndex != Diagnostics.Tracing.ModuleFileIndex.Invalid);
+                        codeAddresses[(int)codeAddressIndexCursor.Current] = codeAddressInfo;
+                    }
+                }
+                else
+                {
+                    // options.ConversionLog.WriteLine("Found existing method " + Methods[methodIndex].FullMethodName);
+                    existingSymbols++;
+                }
+
+                if (!codeAddressIndexCursor.MoveNext())
+                    break;
+            }
+            reader.m_log.WriteLine("    Addresses to look up       " + totalAddressCount);
+            if (existingSymbols != 0)
+                reader.m_log.WriteLine("        Existing Symbols       " + existingSymbols);
+            reader.m_log.WriteLine("        Found Symbols          " + (distinctSymbols + repeats));
+            reader.m_log.WriteLine("        Distinct Found Symbols " + distinctSymbols);
+            reader.m_log.WriteLine("        Unmatched Symbols " + (totalAddressCount - (distinctSymbols + repeats)));
+        }
+
+        // These are a private cache for OpenModuleFile
+        SymbolReader m_symbolReader;
+        SymbolModule m_symbolReaderModule;
+        TraceModuleFile m_moduleFileForSymbolReaderModule;
+
+        /// <summary>
+        /// Tries to open the PDB for 'moduleFile'.  Returns null if unsuccessful. 
+        /// TODO FIX NOW this belongs on a TraceModuleFile.  
+        /// </summary>
+        public unsafe SymbolModule OpenPdbForModuleFile(SymbolReader symReader, TraceModuleFile moduleFile)
+        {
+            Debug.Assert(!symReader.IsDisposed);
+            if (m_symbolReaderModule != null && m_moduleFileForSymbolReaderModule == moduleFile && symReader == m_symbolReader)
+                return m_symbolReaderModule;
+
+            // Is it an NGEN image, in that case try to generate it
+            string pdbFileName = null;
+            if (moduleFile.FilePath.EndsWith(".ni.dll", StringComparison.OrdinalIgnoreCase) ||
+                moduleFile.FilePath.EndsWith(".ni.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                bool shouldGenerateNGenPdb = log.CurrentMachineIsCollectionMachine();
+                if (!shouldGenerateNGenPdb && moduleFile.TimeDateStamp != 0)
+                {
+                    // If we happen to have the same NGEN image on this machine, we can generate it here.
+                    if (File.Exists(moduleFile.FilePath))
+                    {
+                        using (var peFile = new PEFile.PEFile(moduleFile.FilePath))
+                        {
+                            // Note that we NGEN the image if it is the same path (which is a pretty strong indication)
+                            // and the same size.   This is not perfect but we will confirm it for sure later.  At worst we
+                            // generate a NGEN pdb that we did not need. 
+                            if (peFile.Header.SizeOfImage == moduleFile.ImageSize)
+                                shouldGenerateNGenPdb = true;
+                        }
+                    }
+                }
+                if (shouldGenerateNGenPdb)
+                {
+                    if ((symReader.Flags & SymbolReaderFlags.NoNGenPDB) == 0)
+                        pdbFileName = GenerateNGenPdb(symReader, moduleFile.FilePath);
+                    else
+                        symReader.m_log.WriteLine("No NGenPDB set on symbol reader, if not found, will skip generation of {0}", moduleFile.FilePath);
+                }
+                else
+                {
+                    symReader.m_log.WriteLine("Found NGen image, but we are not on the Collection machine");
+                    symReader.m_log.WriteLine("Skipping NGen PDB creation for {0}", moduleFile.FilePath);
+                }
+            }
+
+            if (pdbFileName == null)
+            {
+                if (moduleFile.PdbSignature != Guid.Empty)
+                {
+                    pdbFileName = symReader.FindSymbolFilePath(moduleFile.PdbName, moduleFile.PdbSignature, moduleFile.PdbAge, moduleFile.FilePath, moduleFile.FileVersion);
+
+                    // We have cases where people rename symbol files from the name at build time to match the DLL name see if this is the case
+                    // THis is not that important of a case and can be ripped out.  
+                    if (pdbFileName == null)
+                    {
+                        var simplePdbName = Path.GetFileNameWithoutExtension(moduleFile.PdbName);
+                        var simpleDllName = Path.GetFileNameWithoutExtension(moduleFile.FilePath);
+                        if (string.Compare(simplePdbName, simpleDllName, StringComparison.OrdinalIgnoreCase) != 0)
+                        {
+                            simplePdbName = simpleDllName + ".pdb";
+                            symReader.m_log.WriteLine("The DLL name at build time differs from run time, trying a DLL based PDB name {0}", simplePdbName);
+                            pdbFileName = symReader.FindSymbolFilePath(simplePdbName, moduleFile.PdbSignature, moduleFile.PdbAge, moduleFile.FilePath, moduleFile.FileVersion);
+                        }
+                    }
+                }
+                else
+                {
+                    // TODO FIX NOW, is it OK that I simply remove this?
+                    // if (moduleFile.ImageBase == 0)
+                    //     throw new ApplicationException("No image load location for module " + moduleFile.FileName + " (managed code?).  Can't load syms.");
+
+                    // See if we are viewing on the machine where we collected the data.  If we can still be able to find the PDB.
+                    if (!log.CurrentMachineIsCollectionMachine())
+                    {
+                        if (UnsafePDBMatching)
+                        {
+                            symReader.m_log.WriteLine("WARNING: The log file does not contain exact PDB signature information for {0}",
+                                moduleFile.FilePath);
+                            symReader.m_log.WriteLine("and the collection machine != current machine.");
+                            symReader.m_log.WriteLine("The symbols for {0} may be wildly incorrect.", moduleFile.FilePath);
+                            symReader.m_log.WriteLine("Did you merge the ETL file before transfering it off the collection machine?");
+
+                            // TODO maybe we should rip this Unsafe PDB stuff out? 
+                            var pdbSimpleName = Path.GetFileNameWithoutExtension(moduleFile.FilePath) + ".pdb";
+                            pdbFileName = symReader.FindSymbolFilePath(pdbSimpleName, Guid.Empty, 0);
+                        }
+                        else
+                        {
+                            if (log.PointerSize == 8 && moduleFile.FilePath.IndexOf(@"\windows\System32", StringComparison.OrdinalIgnoreCase) >= 0)
+                                symReader.m_log.WriteLine(
+                                    "Warning: could not find PDB signature of a 64 bit OS DLL.  Did you collect with a 32 bit version of XPERF?");
+                            throw new ApplicationException(
+                                "Trace does not contain PDB signature and resolution is not on the collection machine.\r\n" +
+                                "You must use the merge command when generating the ETL file to avoid this problem.\r\n" +
+                                "The /UnsafePDBMatch will force PDB lookup without a signature, but can result in incorrect symbols\r\n");
                         }
                     }
                     else
                     {
-                        // options.ConversionLog.WriteLine("Found existing method " + Methods[methodIndex].FullMethodName);
-                        existingSymbols++;
+                        symReader.m_log.WriteLine("No PDB signature for {0} in trace.", moduleFile.FilePath);
+                        symReader.m_log.WriteLine("Data collected on current machine, looking up PDB by EXE");
+                        pdbFileName = symReader.FindSymbolFilePathForModule(moduleFile.FilePath);
                     }
-
-                    if (!codeAddressIndexCursor.MoveNext())
-                        break;
                 }
-                options.ConversionLog.WriteLine("    Addresses to look up       " + totalAddressCount);
-                if (existingSymbols != 0)
-                    options.ConversionLog.WriteLine("        Existing Symbols       " + existingSymbols);
-                options.ConversionLog.WriteLine("        Found Symbols          " + (distinctSymbols + repeats));
-                options.ConversionLog.WriteLine("        Distinct Found Symbols " + distinctSymbols);
-                options.ConversionLog.WriteLine("        Unmatched Symbols " + (totalAddressCount - (distinctSymbols + repeats)));
             }
-            return true;
+            if (pdbFileName == null)
+                return null;
+
+            // At this point pdbFileName is set!
+            m_symbolReaderModule = symReader.OpenSymbolFile(pdbFileName);
+            if (m_symbolReaderModule != null)
+            {
+                m_symbolReaderModule.ExePath = moduleFile.FilePath;
+
+                // Currently NGEN pdbs do not have source server information, but the managed version does.
+                // Thus we remember the lookup info for the managed PDB too so we have it if we need source server info 
+                var managed = moduleFile.ManagedModule;
+                if (managed != null)
+                {
+                    m_symbolReaderModule.LogManagedInfo(managed.PdbName, managed.PdbSignature, managed.pdbAge);
+                }
+            }
+
+            symReader.m_log.WriteLine("Opened Pdb file {0}", pdbFileName);
+            // TODO FIX NOW turn on cache
+            // m_symbolReader = reader;
+            // m_moduleFileForSymbolReaderModule = moduleFile;
+            return m_symbolReaderModule;
         }
 
-        private unsafe SymbolReaderModule OpenModuleFile(SymbolReader reader, TraceModuleFile moduleFile)
+        public static string GenerateNGenPdb(SymbolReader symReader, string ngenImagePath)
         {
-            if (moduleFile.PdbSignature != Guid.Empty)
+            var log = symReader.m_log;
+            if (!File.Exists(ngenImagePath))
             {
-                var pdbFile = reader.FindSymbolFilePath(moduleFile.PdbName, moduleFile.PdbSignature, moduleFile.PdbAge);
-                if (pdbFile == null)
-                    throw new Exception("Could not find PDB file " + moduleFile.PdbName + 
-                        " with signature " + moduleFile.PdbSignature + " and age " + moduleFile.PdbAge + ".");
-                return reader.OpenSymbolFile(pdbFile, moduleFile.ImageBase);
+                log.WriteLine("Warning, NGEN image does not exist: {0}", ngenImagePath);
+                return null;
             }
-            // TODO FIX NOW Only do this if the trace is on the same machine.  
-            return reader.OpenSymbolsForModule(moduleFile.FileName, moduleFile.ImageBase);
+
+
+            // When V4.5 shipped, NGEN CreatePdb did not support looking up the IL pdb using symbol servers.  
+            // We work around by explicitly fetching the IL PDB and pointing NGEN CreatePdb at that.  
+            string ilPdbName = null;
+            Guid ilPdbGuid = Guid.Empty;
+            int ilPdbAge = 0;
+
+            string pdbName;
+            Guid pdbGuid;
+            int pdbAge;
+            using (var peFile = new PEFile.PEFile(ngenImagePath))
+            {
+                if (!peFile.GetPdbSignature(out pdbName, out pdbGuid, out pdbAge, true))
+                {
+                    log.WriteLine("Could not get PDB signature for {0}", ngenImagePath);
+                    return null;
+                }
+
+                // Also get the IL pdb information
+                peFile.GetPdbSignature(out ilPdbName, out ilPdbGuid, out ilPdbAge, false);
+            }
+
+            // Fast path, the file already exists.
+            pdbName = Path.GetFileName(pdbName);
+            var relPath = pdbName + "\\" + pdbGuid.ToString("N") + pdbAge.ToString() + "\\" + pdbName;
+            var pdbPath = Path.Combine(symReader.SymbolCacheDirectory, relPath);
+            if (File.Exists(pdbPath))
+                return pdbPath;
+
+            var clrDir = GetClrDirectoryForNGenImage(ngenImagePath, log);
+            if (clrDir == null)
+                return null;
+
+            // See if this is a V4.5 CLR, if so we can do line numbers too.l  
+            var lineNumberArg = "";
+            var ngenexe = Path.Combine(clrDir, "ngen.exe");
+            log.WriteLine("Checking for V4.5 for NGEN image {0}", ngenexe);
+            if (!File.Exists(ngenexe))
+                return null;
+            var isV4_5Runtime = false;
+
+            Match m;
+            using (var peFile = new PEFile.PEFile(ngenexe))
+            {
+                var fileVersionInfo = peFile.GetFileVersionInfo();
+                if (fileVersionInfo != null)
+                {
+                    var clrFileVersion = fileVersionInfo.FileVersion;
+                    m = Regex.Match(clrFileVersion, @"^[\d.]+\.(\d+) ");       // Fetch the build number (last number)
+                    if (m.Success)
+                    {
+                        // Is this a V4.5 runtime?
+                        var buildNumber = int.Parse(m.Groups[1].Value);
+                        log.WriteLine("Got NGEN.exe Build number: {0}", buildNumber);
+                        if (buildNumber > 16000)
+                        {
+                            if (ilPdbName != null)
+                            {
+                                var ilPdbPath = symReader.FindSymbolFilePath(ilPdbName, ilPdbGuid, ilPdbAge);
+                                if (ilPdbPath != null)
+                                    lineNumberArg = "/lines " + Command.Quote(Path.GetDirectoryName(ilPdbPath));
+                                else
+                                    log.WriteLine("Could not find IL PDB {0} Guid {1} Age {2}.", ilPdbName, ilPdbGuid, ilPdbAge);
+                            }
+                            else
+                                log.WriteLine("NGEN image did not have IL PDB information, giving up on line number info.");
+                            isV4_5Runtime = true;
+                        }
+                    }
+                }
+            }
+
+            var options = new CommandOptions();
+            options.AddEnvironmentVariable("COMPLUS_NGenEnableCreatePdb", "1");
+
+            // NGenLocalWorker is needed for V4.0 runtims but interferes on V4.5 runtimes.  
+            if (!isV4_5Runtime)
+                options.AddEnvironmentVariable("COMPLUS_NGenLocalWorker", "1");
+            options.AddEnvironmentVariable("_NT_SYMBOL_PATH", symReader.SymbolPath);
+            var newPath = "%PATH%;" + clrDir;
+            options.AddEnvironmentVariable("PATH", newPath);
+            options.AddOutputStream(log);
+            options.AddNoThrow();
+
+            // For Metro Auto-NGEN images we need to use a location where the app can write the PDB file
+            var outputDirectory = symReader.SymbolCacheDirectory;
+            var outputPdbPath = pdbPath;
+
+            // Find the tempDir where we can write.  
+            string tempDir = null;
+            m = Regex.Match(ngenImagePath, @"(.*)\\Microsoft\\CLR_v(\d+)\.\d+(_(\d\d))?\\NativeImages", RegexOptions.IgnoreCase);
+            if (m.Success)
+            {
+                tempDir = Path.Combine(m.Groups[1].Value, @"Temp\NGenPdb");
+                DirectoryUtilities.Clean(tempDir);
+                Directory.CreateDirectory(tempDir);
+                outputDirectory = tempDir;
+                outputPdbPath = Path.Combine(tempDir, relPath);
+                log.WriteLine("Updating NGEN createPdb output file to {0}", outputPdbPath); // TODO FIX NOW REMOVE (for debugging)
+            }
+            try
+            {
+
+                for (; ; ) // Loop for retrying without /lines 
+                {
+                    // TODO FIX NOW: there is a and ugly problem with persistance of suboptimial PDB files
+                    // This is made pretty bad because the not finding the IL pdbs is enough to make it fail.  
+
+                    // TODO we need to figure out a convention show we know that we have fallen back to no-lines
+                    // and we should regenerate it if we ultimately get the PDB information 
+                    var cmdLine = string.Format(@"{0}\ngen.exe createpdb {1} {2} {3}",
+                        clrDir, Command.Quote(ngenImagePath), Command.Quote(outputDirectory), lineNumberArg);
+                    // TODO FIX NOW REMOVE after V4.5 is out a while
+                    log.WriteLine("set COMPLUS_NGenEnableCreatePdb=1");
+                    if (!isV4_5Runtime)
+                        log.WriteLine("set COMPLUS_NGenLocalWorker=1");
+                    log.WriteLine("set PATH=" + newPath);
+                    log.WriteLine("set _NT_SYMBOL_PATH={0}", symReader.SymbolPath);
+                    log.WriteLine("*** NGEN  CREATEPDB cmdline: {0}\r\n", cmdLine);
+                    options.AddOutputStream(log);
+                    var cmd = Command.Run(cmdLine, options);
+                    log.WriteLine("*** NGEN CREATEPDB returns: {0}", cmd.ExitCode);
+
+                    if (cmd.ExitCode != 0)
+                    {
+                        // ngen might make a bad PDB, so if it returns failure delete it.  
+                        if (File.Exists(outputPdbPath))
+                            File.Delete(outputPdbPath);
+
+                        // We may have failed because we could not get the PDB.  
+                        if (lineNumberArg.Length != 0)
+                        {
+                            log.WriteLine("Ngen failed to generate pdb for {0}, trying again without /lines", ngenImagePath);
+                            lineNumberArg = "";
+                            continue;
+                        }
+                    }
+
+                    if (cmd.ExitCode != 0 || !File.Exists(outputPdbPath))
+                    {
+                        log.WriteLine("ngen failed to generate pdb for {0} at expected location {1}", ngenImagePath, outputPdbPath);
+                        return null;
+                    }
+
+                    // Copy the file to where we want the PDB to live.  
+                    if (outputPdbPath != pdbPath)
+                    {
+                        Directory.CreateDirectory(Path.GetDirectoryName(pdbPath));        // Make sure the destination directory exists.
+                        File.Copy(outputPdbPath, pdbPath);
+                    }
+                    return pdbPath;
+                }
+            }
+            finally
+            {
+                // Insure we have cleaned up any temporary files.  
+                if (tempDir != null)
+                    DirectoryUtilities.Clean(tempDir);
+            }
+        }
+
+        /// <summary>
+        /// Deduce the path to where CLR.dll (and in particular NGEN.exe live for the NGEN image 'ngenImagepath')
+        /// Returns null if it can't be found
+        /// </summary>
+        private static string GetClrDirectoryForNGenImage(string ngenImagePath, TextWriter log)
+        {
+            string majorVersion;
+            // Set the default bitness
+            string bitness = "";
+            var m = Regex.Match(ngenImagePath, @"^(.*)\\assembly\\NativeImages_(v(\d+)[\dA-Za-z.]*)_(\d\d)\\", RegexOptions.IgnoreCase);
+            if (m.Success)
+            {
+                var basePath = m.Groups[1].Value;
+                var version = m.Groups[2].Value;
+                majorVersion = m.Groups[3].Value;
+                bitness = m.Groups[4].Value;
+
+                // See if this NGEN image was in a NIC associated with a private runtime.  
+                if (basePath.EndsWith(version))
+                {
+                    if (Directory.Exists(basePath))
+                        return basePath;
+                }
+            }
+            else
+            {
+                m = Regex.Match(ngenImagePath, @"\\Microsoft\\CLR_v(\d+)\.\d+(_(\d\d))?\\NativeImages", RegexOptions.IgnoreCase);
+                if (m.Success)
+                {
+                    majorVersion = m.Groups[1].Value;
+                    bitness = m.Groups[3].Value;
+                }
+                else
+                {
+                    log.WriteLine("Warning: Could not deduce CLR version from path of NGEN image, skipping {0}", ngenImagePath);
+                    return null;
+                }
+            }
+
+            // Only version 4.0 of the runtime has NGEN PDB support 
+            if (int.Parse(majorVersion) < 4)
+            {
+                log.WriteLine("Pre V4.0 native image, skipping: {0}", ngenImagePath);
+                return null;
+            }
+
+            var winDir = Environment.GetEnvironmentVariable("winDir");
+
+            // If not set, 64 bit OS means we default to 64 bit.  
+            if (bitness == "" && Environment.GetEnvironmentVariable("PROCESSOR_ARCHITEW6432") != null)
+                bitness = "64";
+
+            if (bitness != "64")
+                bitness = "";
+
+            var frameworkDir = Path.Combine(winDir, @"Microsoft.NET\Framework" + bitness);
+            var candidates = Directory.GetDirectories(frameworkDir, "v" + majorVersion + ".*");
+            if (candidates.Length != 1)
+            {
+                log.WriteLine("Warning: Could not find Version {0} of the .NET Framework in {1}", majorVersion, frameworkDir);
+                return null;
+            }
+            return candidates[0];
         }
 
         void IFastSerializable.ToStream(Serializer serializer)
@@ -4006,14 +5814,17 @@ namespace Diagnostics.Eventing
                 serializer.Log("<WriteColection name=\"codeAddresses\" count=\"" + codeAddresses.Count + "\">\r\n");
                 for (int i = 0; i < codeAddresses.Count; i++)
                 {
-                    serializer.WriteAddress(codeAddresses[i].address);
-                    serializer.Write(codeAddresses[i].sourceLineNumber);
-                    serializer.Write((int)codeAddresses[i].moduleFileIndex);
-                    serializer.Write((int)codeAddresses[i].methodIndex);
-                    Debug.Assert(!(codeAddresses[i].methodIndex != Eventing.MethodIndex.Invalid &&
-                                  codeAddresses[i].moduleFileIndex == Eventing.ModuleFileIndex.Invalid));
+                    serializer.WriteAddress(codeAddresses[i].Address);
+                    serializer.Write((int)codeAddresses[i].ModuleFileIndex);
+                    serializer.Write((int)codeAddresses[i].methodOrProcessOrIlMapIndex);
+                    serializer.Write(codeAddresses[i].InclusiveCount);
                 }
+                serializer.Write(totalCodeAddresses);
                 serializer.Log("</WriteColection>\r\n");
+
+                serializer.Write(ILToNativeMaps.Count);
+                for (int i = 0; i < ILToNativeMaps.Count; i++)
+                    serializer.Write(ILToNativeMaps[i]);
             });
         }
 
@@ -4031,13 +5842,17 @@ namespace Diagnostics.Eventing
                 codeAddresses = new GrowableArray<CodeAddressInfo>(count + 1);
                 for (int i = 0; i < count; i++)
                 {
-                    deserializer.ReadAddress(out codeAddressInfo.address);
-                    deserializer.Read(out codeAddressInfo.sourceLineNumber);
-                    int index;
-                    deserializer.Read(out index); codeAddressInfo.moduleFileIndex = (ModuleFileIndex)index;
-                    deserializer.Read(out index); codeAddressInfo.methodIndex = (MethodIndex)index;
+                    deserializer.ReadAddress(out codeAddressInfo.Address);
+                    codeAddressInfo.ModuleFileIndex = (ModuleFileIndex)deserializer.ReadInt();
+                    codeAddressInfo.methodOrProcessOrIlMapIndex = deserializer.ReadInt();
+                    deserializer.Read(out codeAddressInfo.InclusiveCount);
                     codeAddresses.Add(codeAddressInfo);
                 }
+                deserializer.Read(out totalCodeAddresses);
+
+                ILToNativeMaps.Count = deserializer.ReadInt();
+                for (int i = 0; i < ILToNativeMaps.Count; i++)
+                    deserializer.Read(out ILToNativeMaps.UnderlyingArray[i]);
             });
             lazyCodeAddresses.FinishRead();        // TODO REMOVE 
         }
@@ -4047,23 +5862,270 @@ namespace Diagnostics.Eventing
             throw new NotImplementedException(); // GetEnumerator
         }
 
-        private struct CodeAddressInfo
+        internal struct CodeAddressInfo
         {
-            internal CodeAddressInfo(Address address, ModuleFileIndex moduleFileIndex)
+            internal CodeAddressInfo(Address address, ProcessIndex processIndex)
             {
-                this.address = address;
-                this.sourceLineNumber = 0;
-                this.moduleFileIndex = moduleFileIndex;
-                this.methodIndex = Diagnostics.Eventing.MethodIndex.Invalid;
+                this.Address = address;
+                this.ModuleFileIndex = ModuleFileIndex.Invalid;
+                this.methodOrProcessOrIlMapIndex = -2 - ((int)processIndex);      // Encode process index to make it unambiguous with a method index.
+                this.InclusiveCount = 0;
+                Debug.Assert(GetProcessIndex(null) == processIndex);
             }
-            internal Address address;
-            internal int sourceLineNumber;
-            internal ModuleFileIndex moduleFileIndex;
-            internal MethodIndex methodIndex;
+            internal Address Address;
+            internal int InclusiveCount;
+
+            internal ILMapIndex GetILMapIndex(TraceCodeAddresses codeAddresses)
+            {
+                if (methodOrProcessOrIlMapIndex < 0 || (methodOrProcessOrIlMapIndex & 1) == 0)
+                    return ILMapIndex.Invalid;
+                return (ILMapIndex)(methodOrProcessOrIlMapIndex >> 1);
+            }
+            internal void SetILMapIndex(TraceCodeAddresses codeAddresses, ILMapIndex value)
+            {
+                Debug.Assert(value != ILMapIndex.Invalid);
+
+                // We may be overwriting other values, insure that they actually don't change.  
+                Debug.Assert(GetMethodIndex(codeAddresses) == Diagnostics.Tracing.MethodIndex.Invalid ||
+                    GetMethodIndex(codeAddresses) == codeAddresses.ILToNativeMaps[(int)value].MethodIndex);
+                Debug.Assert(methodOrProcessOrIlMapIndex >= 0 ||
+                    GetProcessIndex(codeAddresses) == codeAddresses.ILToNativeMaps[(int)value].ProcessIndex);
+
+                methodOrProcessOrIlMapIndex = ((int)value << 1) + 1;
+
+                Debug.Assert(GetILMapIndex(codeAddresses) == value);
+            }
+
+
+            /// <summary>
+            /// This is only valid until MethodIndex or ModuleFileIndex is set.   
+            /// </summary>
+            internal ProcessIndex GetProcessIndex(TraceCodeAddresses codeAddresses)
+            {
+                if (methodOrProcessOrIlMapIndex < -1)
+                    return (Diagnostics.Tracing.ProcessIndex)(-(methodOrProcessOrIlMapIndex + 2));
+
+                var ilMapIdx = GetILMapIndex(codeAddresses);
+                if (ilMapIdx != ILMapIndex.Invalid)
+                    return codeAddresses.ILToNativeMaps[(int)ilMapIdx].ProcessIndex;
+                // Can't assert because we get here if we have NGEN rundown on an NGEN image 
+                // Debug.Assert(false, "Asking for Process after Method has been set is illegal (to save space)");
+                return Diagnostics.Tracing.ProcessIndex.Invalid;
+            }
+            /// <summary>
+            /// Only for managed code.  
+            /// </summary>
+            internal MethodIndex GetMethodIndex(TraceCodeAddresses codeAddresses)
+            {
+                if (methodOrProcessOrIlMapIndex < 0)
+                    return Diagnostics.Tracing.MethodIndex.Invalid;
+
+                if ((methodOrProcessOrIlMapIndex & 1) == 0)
+                    return (Diagnostics.Tracing.MethodIndex)(methodOrProcessOrIlMapIndex >> 1);
+
+                return codeAddresses.ILToNativeMaps[(int)GetILMapIndex(codeAddresses)].MethodIndex;
+            }
+            internal void SetMethodIndex(TraceCodeAddresses codeAddresses, MethodIndex value)
+            {
+                Debug.Assert(value != Diagnostics.Tracing.MethodIndex.Invalid);
+
+                if (GetILMapIndex(codeAddresses) == TraceCodeAddresses.ILMapIndex.Invalid)
+                    methodOrProcessOrIlMapIndex = (int)(value) << 1;
+                else
+                    Debug.Assert(GetMethodIndex(codeAddresses) == value, "Setting method index when ILMap already set (ignored)");
+
+                Debug.Assert(GetMethodIndex(codeAddresses) == value);
+            }
+            /// <summary>
+            /// Only for unmanaged code.  
+            /// </summary>
+            internal ModuleFileIndex ModuleFileIndex;
+
+            // keep track of how populare each code stack is. 
+            internal void UpdateStats()
+            {
+                InclusiveCount++;
+            }
+
+            // To save space, we reuse this slot during data collection 
+            // If x < -1 it is ProcessIndex, if > -1 and odd, it is an ILMapIndex if > -1 and even it is a MethodIndex.  
+            internal int methodOrProcessOrIlMapIndex;
         }
 
-        // Only used during conversion. 
-        private TraceProcess kernelProcess;             // We make up a 'kernel process' (pid 0), to hold kernel dlls.   
+        private ILMapIndex UnloadILMapForMethod(MethodIndex methodIndex, MethodLoadUnloadVerboseTraceData data)
+        {
+            var process = log.Processes.GetProcess(data.ProcessID, data.TimeStamp100ns);
+            if (process == null)
+                return ILMapIndex.Invalid;
+
+            ILMapIndex ilMapIdx;
+            var ilMap = FindAndRemove(data.MethodID, process.ProcessIndex, out ilMapIdx);
+            if (ilMap == null)
+                return ilMapIdx;
+
+            Debug.Assert(ilMap.MethodStart == 0 || ilMap.MethodStart == data.MethodStartAddress);
+            Debug.Assert(ilMap.MethodLength == 0 || ilMap.MethodLength == data.MethodSize);
+
+            ilMap.MethodStart = data.MethodStartAddress;
+            ilMap.MethodLength = data.MethodSize;
+            Debug.Assert(ilMap.MethodIndex == 0 || ilMap.MethodIndex == methodIndex);
+            ilMap.MethodIndex = methodIndex;
+            return ilMapIdx;
+        }
+
+        /// <summary>
+        /// Find the ILToNativeMap for 'methodId' in process associated with 'processIndex' 
+        /// and then remove it from the table (this is what you want to do when the method is unloaded)
+        /// </summary>
+        private ILToNativeMap FindAndRemove(long methodID, ProcessIndex processIndex, out ILMapIndex mapIdxRet)
+        {
+            ILMapIndex mapIdx;
+            if (methodIDToILToNativeMap != null && methodIDToILToNativeMap.TryGetValue(methodID, out mapIdx))
+            {
+                ILToNativeMap prev = null;
+                while (mapIdx != ILMapIndex.Invalid)
+                {
+                    ILToNativeMap ret = ILToNativeMaps[(int)mapIdx];
+                    if (ret.ProcessIndex == processIndex)
+                    {
+                        if (prev != null)
+                            prev.Next = ret.Next;
+                        else if (ret.Next == ILMapIndex.Invalid)
+                            methodIDToILToNativeMap.Remove(methodID);
+                        else
+                            methodIDToILToNativeMap[methodID] = ret.Next;
+                        mapIdxRet = mapIdx;
+                        return ret;
+                    }
+                    mapIdx = ret.Next;
+                }
+            }
+            mapIdxRet = ILMapIndex.Invalid;
+            return null;
+        }
+
+        internal void AddILMapping(MethodILToNativeMapTraceData data)
+        {
+            var ilMap = new ILToNativeMap();
+            ilMap.Next = ILMapIndex.Invalid;
+            var process = log.Processes.GetProcess(data.ProcessID, data.TimeStamp100ns);
+            if (process == null)
+                return;
+
+            ilMap.ProcessIndex = process.ProcessIndex;
+            ILToNativeMapTuple tuple;
+            for (int i = 0; i < data.CountOfMapEntries; i++)
+            {
+                // There are sepcial prolog and epilog offsets, but the best line approximation 
+                // happens if we simply ignore them, so this is what we do here.  
+                var ilOffset = data.ILOffset(i);
+                if (ilOffset < 0)
+                    continue;
+                tuple.ILOffset = ilOffset;
+                tuple.NativeOffset = data.NativeOffset(i);
+                ilMap.Map.Add(tuple);
+            }
+
+            // They may not come back sorted, but we want to binary search so sort them by native offset (assending)
+            ilMap.Map.Sort((x, y) => x.NativeOffset - y.NativeOffset);
+
+            ILMapIndex mapIdx = (ILMapIndex)ILToNativeMaps.Count;
+            ILToNativeMaps.Add(ilMap);
+            if (methodIDToILToNativeMap == null)
+                methodIDToILToNativeMap = new Dictionary<long, ILMapIndex>(101);
+            ILMapIndex prevIndex;
+            if (methodIDToILToNativeMap.TryGetValue(data.MethodID, out prevIndex))
+                ilMap.Next = prevIndex;
+            methodIDToILToNativeMap[data.MethodID] = mapIdx;
+        }
+
+        internal enum ILMapIndex { Invalid = -1 };
+        internal struct ILToNativeMapTuple
+        {
+            public int ILOffset;
+            public int NativeOffset;
+
+            internal void Deserialize(Deserializer deserializer)
+            {
+                deserializer.Read(out ILOffset);
+                deserializer.Read(out NativeOffset);
+            }
+            internal void Serialize(Serializer serializer)
+            {
+                serializer.Write(ILOffset);
+                serializer.Write(NativeOffset);
+            }
+        }
+
+        internal class ILToNativeMap : IFastSerializable
+        {
+            public ILMapIndex Next;             // We keep a link list of maps with the same start address 
+            // (can only be from different processes);
+            public ProcessIndex ProcessIndex;   // This is not serialized.  
+            public MethodIndex MethodIndex;
+            public Address MethodStart;
+            public int MethodLength;
+            internal GrowableArray<ILToNativeMapTuple> Map;
+
+            public int GetILOffsetForNativeAddress(Address nativeAddress)
+            {
+                int idx;
+                if (nativeAddress < MethodStart || MethodStart + (uint)MethodLength < nativeAddress)
+                    return -1;
+                int nativeOffset = (int)(nativeAddress - MethodStart);
+                Map.BinarySearch(nativeOffset, out idx,
+                    delegate(int key, ILToNativeMapTuple elem) { return key - elem.NativeOffset; });
+                if (idx < 0)
+                    return -1;
+
+                // After looking at the empirical results, it does seem that linear interpolation 
+                // Gives a significantly better approximation of the IL address.  
+                int retIL = Map[idx].ILOffset;
+                int nativeDelta = nativeOffset - Map[idx].NativeOffset;
+                int nextIdx = idx + 1;
+                if (nextIdx < Map.Count && nativeDelta != 0)
+                {
+                    int ILDeltaToNext = Map[nextIdx].ILOffset - Map[idx].ILOffset;
+                    // If the IL deltas are going down don't interpolate.  
+                    if (ILDeltaToNext > 0)
+                    {
+                        int nativeDeltaToNext = Map[nextIdx].NativeOffset - Map[idx].NativeOffset;
+                        retIL += (int)(((double)nativeDelta) / nativeDeltaToNext * ILDeltaToNext + .5);
+                    }
+                    else
+                        return retIL;
+                }
+                // For our use in sampling the EIP is the instruction that COMPLETED, so we actually want to
+                // attribute the time to the line BEFORE this one if we are exactly on the boundary.  
+                // TODO This probably does not belong here, but I only want to this if the IL deltas are going up.  
+                if (retIL > 0)
+                    --retIL;
+                return retIL;
+            }
+
+            void IFastSerializable.ToStream(Serializer serializer)
+            {
+                serializer.Write((int)MethodIndex);
+                serializer.Write((long)MethodStart);
+                serializer.Write(MethodLength);
+
+                serializer.Write(Map.Count);
+                for (int i = 0; i < Map.Count; i++)
+                    Map[i].Serialize(serializer);
+            }
+            void IFastSerializable.FromStream(Deserializer deserializer)
+            {
+                MethodIndex = (MethodIndex)deserializer.ReadInt();
+                deserializer.ReadAddress(out MethodStart);
+                deserializer.Read(out MethodLength);
+
+                Map.Count = deserializer.ReadInt();
+                for (int i = 0; i < Map.Count; i++)
+                    Map.UnderlyingArray[i].Deserialize(deserializer);
+            }
+        }
+        GrowableArray<ILToNativeMap> ILToNativeMaps;                    // only Jitted code has these, indexed by ILMapIndex 
+        Dictionary<long, ILMapIndex> methodIDToILToNativeMap;
 
         /// <summary>
         /// Initialially we only have addresses and we need to group them into methods.   We do this by creating 64 byte 'buckets'
@@ -4075,13 +6137,14 @@ namespace Diagnostics.Eventing
         private TraceCodeAddress[] codeAddressObjects;  // If we were asked for TraceCodeAddresses (instead of indexes) we cache them
         private string[] names;                         // A cache (one per code address) of the string name of the address
         private int managedMethodRecordCount;           // Remembers how many code addresses are managed methods (currently not serialized)
+        internal int totalCodeAddresses;                 // Count of the number of times a code address appears in the log.
 
         // These are actually serialized.  
         private TraceLog log;
         private TraceModuleFiles moduleFiles;
         private TraceMethods methods;
         private DeferedRegion lazyCodeAddresses;
-        private GrowableArray<CodeAddressInfo> codeAddresses;
+        internal GrowableArray<CodeAddressInfo> codeAddresses;
 
         #endregion
     }
@@ -4104,19 +6167,8 @@ namespace Diagnostics.Eventing
     public class TraceCodeAddress
     {
         public CodeAddressIndex CodeAddressIndex { get { return codeAddressIndex; } }
-
         public Address Address { get { return codeAddresses.Address(codeAddressIndex); } }
-        public int SourceLineNumber { get { return codeAddresses.SourceLineNumber(codeAddressIndex); } }
-        public string SourceFileName
-        {
-            get
-            {
-                MethodIndex methodIndex = codeAddresses.MethodIndex(codeAddressIndex);
-                if (methodIndex == MethodIndex.Invalid)
-                    return "";
-                return codeAddresses.Methods.SourceFileName(methodIndex);
-            }
-        }
+
         public string FullMethodName
         {
             get
@@ -4138,6 +6190,11 @@ namespace Diagnostics.Eventing
                     return codeAddresses.Methods[methodIndex];
             }
         }
+        /// <summary>
+        /// This is only valid for managed methods returns -1 if invalid / unavailable
+        /// </summary>
+        public int ILOffset { get { return codeAddresses.ILOffset(codeAddressIndex); } }
+
         public TraceModuleFile ModuleFile
         {
             get
@@ -4169,7 +6226,7 @@ namespace Diagnostics.Eventing
                 TraceModuleFile moduleFile = ModuleFile;
                 if (moduleFile == null)
                     return "";
-                return moduleFile.FileName;
+                return moduleFile.FilePath;
             }
         }
 
@@ -4186,10 +6243,6 @@ namespace Diagnostics.Eventing
                 sb.Append(" FullMethodName=\"").Append(XmlUtilities.XmlEscape(FullMethodName, false)).Append("\"");
             if (ModuleName.Length != 0)
                 sb.Append(" ModuleName=\"").Append(XmlUtilities.XmlEscape(ModuleName, false)).Append("\"");
-            if (SourceLineNumber != 0)
-                sb.Append(" SourceLineNumber=\"").Append(SourceLineNumber).Append("\"");
-            if (SourceFileName.Length > 0)
-                sb.Append(" SourceFileName=\"").Append(XmlUtilities.XmlEscape(SourceFileName, false)).Append("\"");
             sb.Append("/>");
             return sb;
         }
@@ -4203,6 +6256,7 @@ namespace Diagnostics.Eventing
         TraceCodeAddresses codeAddresses;
         CodeAddressIndex codeAddressIndex;
         #endregion
+
     }
 
     public enum ModuleFileIndex { Invalid = -1 };
@@ -4250,17 +6304,18 @@ namespace Diagnostics.Eventing
                     moduleFile = moduleFiles[i];
                     Debug.Assert(moduleFile.next == null);
                     TraceModuleFile collision;
-                    if (moduleFilesByName.TryGetValue(moduleFile.FileName, out collision))
+                    if (moduleFilesByName.TryGetValue(moduleFile.FilePath, out collision))
                         moduleFile.next = collision;
                     else
-                        moduleFilesByName.Add(moduleFile.FileName, moduleFile);
+                        moduleFilesByName.Add(moduleFile.FilePath, moduleFile);
                 }
             }
             if (moduleFilesByName.TryGetValue(fileName, out moduleFile))
             {
                 do
                 {
-                    if (moduleFile.ImageBase == imageBase)
+                    // TODO review the imageBase == 0 condition.  Needed to get PDB signature on managed IL.  
+                    if (moduleFile.ImageBase == imageBase || imageBase == 0)        // imagebase == 0 is managed case, we allow it to match anything.  
                         return moduleFile;
                     //                    options.ConversionLog.WriteLine("WARNING: " + fileName + " loaded with two base addresses 0x" + moduleImageBase.ToString("x") + " and 0x" + moduleFile.moduleImageBase.ToString("x"));
                     moduleFile = moduleFile.next;
@@ -4360,14 +6415,13 @@ namespace Diagnostics.Eventing
         /// The moduleFile name associted with the moduleFile.  May be the empty string if the moduleFile has no moduleFile
         /// (dynamically generated).  For managed code, this is the IL moduleFile name.  
         /// </summary>
-        public string FileName
+        public string FilePath
         {
             get
             {
                 if (fileName == null)
                     return "ManagedModule";
                 return fileName;
-                ;
             }
         }
         /// <summary>
@@ -4378,7 +6432,14 @@ namespace Diagnostics.Eventing
             get
             {
                 if (name == null)
-                    name = Path.GetFileNameWithoutExtension(FileName);
+                {
+                    var filePath = FilePath;
+                    if (filePath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ||
+                        filePath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                        name = Path.GetFileNameWithoutExtension(filePath);
+                    else
+                        name = Path.GetFileName(filePath);
+                }
                 return name;
             }
         }
@@ -4393,6 +6454,19 @@ namespace Diagnostics.Eventing
 
         public string FileVersion { get { return fileVersion; } }
         public int TimeDateStamp { get { return timeDateStamp; } }
+        /// <summary>
+        /// The number of code addresses in this module.  This is useful for determining if 
+        /// this module is worth having its symbolic information looked up or not.   
+        /// 
+        /// This number is defined as the number of appearances this module has in any stack 
+        /// or any event with a code addresss (If the modules appears 5 times in a stack that
+        /// counts as 5 even though it is just one event's stack).  
+        /// </summary>
+        public int CodeAddressesInModule { get { return codeAddressesInModule; } }
+        /// <summary>
+        /// If this is an NGEN image, return the TraceModuleFile of the IL image.  
+        /// </summary>
+        public TraceModuleFile ManagedModule { get { return managedModule; } }
 
         // If the module file was a managed module, this is the moduleID that the CLR associates with it.  
         public override string ToString()
@@ -4401,7 +6475,7 @@ namespace Diagnostics.Eventing
                     "Name=" + XmlUtilities.XmlQuote(Name) + " " +
                     "ModuleFileIndex=" + XmlUtilities.XmlQuote(ModuleFileIndex) + " " +
                     "ImageSize=" + XmlUtilities.XmlQuoteHex(ImageSize) + " " +
-                    "FileName=" + XmlUtilities.XmlQuote(FileName) + " " +
+                    "FileName=" + XmlUtilities.XmlQuote(FilePath) + " " +
                     "ImageBase=" + XmlUtilities.XmlQuoteHex((ulong)ImageBase) + " " +
                     "TimeDateStamp=" + XmlUtilities.XmlQuote(TimeDateStamp) + " " +
                     "PdbName=" + XmlUtilities.XmlQuote(PdbName) + " " +
@@ -4427,13 +6501,15 @@ namespace Diagnostics.Eventing
         internal Address defaultBase;
         internal string name;
         private ModuleFileIndex moduleFileIndex;
-        internal TraceModuleFile next;          // Chain of modules that have the same name (But different image bases)
+        internal TraceModuleFile next;          // Chain of modules that have the same path (But different image bases)
 
         internal string pdbName;
         internal Guid pdbSignature;
         internal int pdbAge;
         internal string fileVersion;
         internal int timeDateStamp;
+        internal int codeAddressesInModule;
+        internal TraceModuleFile managedModule;
 
         void IFastSerializable.ToStream(Serializer serializer)
         {
@@ -4447,6 +6523,9 @@ namespace Diagnostics.Eventing
             serializer.Write(pdbAge);
             serializer.Write(fileVersion);
             serializer.Write(timeDateStamp);
+            serializer.Write((int)moduleFileIndex);
+            serializer.Write(codeAddressesInModule);
+            serializer.Write(managedModule);
         }
         void IFastSerializable.FromStream(Deserializer deserializer)
         {
@@ -4460,6 +6539,9 @@ namespace Diagnostics.Eventing
             deserializer.Read(out pdbAge);
             deserializer.Read(out fileVersion);
             deserializer.Read(out timeDateStamp);
+            moduleFileIndex = (ModuleFileIndex)deserializer.ReadInt();
+            deserializer.Read(out codeAddressesInModule);
+            deserializer.Read(out managedModule);
         }
         #endregion
     }
@@ -4526,12 +6608,41 @@ namespace Diagnostics.Eventing
                 }
                 return m_ConversionLog;
             }
-            set 
+            set
             {
-                 m_ConversionLog = value;
+                m_ConversionLog = value;
             }
         }
         public string ConversionLogName;
+        /// <summary>
+        /// Normally events that are only to convey non-temporal information (like DCStart end Ends, MethodName events, File name evens
+        /// are removed from the stream.   However sometimes it is useful to keep these events (typically for deubgging TraceEvent itslef)
+        /// </summary>
+        public bool KeepAllEvents;
+        /// <summary>
+        /// Sometimes you collect too much data, and you just want to look at a fraction of it to speed things up
+        /// (or to keep file size under control).  This allows that.   10M will produce about 3-4GB 
+        /// 1M is a good value to keep things under control.  Note that we still scan the entire original ETL file
+        /// because we look for rundown events, however we don't transerfer them to the ETLX file.  
+        /// The default is 10M because ETLX has a restriction of 4GB in size.  
+        /// </summary>
+        public int MaxEventCount;
+        /// <summary>
+        /// If you have too much data and wish to skip the first part of the trace Set this to the number of msec to skip.
+        /// The idea is that you might first look at the first 1M events, then set this to a number near the end of that first
+        /// block to get the next block etc.  
+        /// </summary>
+        public double SkipMSec;
+        /// <summary>
+        /// If this delegate is non-null, it is called if there are any lost events.  
+        /// It is passed the number of lost events.  You can throw if you want to abort.  
+        /// </summary>
+        public Action<int> OnLostEvents;
+        /// <summary>
+        /// The directory to read files of the form *.manifest.xml to allow you to read unregistered providers.  
+        /// </summary>
+        public string ExplicitManifestDir;
+
         #region private
         private TextWriter m_ConversionLog;
         #endregion
@@ -4562,7 +6673,7 @@ namespace Diagnostics.Eventing
         {
             TraceLog log = anEvent.Source as TraceLog;
             if (log == null)
-                return Diagnostics.Eventing.CallStackIndex.Invalid;
+                return Diagnostics.Tracing.CallStackIndex.Invalid;
             return log.GetCallStackIndexForEvent(anEvent);
         }
         public static TraceCallStacks CallStacks(this TraceEvent anEvent)
@@ -4615,6 +6726,30 @@ namespace Diagnostics.Eventing
 
     #region Private Classes
 
+
+    internal struct JavaScriptSourceKey : IEquatable<JavaScriptSourceKey>
+    {
+        public JavaScriptSourceKey(long sourceID, Address scriptContextID)
+        {
+            SourceID = sourceID;
+            ScriptContextID = scriptContextID;
+        }
+        public override bool Equals(object obj)
+        {
+            throw new NotImplementedException();        // you shoudl not be calling this!
+        }
+        public override int GetHashCode()
+        {
+            return (int)SourceID + (int)ScriptContextID;
+        }
+        public bool Equals(JavaScriptSourceKey other)
+        {
+            return SourceID == other.SourceID && ScriptContextID == other.ScriptContextID;
+        }
+        public long SourceID;
+        public Address ScriptContextID;
+    }
+
     internal static class SerializerExtentions
     {
         public static void WriteAddress(this Serializer serializer, Address address)
@@ -4629,8 +6764,6 @@ namespace Diagnostics.Eventing
         }
     }
 
-
-
     /// <summary>
     /// Represents a source for an ETLX file.  This is the class returned by the code:TraceEvents.GetSource
     /// methodIndex 
@@ -4639,11 +6772,11 @@ namespace Diagnostics.Eventing
     {
         public override bool Process()
         {
-
             // This basically a foreach loop, however we cheat and substitute our own dispatcher 
             // to do the lookup.  TODO: is there a better way?
             IEnumerator<TraceEvent> enumerator = ((IEnumerable<TraceEvent>)events).GetEnumerator();
             TraceEvents.EventEnumeratorBase asBase = (TraceEvents.EventEnumeratorBase)enumerator;
+            this.currentID = asBase.lookup.currentID;
             events.log.FreeLookup(asBase.lookup);
             asBase.lookup = this;
             try
@@ -4679,11 +6812,21 @@ namespace Diagnostics.Eventing
         {
         }
         #region private
+        protected internal override string ProcessName(int processID, long time100ns)
+        {
+            return Log.ProcessName(processID, time100ns);
+        }
         protected override void RegisterEventTemplateImpl(TraceEvent template)
         {
             template.source = Log;
             base.RegisterEventTemplateImpl(template);
         }
+
+        internal override unsafe Guid GetRelatedActivityID(TraceEventNativeMethods.EVENT_RECORD* eventRecord)
+        {
+            return Log.GetRelatedActivityID(eventRecord);
+        }
+
         internal ETLXTraceEventSource(TraceEvents events)
         {
             this.events = events;
@@ -4695,80 +6838,5 @@ namespace Diagnostics.Eventing
         #endregion
     }
 
-#if MAC_SUPPORT
-    class MacTraceEventSource : TraceEventDispatcher
-    {
-        public MacTraceEventSource(string fileName)
-        {
-            this.fileName = fileName;
-        }
-        public override bool Process()
-        {
-            using (PinnedStreamReader reader = new PinnedStreamReader(fileName))
-            {
-                // Read in the header.
-                int signature = reader.ReadInt32();     // Just a number that identifies the file. 
-                Debug.Assert(signature == 0x3AD34349);
-                int version = reader.ReadInt32();
-                sessionStartTime100ns = reader.ReadInt64();
-                sessionEndTime100ns = reader.ReadInt64();
-                pointerSize = reader.ReadInt32();
-                eventsLost = reader.ReadInt32();
-                numberOfProcessors = reader.ReadInt32();
-                cpuSpeedInMHz = reader.ReadInt32();
-
-                while (reader.Current < (StreamLabel) reader.Length)
-                {
-                    // TODO fold in with logic in GetNext
-                    IntPtr ptr = reader.GetPointer(TraceEvent.HeaderLength);
-
-                    // The events are expected to have a header that looks like code:TraceEventNativeMethods.EVENT_TRACE
-                    // the important data is in code:TraceEvent#TraceEventRecordLayout
-                    TraceEvent ret = Lookup(ptr);
-
-                    // Confirm we have a half-way sane event, to catch obvious loss of sync.  
-                    Debug.Assert(ret.Level <= TraceEventLevel.Verbose);
-                    Debug.Assert(ret.Version <= 2);
-                    Debug.Assert(ret.TimeCreated100ns == long.MaxValue ||
-                        SessionStartTime100ns <= ret.TimeCreated100ns && ret.TimeCreated100ns <= SessionEndTime100ns);
-
-                    // We have to insure we have a pointer to the whole blob, not just the header.  
-                    int totalLength = TraceEvent.HeaderLength + (ret.EventDataLength + 3 & ~3);
-                    Debug.Assert(totalLength < 0x20000);
-                    ret.rawData = reader.GetPointer(totalLength);
-                    ret.mofData = TraceEventRawReaders.Add(ret.rawData, TraceEvent.HeaderLength);
-
-                    Dispatch(ret);
-                    if (stopProcessing)
-                        return false;
-
-                    reader.Skip(totalLength);
-                }
-            }
-            return true;
-        }
-    #region private
-        private string fileName;
-    #endregion
-
-#if true
-        /// <summary>
-        /// Test code for using a source.  This assumes you dumped the data to test.etlm and it will print
-        /// it out as text in a verbose dumping mode.  
-        /// </summary>
-        static void Test()
-        {
-            MacTraceEventSource source = new MacTraceEventSource("test.etlm");
-            source.EveryEvent += delegate(TraceEvent anEvent)
-                         if (anEvent is UnhandledTraceEvent)
-                    Console.Write(anEvent.Dump());
-                else 
-                    Console.WriteLine(anEvent.ToString());
-            };
-            source.Process();
-        }
-#endif
-    }
-#endif
     #endregion
 }

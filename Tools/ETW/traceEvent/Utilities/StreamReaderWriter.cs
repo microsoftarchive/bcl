@@ -10,7 +10,6 @@ using System.IO;
 using System.Diagnostics;
 using System.Collections.Generic;
 using DeferedStreamLabel = FastSerialization.StreamLabel;
-using Diagnostics.Eventing;
 
 namespace FastSerialization
 {
@@ -82,8 +81,24 @@ namespace FastSerialization
             Debug.Assert(len < Length);
             while (len > 0)
             {
-                char c = (char)ReadByte();   // TODO do real UTF8 decode. 
-                sb.Append(c);
+                int b = ReadByte();
+                if (b < 0x80)
+                    sb.Append((char) b);
+                else if (b < 0xE0)
+                {
+                    // TODO test this for correctness
+                    b = (b & 0x1F);
+                    b = b << 6 + (ReadByte() & 0x3F);
+                    sb.Append((char)b);
+                }
+                else
+                {
+                    // TODO test this for correctness
+                    b = (b & 0xF);
+                    b = b << 6 + (ReadByte() & 0x3F);
+                    b = b << 6 + (ReadByte() & 0x3F);
+                    sb.Append((char)b); 
+                }
                 --len;
             }
             return sb.ToString();
@@ -183,8 +198,22 @@ namespace FastSerialization
                 Write(value.Length);
                 for (int i = 0; i < value.Length; i++)
                 {
-                    // TODO do actual UTF8
-                    Write((byte)value[i]);
+                    char c = value[i];
+                    if (c < 128)
+                        Write((byte)value[i]);                 // Only need one byte for UTF8
+                    else if (c < 2048)
+                    {
+                        // TODO confirm that this is correct!
+                        Write((byte) (0xC0 | (c >> 6)));                // Encode 2 byte UTF8
+                        Write((byte) (0x80 | (c & 0x3F)));
+                    }
+                    else
+                    {
+                        // TODO confirm that this is correct!
+                        Write((byte) (0xE0 | ((c >> 12) & 0xF)));        // Encode 3 byte UTF8
+                        Write((byte) (0x80 | ((c >> 6) & 0x3F)));
+                        Write((byte) (0x80 | (c & 0x3F)));
+                    }
                 }
             }
         }
@@ -314,8 +343,22 @@ namespace FastSerialization
                 Write(value.Length);
                 for (int i = 0; i < value.Length; i++)
                 {
-                    // TODO do actual UTF8
-                    Write((byte)value[i]);
+                    char c = value[i];
+                    if (c < 128)
+                        Write((byte)value[i]);                 // Only need one byte for UTF8
+                    else if (c < 2048)
+                    {
+                        // TODO confirm that this is correct!
+                        Write((byte) (0xC0 | (c >> 6)));                // Encode 2 byte UTF8
+                        Write((byte) (0x80 | (c & 0x3F)));
+                    }
+                    else
+                    {
+                        // TODO confirm that this is correct!
+                        Write((byte) (0xE0 | ((c >> 12) & 0xF)));        // Encode 3 byte UTF8
+                        Write((byte) (0x80 | ((c >> 6) & 0x3F)));
+                        Write((byte) (0x80 | (c & 0x3F)));
+                    }
                 }
             }
         }
@@ -357,7 +400,7 @@ namespace FastSerialization
         byte* bufferStart;
         byte* bufferCur;
         byte* bufferEnd;
-        #endregion
+    #endregion
     }
 #endif
 
@@ -372,14 +415,22 @@ namespace FastSerialization
             : base(bufferSize)
         {
             this.outputStream = outputStream;
+            streamLength = outputStream.Length;
         }
 
         public void Flush()
         {
             outputStream.Write(bytes, 0, endPosition);
+            streamLength += endPosition;
             endPosition = 0;
             outputStream.Flush();
         }
+
+        /// <summary>
+        /// You should avoid using this if at all possible.  
+        /// </summary>
+        public Stream RawStream { get { return outputStream; } }
+
         public void Close()
         {
             Flush();
@@ -389,7 +440,8 @@ namespace FastSerialization
         {
             get
             {
-                return base.Length + outputStream.Length;
+                Debug.Assert(streamLength == outputStream.Length);
+                return base.Length + streamLength;
             }
         }
         public override StreamLabel GetLabel()
@@ -402,6 +454,7 @@ namespace FastSerialization
         public override void Clear()
         {
             outputStream.SetLength(0);
+            streamLength = 0;
         }
 
         #region private
@@ -409,6 +462,7 @@ namespace FastSerialization
         {
             Debug.Assert(endPosition > bytes.Length - sizeof(long));
             outputStream.Write(bytes, 0, endPosition);
+            streamLength += endPosition;
             endPosition = 0;
         }
         void IDisposable.Dispose()
@@ -418,6 +472,8 @@ namespace FastSerialization
 
         const int defaultBufferSize = 1024 * 8 - sizeof(long);
         Stream outputStream;
+        long streamLength;
+
         #endregion
     }
 
@@ -426,7 +482,8 @@ namespace FastSerialization
     /// </summary>
     public class IOStreamStreamReader : MemoryStreamReader, IDisposable
     {
-        public IOStreamStreamReader(string fileName) : this(new FileStream(fileName, FileMode.Open)) { }
+        public IOStreamStreamReader(string fileName) : this(
+            new FileStream(fileName, FileMode.Open, FileAccess.Read, FileShare.Read|FileShare.Delete)) { }
         public IOStreamStreamReader(Stream inputStream) : this(inputStream, defaultBufferSize) { }
         public IOStreamStreamReader(Stream inputStream, int bufferSize)
             : base(new byte[bufferSize + align], 0, 0)
@@ -499,6 +556,7 @@ namespace FastSerialization
                 inputStream.Seek(positionInStream + endPosition, SeekOrigin.Begin);
                 for (; ; )
                 {
+                    System.Threading.Thread.Sleep(0);       // allow for Thread.Interrupt
                     int count = inputStream.Read(bytes, endPosition, bytes.Length - endPosition);
                     if (count == 0)
                         break;
@@ -523,9 +581,10 @@ namespace FastSerialization
 
     public unsafe sealed class PinnedStreamReader : IOStreamStreamReader
     {
-        public PinnedStreamReader(string fileName) : this(new FileStream(fileName, FileMode.Open, FileAccess.Read)) { }
-        public PinnedStreamReader(Stream inputStream) : this(inputStream, defaultBufferSize) { }
-        public PinnedStreamReader(Stream inputStream, int bufferSize)
+        public PinnedStreamReader(string fileName, int bufferSize=defaultBufferSize)
+            : this(new FileStream(fileName, FileMode.Open, FileAccess.Read, 
+            FileShare.Read|FileShare.Delete), bufferSize) { }
+        public PinnedStreamReader(Stream inputStream, int bufferSize=defaultBufferSize)
             : base(inputStream, bufferSize)
         {
             // Pin the array

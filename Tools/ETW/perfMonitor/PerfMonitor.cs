@@ -12,11 +12,14 @@ using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
-using Diagnostics.Eventing;
+using Diagnostics.Tracing;
 using Stacks;
 using Stats;
 using Symbols;
 using Utilities;
+using Diagnostics.Tracing.StackSources;
+using PerfView;
+using Diagnostics.Tracing.Parsers;
 
 // See code:PerfMonitor.PerfMonitor to get started. 
 namespace PerfMonitor
@@ -35,7 +38,13 @@ namespace PerfMonitor
             // we launch.   However to do this we can't refernce the DLLs until we have unpacked them
             // We do this doing the real work (which happens to reference TraceEvent.dll) in 'DoMain'
             // and insure that we unpacked all dlls (including TraceEvent.dll) before calling it. 
-            UnpackSupportDlls();
+            SupportFiles.UnpackResourcesIfNeeded();
+
+            // Preemptively LoadLibrary it so that it is guarenteed find it.  
+            // TODO do this more lazily close to actual use.  
+            SupportFiles.LoadNative("msdia100.dll");
+            SupportFiles.LoadNative("dbghelp.dll");
+            SupportFiles.LoadNative("KernelTraceControl.dll");
             return DoMain();
         }
         #region private
@@ -44,7 +53,7 @@ namespace PerfMonitor
         {
             Stopwatch sw = Stopwatch.StartNew();
 
-            var commandProcessor = new CommandProcessor(Console.Out);
+            var commandProcessor = new PerfMonitorCommandProcessor(Console.Out);
             var commandLineArgs = new CommandLineArgs(commandProcessor);
             if (commandLineArgs.DoCommand == null)
             {
@@ -60,36 +69,6 @@ namespace PerfMonitor
             Console.Error.WriteLine("PerfMonitor processing time: " + (sw.ElapsedMilliseconds / 1000.0).ToString("f3") + " secs.");
             return ret;
         }
-
-        /// <summary>
-        /// To ease deployment, all support DLLs needed by perfMonitor are
-        /// packed into the EXE.  This unpackes them if they have not already
-        /// been unpacked.  
-        /// </summary>
-        private static void UnpackSupportDlls()
-        {
-            System.Reflection.Assembly exeAssembly = System.Reflection.Assembly.GetEntryAssembly();
-            string exePath = exeAssembly.ManifestModule.FullyQualifiedName;
-            DateTime exeDateUtc = File.GetLastWriteTimeUtc(exePath);
-            string exeDir = Path.GetDirectoryName(exePath);
-            UnpackDll(@".\dbghelp.dll", exeDir, exeDateUtc);
-            UnpackDll(@".\symsrv.dll", exeDir, exeDateUtc);
-            UnpackDll(@".\TraceEvent.dll", exeDir, exeDateUtc);
-            UnpackDll(@".\KernelTraceControl.dll", exeDir, exeDateUtc);
-        }
-        private static void UnpackDll(string resourceName, string targetDir, DateTime exeDateUtc)
-        {
-            // TODO be more careful about clobbering files. 
-            string targetPath = Path.Combine(targetDir, resourceName);
-            if (File.Exists(targetPath))
-            {
-                if (File.GetLastWriteTimeUtc(targetPath) > exeDateUtc)
-                    return;     // Nothing to do. 
-            }
-            // Console.WriteLine("Unpacking support dll " + targetPath);
-            if (!ResourceUtilities.UnpackResourceAsFile(resourceName, targetPath))
-                Console.WriteLine("Error unpacking dll!");
-        }
         #endregion
     }
 
@@ -100,10 +79,10 @@ namespace PerfMonitor
     /// a method here as well as update code:CommandLineArgs.CommandLineArgs to actually
     /// call the method (and provide the help for it).  
     /// </summary>
-    public class CommandProcessor
+    public class PerfMonitorCommandProcessor
     {
-        public CommandProcessor() { }
-        public CommandProcessor(TextWriter logFile) { m_logFile = logFile; }
+        public PerfMonitorCommandProcessor() { }
+        public PerfMonitorCommandProcessor(TextWriter logFile) { m_logFile = logFile; }
         public int ExecuteCommand(CommandLineArgs parsedArgs)
         {
             try
@@ -143,224 +122,49 @@ namespace PerfMonitor
             set { m_logFile = value; }
         }
 
-        // Command line commands.  
+        private CommandProcessor PerfViewCommandProcessor
+        {
+            get
+            {
+                if (m_PerfViewCommandProcessor == null)
+                {
+                    m_PerfViewCommandProcessor = new CommandProcessor();
+                    m_PerfViewCommandProcessor.LogFile = LogFile;
+                }
+                return m_PerfViewCommandProcessor;
+            }
+        }
+        PerfView.CommandProcessor m_PerfViewCommandProcessor;
+
+        // Command line commands. 
+        // This first group uses the PerfView logic.  
         public void Run(CommandLineArgs parsedArgs)
         {
-            // TODO can we simpify?
-            // Find the command from the command line and see if we need to wrap it in cmd /c 
-            Match m = Regex.Match(parsedArgs.CommandLine, "^\\s*\"(.*?)\"");    // Is it quoted?
-            if (!m.Success)
-                m = Regex.Match(parsedArgs.CommandLine, @"\s*(\S*)");           // Nope, then whatever is before the first space.
-            var exeName = m.Groups[1].Value;
-
-            parsedArgs.ExeFile = Command.FindOnPath(exeName);
-
-            if (string.Compare(Path.GetExtension(parsedArgs.ExeFile), ".exe", StringComparison.OrdinalIgnoreCase) == 0)
-                parsedArgs.Process = Path.GetFileNameWithoutExtension(parsedArgs.ExeFile);
-
-            if (parsedArgs.ExeFile == null && string.Compare(exeName, "start", StringComparison.OrdinalIgnoreCase) != 0)
-                throw new FileNotFoundException("Could not find command " + exeName + " on path.");
-
-            var fullCmdLine = parsedArgs.CommandLine;
-            if (string.Compare(Path.GetExtension(parsedArgs.ExeFile), ".exe", StringComparison.OrdinalIgnoreCase) != 0)
-                fullCmdLine = "cmd /c call " + parsedArgs.CommandLine;
-
-            // OK actually do the work.
-            parsedArgs.NoRundown = true;
-            bool success = false;
-            Command cmd = null;
-            try
-            {
-                s_forceAbortOnCtrlC = true;
-                Start(parsedArgs);
-                Thread.Sleep(100);          // Allow time for the start rundown events OS events to happen.  
-                DateTime startTime = DateTime.Now;
-                LogFile.WriteLine("Starting at {0}", startTime);
-                // TODO allow users to specify the launch directory
-                LogFile.WriteLine("Current Directory {0}", Environment.CurrentDirectory);
-                LogFile.WriteLine("Executing: {0} {{", fullCmdLine);
-
-                // Options:  add support dir to path so that tutorial examples work.  
-                var options = new CommandOptions().AddNoThrow().AddTimeout(CommandOptions.Infinite).AddOutputStream(LogFile);
-                cmd = new Command(fullCmdLine, options);
-                cmd.Wait();     // We break this up so that on thread abort (exceptions, we can kill it easily. 
-                DateTime stopTime = DateTime.Now;
-                LogFile.WriteLine("}} Stopping at {0} = {1:f3} sec", stopTime, (stopTime - startTime).TotalSeconds);
-                if (cmd.ExitCode != 0)
-                    LogFile.WriteLine("Warning: Command exited with non-success error code 0x{0:x}", cmd.ExitCode);
-                Stop(parsedArgs);
-                success = true;
-            }
-            finally
-            {
-                if (!success)
-                {
-                    if (cmd != null)
-                        cmd.Kill();
-                    Abort(parsedArgs);
-                }
-            }
+            PerfViewCommandProcessor.Run(parsedArgs);
         }
         public void Collect(CommandLineArgs parsedArgs)
         {
-            parsedArgs.Process = null;
-            bool success = false;
-            try
-            {
-                s_forceAbortOnCtrlC = true;
-                Start(parsedArgs);
-                DateTime startTime = DateTime.Now;
-                Console.WriteLine("Started ETW Logging at {0}.  Press S <ENTER> to stop.", DateTime.Now);
-                for (; ; )
-                {
-                    string line = Console.ReadLine();
-                    if (line == null)
-                        break;
-                    if (line.StartsWith("S", StringComparison.OrdinalIgnoreCase))
-                        break;
-                    Console.WriteLine("Press S <ENTER> to stop logging.");
-                }
-
-                DateTime stopTime = DateTime.Now;
-                LogFile.WriteLine("Stopping at {0} = {1:f3} sec", stopTime, (stopTime - startTime).TotalSeconds);
-                Stop(parsedArgs);
-                success = true;
-            }
-            finally
-            {
-                if (!success)
-                    Abort(parsedArgs);
-            }
+            PerfViewCommandProcessor.Collect(parsedArgs);
         }
         public void Start(CommandLineArgs parsedArgs)
         {
-            if (parsedArgs.DataFile == null)
-                parsedArgs.DataFile = "PerfMonitorOutput.etl";
-
-            string userFileName = Path.ChangeExtension(parsedArgs.DataFile, ".etl");
-            string kernelFileName = Path.ChangeExtension(parsedArgs.DataFile, ".kernel.etl");
-            string rundownFileName = Path.ChangeExtension(parsedArgs.DataFile, ".clrRundown.etl");
-
-            // Insure that old data is gone (BASENAME.*.etl?)
-            var dirName = Path.GetDirectoryName(parsedArgs.DataFile);
-            if (dirName.Length == 0)
-                dirName = ".";
-            var fileNames = Directory.GetFiles(dirName, Path.GetFileNameWithoutExtension(parsedArgs.DataFile) + "*.etl?");
-            foreach (var fileName in fileNames)
-                FileUtilities.ForceDelete(fileName);
-
-            // Create the sessions
-            TraceEventSession kernelModeSession = null;
-            if (parsedArgs.KernelEvents != KernelTraceEventParser.Keywords.None)
-            {
-                LogFile.WriteLine("Starting kernel tracing.  Output file: " + kernelFileName);
-                kernelModeSession = new TraceEventSession(KernelTraceEventParser.KernelSessionName, kernelFileName);
-                kernelModeSession.BufferSizeMB = parsedArgs.BufferSize;
-                kernelModeSession.StopOnDispose = true; // Don't leave running on errors 
-                kernelModeSession.EnableKernelProvider(parsedArgs.KernelEvents, parsedArgs.KernelEvents);
-            }
-
-            LogFile.WriteLine("Starting user model tracing.  Output file: " + userFileName);
-            TraceEventSession userModeSession = new TraceEventSession(s_UserModeSessionName, userFileName);
-            userModeSession.BufferSizeMB = parsedArgs.BufferSize;
-            if (parsedArgs.Circular != 0)
-                userModeSession.CircularBufferMB = parsedArgs.Circular;
-            userModeSession.StopOnDispose = true;   // Don't leave running on errors
-
-            if (parsedArgs.ClrEvents != ClrTraceEventParser.Keywords.None)
-                userModeSession.EnableProvider(ClrTraceEventParser.ProviderGuid, TraceEventLevel.Verbose, (ulong)parsedArgs.ClrEvents);
-
-            if (parsedArgs.AdditionalProviders != null)
-                EnableAdditionalProviders(userModeSession, parsedArgs.AdditionalProviders, parsedArgs.ExeFile);
-
-            // OK at this point, we want to leave both sessions for an indefinate period of time (even past process exit)
-            if (kernelModeSession != null)
-                kernelModeSession.StopOnDispose = false;
-            userModeSession.StopOnDispose = false;
+            PerfViewCommandProcessor.Start(parsedArgs);
         }
         public void Stop(CommandLineArgs parsedArgs)
         {
-            LogFile.WriteLine("Stopping tracing for sessions '" + KernelTraceEventParser.KernelSessionName + "' and '" + s_UserModeSessionName + "'.");
-
-            // Try to stop the kernel session
-            if (parsedArgs.KernelEvents != KernelTraceEventParser.Keywords.None)
-            {
-                try { new TraceEventSession(KernelTraceEventParser.KernelSessionName).Stop(); }
-                catch (Exception e) { LogFile.WriteLine("Error stopping Kernel session: " + e.Message); }
-            }
-
-            string dataFile = null;
-            try
-            {
-                TraceEventSession clrSession = new TraceEventSession(s_UserModeSessionName);
-                dataFile = clrSession.FileName;
-                // Try to force the rundown of CLR method and loader events.  This routine does not fail.  
-                if (!parsedArgs.NoRundown && parsedArgs.ClrEvents != ClrTraceEventParser.Keywords.None)
-                    DoClrRundownForSession(clrSession, parsedArgs);
-                clrSession.Stop();
-            }
-            catch (Exception e) { LogFile.WriteLine("Error stopping User session: " + e.Message); }
-
-            s_forceAbortOnCtrlC = false;
-            if (dataFile == null || !File.Exists(dataFile))
-                LogFile.WriteLine("Warning: no data generated.\n");
-            else
-            {
-                parsedArgs.DataFile = dataFile;
-                if (parsedArgs.Merge)
-                    Merge(parsedArgs);
-                if (parsedArgs.Etlx)
-                    Etlx(parsedArgs);
-            }
+            PerfViewCommandProcessor.Stop(parsedArgs);
         }
         public void Abort(CommandLineArgs parsedArgs)
         {
-            lock (s_UserModeSessionName)    // Insure only one thread can be aborting at a time.
-            {
-                if (s_abortInProgress)
-                    return;
-                s_abortInProgress = true;
-                m_logFile.WriteLine("Aborting tracing for sessions '" + KernelTraceEventParser.KernelSessionName + "' and '" + s_UserModeSessionName + "'.");
-                try { new TraceEventSession(KernelTraceEventParser.KernelSessionName).Stop(true); }
-                catch (Exception) { }
-
-                try { new TraceEventSession(s_UserModeSessionName).Stop(true); }
-                catch (Exception) { }
-
-                // Insure that the rundown session is also stopped. 
-                try { new TraceEventSession(s_UserModeSessionName + "Rundown").Stop(true); }
-                catch (Exception) { }
-            }
+            PerfViewCommandProcessor.Abort(parsedArgs);
         }
         public void Merge(CommandLineArgs parsedArgs)
         {
-            if (parsedArgs.DataFile == null)
-                parsedArgs.DataFile = "PerfMonitorOutput.etl";
-
-            LogFile.WriteLine("Merging data files to " + Path.GetFileName(parsedArgs.DataFile) + ".  Can take 10s of seconds...");
-            Stopwatch sw = Stopwatch.StartNew();
-
-            // logic to touch etlxFile if it was alread up to date. 
-            bool etlxFileUpToDate = false;
-            var etlxFile = Path.ChangeExtension(parsedArgs.DataFile, ".etlx");
-            if (File.Exists(parsedArgs.DataFile) && File.Exists(etlxFile))
-                if (File.GetLastWriteTimeUtc(etlxFile) > File.GetLastWriteTimeUtc(parsedArgs.DataFile))
-                    etlxFileUpToDate = true;
-
-            TraceEventSession.MergeInPlace(parsedArgs.DataFile);
-
-            // Touch the file to bring it up to date.  
-            if (etlxFileUpToDate)
-                File.SetLastWriteTimeUtc(etlxFile, DateTime.Now);
-
-            sw.Stop();
-            LogFile.WriteLine("Merge took {0:f3} sec.", sw.Elapsed.TotalSeconds);
+            PerfViewCommandProcessor.Merge(parsedArgs);
         }
         public void ListSessions(CommandLineArgs parsedArgs)
         {
-            LogFile.WriteLine("Active Session Names");
-            foreach (string activeSessionName in TraceEventSession.GetActiveSessionNames())
-                LogFile.WriteLine("    " + activeSessionName);
+            PerfViewCommandProcessor.ListSessions(parsedArgs);
         }
 
         public void Analyze(CommandLineArgs parsedArgs) { ReportGenerator.Analyze(parsedArgs); }
@@ -386,7 +190,7 @@ namespace PerfMonitor
         public void ListSources(CommandLineArgs parsedArgs)
         {
             bool anySources = false;
-            foreach (Type eventSource in GetEventSourcesInFile(parsedArgs.ExeFile, true))
+            foreach (Type eventSource in EventSourceFinder.GetEventSourcesInFile(parsedArgs.ExeFile, true))
             {
                 if (!anySources)
                 {
@@ -396,14 +200,11 @@ namespace PerfMonitor
                     Console.WriteLine("-------------------------------------------------------------------------");
                 }
 
-                Console.WriteLine("{0,-30}: {1}", GetName(eventSource), GetGuid(eventSource));
+                Console.WriteLine("{0,-30}: {1}", EventSourceFinder.GetName(eventSource), EventSourceFinder.GetGuid(eventSource));
 
                 if (parsedArgs.DumpManifests != null)
                 {
-                    // Invoke GenerateManifest
-                    var manifest = (string)eventSource.BaseType.InvokeMember("GenerateManifest",
-                        BindingFlags.InvokeMethod | BindingFlags.Static | BindingFlags.Public,
-                        null, null, new object[] { eventSource, "" });
+                    var manifest = EventSourceFinder.GetManifest(eventSource);
                     File.WriteAllText(Path.Combine(parsedArgs.DumpManifests, eventSource.Name + ".manifest.xml"), manifest);
                 }
                 anySources = true;
@@ -462,8 +263,8 @@ namespace PerfMonitor
                 parsedArgs.ClrEvents = ClrTraceEventParser.Keywords.None;
             if (parsedArgs.KernelEvents == KernelTraceEventParser.Keywords.Default)
                 parsedArgs.KernelEvents = KernelTraceEventParser.Keywords.Process | KernelTraceEventParser.Keywords.ProcessCounters;
-            if (parsedArgs.AdditionalProviders == null)
-                parsedArgs.AdditionalProviders = new string[] { "@" };
+            if (parsedArgs.Providers == null)
+                parsedArgs.Providers = new string[] { "@" };
 
             var process = parsedArgs.Process;
             Run(parsedArgs);
@@ -510,9 +311,8 @@ namespace PerfMonitor
                     ClrRundownTraceEventParser clrRundownSource = new ClrRundownTraceEventParser(source);
                     ClrStressTraceEventParser clrStress = new ClrStressTraceEventParser(source);
                     SymbolTraceEventParser symbolSource = new SymbolTraceEventParser(source);
-                    WPFTraceEventParser wpfSource = new WPFTraceEventParser(source);
-
                     DynamicTraceEventParser dyamicSource = source.Dynamic;
+
                     if (source is ETWTraceEventSource)
                     {
                         // file names associated with disk I/O activity are logged at the end of the stream.  Thus to
@@ -537,19 +337,36 @@ namespace PerfMonitor
                     output.WriteLine("<Events>");
                     bool dumpUnknown = true;        // TODO allow people to see this?
                     StringBuilder sb = new StringBuilder(1024);
+
+                    long startTime = source.RelativeTimeMSecTo100ns(parsedArgs.StartTimeRelMsec);
+                    long endTime = source.RelativeTimeMSecTo100ns(parsedArgs.EndTimeRelMsec);
+                    bool timeFilter = (parsedArgs.StartTimeRelMsec > 0 || parsedArgs.EndTimeRelMsec < double.MaxValue);
+
                     Action<TraceEvent> Dumper = delegate(TraceEvent data)
                     {
+                        if (timeFilter)
+                        {
+                            var timeStamp = data.TimeStamp100ns;
+                            if (timeStamp < startTime)
+                                return;
+                            if (timeStamp > endTime)
+                            {
+                                source.StopProcessing();
+                                return;
+                            }
+                        }
                         if (dumpUnknown && data is UnhandledTraceEvent)
                             output.WriteLine(data.Dump());
                         else
                             output.WriteLine(data.ToXml(sb).ToString());
                         sb.Length = 0;
                     };
+                    var tdhParser = new RegisteredTraceEventParser(source);
+                    tdhParser.All += Dumper;
                     kernelSource.All += Dumper;
                     clrRundownSource.All += Dumper;
                     clrSource.All += Dumper;
                     clrStress.All += Dumper;
-                    wpfSource.All += Dumper;
                     symbolSource.All += Dumper;
                     source.Dynamic.All += Dumper;
                     source.UnhandledEvent += Dumper;
@@ -678,11 +495,11 @@ namespace PerfMonitor
         }
         public void Listen(CommandLineArgs parsedArgs)
         {
-            // Assume you are only doing EventSoruces, so you don't have to specify the @ if you don't want to.  
-            for (int i = 0; i < parsedArgs.AdditionalProviders.Length; i++)
+            // Assume you are only doing EventSources, so you don't have to specify the @ if you don't want to.  
+            for (int i = 0; i < parsedArgs.Providers.Length; i++)
             {
-                if (!parsedArgs.AdditionalProviders[i].StartsWith("@"))
-                    parsedArgs.AdditionalProviders[i] = "@" + parsedArgs.AdditionalProviders[i];
+                if (!parsedArgs.Providers[i].StartsWith("@") && !parsedArgs.Providers[i].StartsWith("*"))
+                    parsedArgs.Providers[i] = "@" + parsedArgs.Providers[i];
             }
 
             TextWriter writer = Console.Out;
@@ -718,7 +535,11 @@ namespace PerfMonitor
                 // Get source for user events. 
                 session = new TraceEventSession(s_UserModeSessionName, null);
                 session.StopOnDispose = true;
-                EnableAdditionalProviders(session, parsedArgs.AdditionalProviders, null);
+
+                // TODO Instantiating a new CommandProcessor is a bit of a hack.  
+                var commandProcessor = new CommandProcessor();
+                commandProcessor.LogFile = writer;
+                commandProcessor.EnableAdditionalProviders(session, parsedArgs.Providers, null);
                 var source = new ETWTraceEventSource(session.SessionName, TraceEventSourceType.Session);
 
                 PrintEventSourcesAsText(source, kernelSource, Console.Out);
@@ -765,7 +586,8 @@ namespace PerfMonitor
             var sequencer = new Sequencer(source.SessionStartTime100ns);
 
             StringBuilder sb = new StringBuilder();
-            source.Dynamic.All += delegate(TraceEvent data)
+
+            Action<TraceEvent> dumper = delegate(TraceEvent data)
             {
                 try
                 {
@@ -790,7 +612,7 @@ namespace PerfMonitor
                     {
                         if (data.EventName == "ManifestDump")
                             return;
-                        sb.Clear();
+                        sb.Length = 0;
                         var fieldNames = data.PayloadNames;
                         for (int i = 0; i < fieldNames.Length; i++)
                             sb.Append(fieldNames[i]).Append('=').Append(data.PayloadString(i)).Append(' ');
@@ -807,7 +629,7 @@ namespace PerfMonitor
                         {
                             startEvents.Remove(data);
                             var durationMsec = (data.TimeStamp100ns - startTime) / 10000.0;
-                            message = string.Format("Duration={0:f3} MSec {1}", durationMsec, message);
+                            message = string.Format("{0} Duration={1:f3} MSec", message, durationMsec);
                         }
                     }
                     var timeRelMsec = (data.TimeStamp100ns - zeroTime) / 10000.0;   // convert 100ns to Msec
@@ -815,6 +637,13 @@ namespace PerfMonitor
                 }
                 finally { sequencer.Unlock(); }
             };
+
+            // Add the dumper to all providers whose manifest is emedded in the data stream
+            source.Dynamic.All += dumper;
+            // And all 'OS declared manifests'
+            var tdhParser = new RegisteredTraceEventParser(source);
+            tdhParser.All += dumper;
+
             kernelSource.Kernel.ProcessStart += delegate(ProcessTraceData data)
             {
                 try
@@ -873,7 +702,7 @@ namespace PerfMonitor
             };
 
             if (kernelSource != source)
-                writer.WriteLine("Listening for events.  4 second delay because of buffering...");
+                writer.WriteLine("Listening for events.  6 second delay because of buffering...");
             writer.WriteLine();
             writer.WriteLine("  Time Msec  PID  Event Name       Message");
             writer.WriteLine("-----------------------------------------------------------------------------");
@@ -890,13 +719,12 @@ namespace PerfMonitor
             source.Process();
         }
 
-
         /// <summary>
         /// Sequencer allows us to interleave more than one real time TraceEventSource and keep the time order chronological.  
         /// </summary>
         class Sequencer
         {
-            const long maxFlushDelay100ns = 40000000;   // Wait 4 seconds
+            const long maxFlushDelay100ns = 60000000;   // Wait 6 seconds
             // long sessionStart100ns;
 
             public Sequencer(long sessionStart100ns)
@@ -949,7 +777,7 @@ namespace PerfMonitor
                 if (shortWait)
                 {
                     //Console.WriteLine("Seqencer: YIELD");
-                    Thread.Yield();
+                    Thread.Sleep(0);
                     System.Threading.Monitor.Enter(this);
                 }
                 else
@@ -1026,14 +854,32 @@ namespace PerfMonitor
             DateTime start = DateTime.Now;
 
             ETWTraceEventSource source = new ETWTraceEventSource(KernelTraceEventParser.KernelSessionName, TraceEventSourceType.Session);
-            source.Kernel.ProcessStart += delegate(ProcessTraceData data)
+
+            Action<ProcessTraceData> onPStart = delegate(ProcessTraceData data)
             {
+                Console.WriteLine("********** IN PSTART ****************");
                 TimeSpan relativeTime = data.TimeStamp - start;
                 liveProcesses[data.ProcessID] = (ProcessTraceData)data.Clone();
                 Console.WriteLine(@"{0}{1}: {{ At({2}) Parent({3}) Cmd: {4}",
                     Indent(liveProcesses, data.ProcessID),
                     data.ProcessID, relativeTime, data.ParentID, data.CommandLine);
+
+                Trace.WriteLine("Got PStart");
             };
+            source.Kernel.ProcessStart += onPStart;
+
+            source.Kernel.ProcessDCStart += delegate(ProcessTraceData data)
+            {
+                TimeSpan relativeTime = data.TimeStamp - start;
+                // liveProcesses[data.ProcessID] = (ProcessTraceData)data.Clone();
+
+                Console.WriteLine(@"{0}{1}: {{ At({2}) Parent({3}) Cmd: {4}",
+                    Indent(liveProcesses, data.ProcessID),
+                    data.ProcessID, relativeTime, data.ParentID, data.CommandLine);
+
+                Trace.WriteLine("Got Process Data Collect Start");
+            };
+
             source.Kernel.ProcessEnd += delegate(ProcessTraceData data)
             {
                 TimeSpan relativeTime = data.TimeStamp - start;
@@ -1044,7 +890,15 @@ namespace PerfMonitor
                     Console.WriteLine("{0}{1}: }} At({2}) Exit(0x{3:x}) Duration({4}) ",
                         Indent(liveProcesses, data.ProcessID), data.ProcessID, relativeTime, data.ExitStatus, processDuration);
                 }
+            };  
+
+            source.UnhandledEvent += delegate(TraceEvent data)
+            {
+                Console.WriteLine("Got unhandled event: " + data.ToString());
             };
+
+            // session.CaptureKernelState(KernelTraceEventParser.Keywords.Process);
+
             source.Process();
             Console.WriteLine("Processing Complete");
         }
@@ -1057,8 +911,8 @@ namespace PerfMonitor
                 processId = startData.ParentID;
                 indent++;
             }
-            Debug.Assert(indent > 0);
-            --indent;
+            if (indent > 0)
+                --indent;
 
             return new string(' ', indent * 2);
         }
@@ -1104,297 +958,6 @@ namespace PerfMonitor
             stream.WriteLine("</TraceProcesses>");
         }
 
-        // TODO remove and depend on framework for these instead.  
-        internal static Guid GetGuid(Type eventSource)
-        {
-            foreach (var attrib in CustomAttributeData.GetCustomAttributes(eventSource))
-            {
-                foreach (var arg in attrib.NamedArguments)
-                {
-                    if (arg.MemberInfo.Name == "Guid")
-                    {
-                        var value = (string)arg.TypedValue.Value;
-                        return new Guid(value);
-                    }
-                }
-            }
-
-            return GenerateGuidFromName(GetName(eventSource).ToUpperInvariant());
-        }
-        internal static string GetName(Type eventSource)
-        {
-            foreach (var attrib in CustomAttributeData.GetCustomAttributes(eventSource))
-            {
-                foreach (var arg in attrib.NamedArguments)
-                {
-                    if (arg.MemberInfo.Name == "Name")
-                    {
-                        var value = (string)arg.TypedValue.Value;
-                        return value;
-                    }
-                }
-            }
-            return eventSource.Name;
-        }
-        internal static Guid GenerateGuidFromName(string name)
-        {
-            // The algorithm below is following the guidance of http://www.ietf.org/rfc/rfc4122.txt
-            // Create a blob containing a 16 byte number representing the namespace
-            // followed by the unicode bytes in the name.  
-            var bytes = new byte[name.Length * 2 + 16];
-            uint namespace1 = 0x482C2DB2;
-            uint namespace2 = 0xC39047c8;
-            uint namespace3 = 0x87F81A15;
-            uint namespace4 = 0xBFC130FB;
-            // Write the bytes most-significant byte first.  
-            for (int i = 3; 0 <= i; --i)
-            {
-                bytes[i] = (byte)namespace1;
-                namespace1 >>= 8;
-                bytes[i + 4] = (byte)namespace2;
-                namespace2 >>= 8;
-                bytes[i + 8] = (byte)namespace3;
-                namespace3 >>= 8;
-                bytes[i + 12] = (byte)namespace4;
-                namespace4 >>= 8;
-            }
-            // Write out  the name, most significant byte first
-            for (int i = 0; i < name.Length; i++)
-            {
-                bytes[2 * i + 16 + 1] = (byte)name[i];
-                bytes[2 * i + 16] = (byte)(name[i] >> 8);
-            }
-
-            // Compute the Sha1 hash 
-            var sha1 = System.Security.Cryptography.SHA1.Create();
-            byte[] hash = sha1.ComputeHash(bytes);
-
-            // Create a GUID out of the first 16 bytes of the hash (SHA-1 create a 20 byte hash)
-            int a = (((((hash[3] << 8) + hash[2]) << 8) + hash[1]) << 8) + hash[0];
-            short b = (short)((hash[5] << 8) + hash[4]);
-            short c = (short)((hash[7] << 8) + hash[6]);
-
-            c = (short)((c & 0x0FFF) | 0x5000);   // Set high 4 bits of octet 7 to 5, as per RFC 4122
-            Guid guid = new Guid(a, b, c, hash[8], hash[9], hash[10], hash[11], hash[12], hash[13], hash[14], hash[15]);
-            return guid;
-        }
-
-        // TODO load it its own appdomain so we can unload them properly.
-        internal static IEnumerable<Type> GetEventSourcesInFile(string fileName, bool allowInvoke = false)
-        {
-            System.Reflection.Assembly assembly;
-            try
-            {
-                if (allowInvoke)
-                    assembly = System.Reflection.Assembly.LoadFrom(fileName);
-                else
-                    assembly = System.Reflection.Assembly.ReflectionOnlyLoadFrom(fileName);
-            }
-            catch (Exception e)
-            {
-                // Convert to an application exception TODO is this a good idea?
-                throw new ApplicationException(e.Message);
-            }
-
-            Dictionary<Assembly, Assembly> soFar = new Dictionary<Assembly, Assembly>();
-            GetStaticReferencedAssemblies(assembly, soFar);
-
-            List<Type> eventSources = new List<Type>();
-            foreach (Assembly subAssembly in soFar.Keys)
-            {
-                try
-                {
-                    foreach (Type type in subAssembly.GetTypes())
-                    {
-                        if (type.BaseType != null && type.BaseType.Name == "EventSource")
-                            eventSources.Add(type);
-                    }
-                }
-                catch (Exception)
-                {
-                    Console.WriteLine("Problem loading {0} module, skipping.", subAssembly.GetName().Name);
-                }
-            }
-            return eventSources;
-        }
-        private static void GetStaticReferencedAssemblies(Assembly assembly, Dictionary<Assembly, Assembly> soFar)
-        {
-            soFar[assembly] = assembly;
-            string assemblyDirectory = Path.GetDirectoryName(assembly.ManifestModule.FullyQualifiedName);
-            foreach (AssemblyName childAssemblyName in assembly.GetReferencedAssemblies())
-            {
-                try
-                {
-                    // TODO is this is at best heuristic.  
-                    string childPath = Path.Combine(assemblyDirectory, childAssemblyName.Name + ".dll");
-                    Assembly childAssembly = null;
-                    if (File.Exists(childPath))
-                        childAssembly = Assembly.ReflectionOnlyLoadFrom(childPath);
-
-                    //TODO do we care about things in the GAC?   it expands the search quite a bit. 
-                    //else
-                    //    childAssembly = Assembly.Load(childAssemblyName);
-
-                    if (childAssembly != null && !soFar.ContainsKey(childAssembly))
-                        GetStaticReferencedAssemblies(childAssembly, soFar);
-                }
-                catch (Exception)
-                {
-                    Console.WriteLine("Could not load assembly " + childAssemblyName + " skipping.");
-                }
-            }
-        }
-
-        /// <summary>
-        /// Enable any addional providers specified by 'providerSpecs'.   wildCardFileName is the file name 
-        /// to use if the providerSpec is @
-        /// </summary>
-        private void EnableAdditionalProviders(TraceEventSession userModeSession, string[] providerSpecs, string wildCardFileName)
-        {
-            foreach (var provider in providerSpecs)
-            {
-                Match m = Regex.Match(provider, "^(.*?)(:(0x)?(.*?))?(:(.*?))?$", RegexOptions.IgnoreCase);
-                Debug.Assert(m.Success);
-                var providerStr = m.Groups[1].Value;
-                var matchAnyKeywordsStr = m.Groups[4].Value;
-                var levelStr = m.Groups[6].Value;
-
-                if (providerStr == "@" || providerStr.Length == 0 && wildCardFileName != null)
-                    providerStr = "@" + wildCardFileName;
-
-                List<Guid> providerGuids = ParseProviderSpec(providerStr);
-                ulong matchAnyKeywords = unchecked((ulong)-1);
-                if (matchAnyKeywordsStr.Length > 0)
-                {
-                    if (!ulong.TryParse(matchAnyKeywordsStr, System.Globalization.NumberStyles.HexNumber, null, out matchAnyKeywords))
-                        throw new CommandLineParserException("Could not parse as a hexidecimal keyword specification " + matchAnyKeywordsStr);
-                }
-
-                TraceEventLevel level = TraceEventLevel.Verbose;
-                if (levelStr.Length > 0)
-                {
-                    int intLevel;
-                    if (int.TryParse(levelStr, out intLevel) && 0 <= intLevel && intLevel < 256)
-                        level = (TraceEventLevel)intLevel;
-                    else
-                    {
-                        try { Enum.Parse(typeof(TraceEventLevel), levelStr); }
-                        catch { throw new CommandLineParserException("Could not parse level specification " + levelStr); }
-                    }
-                }
-
-                foreach (var providerGuid in providerGuids)
-                {
-                    Console.WriteLine("Enabling provider {0} level: {1} keywords: 0x{2:x}", providerGuid, level, matchAnyKeywords);
-                    userModeSession.EnableProvider(providerGuid, level, matchAnyKeywords);
-                }
-            }
-        }
-
-        // Given a provider specification (guid or name or @filename#eventSource return a list of providerGuids for it.  
-        private List<Guid> ParseProviderSpec(string providerSpec)
-        {
-            var ret = new List<Guid>();
-
-            // Is it a EventSource specification (@path#eventSourceName?)
-            if (providerSpec.StartsWith("@"))
-            {
-                int atIndex = providerSpec.IndexOf('#', 1);
-                string eventSourceName = null;
-                if (atIndex < 0)
-                    atIndex = providerSpec.Length;
-                else
-                    eventSourceName = providerSpec.Substring(atIndex + 1);
-
-                string fileName = providerSpec.Substring(1, atIndex - 1);
-                if (!File.Exists(fileName))
-                {
-                    var exe = fileName + ".exe";
-                    if (File.Exists(exe))
-                        fileName = exe;
-                    else
-                    {
-                        var dll = fileName + ".dll";
-                        if (File.Exists(dll))
-                            fileName = dll;
-                    }
-                }
-
-                // Console.WriteLine("Got Provider Name '{0}'", providerName);
-                // Console.WriteLine("Got File Name '{0}'", path);
-                foreach (Type eventSource in GetEventSourcesInFile(fileName))
-                {
-                    bool useProvider = false;
-                    if (eventSourceName == null)
-                        useProvider = true;
-                    else
-                    {
-                        string candidateEventSourceName = GetName(eventSource);
-                        if (String.Compare(eventSourceName, candidateEventSourceName, StringComparison.OrdinalIgnoreCase) == 0)
-                            useProvider = true;
-                        else
-                        {
-                            int dot = candidateEventSourceName.LastIndexOf('.');
-                            if (dot >= 0)
-                                candidateEventSourceName = candidateEventSourceName.Substring(dot + 1);
-
-                            if (String.Compare(eventSourceName, candidateEventSourceName, StringComparison.OrdinalIgnoreCase) == 0)
-                                useProvider = true;
-                            else
-                            {
-                                if (candidateEventSourceName.EndsWith("EventSource", StringComparison.OrdinalIgnoreCase))
-                                    candidateEventSourceName = candidateEventSourceName.Substring(0, candidateEventSourceName.Length - 11);
-
-                                if (String.Compare(eventSourceName, candidateEventSourceName, StringComparison.OrdinalIgnoreCase) == 0)
-                                    useProvider = true;
-
-                            }
-                        }
-                    }
-                    if (useProvider)
-                    {
-                        Console.WriteLine("Found Provider {0} Guid {1}", GetName(eventSource), GetGuid(eventSource));
-                        ret.Add(GetGuid(eventSource));
-                    }
-                }
-                if (ret.Count == 0)
-                {
-                    if (eventSourceName != null)
-                        throw new ApplicationException("EventSource " + eventSourceName + " not found in " + fileName);
-                    else
-                        throw new ApplicationException("No types deriving from EventSource found in " + fileName);
-                }
-            }
-            else
-            {
-                // Is it a normal GUID 
-                Guid providerGuid;
-                if (Regex.IsMatch(providerSpec, "........-....-....-....-............"))
-                {
-                    try
-                    {
-                        providerGuid = new Guid(providerSpec);
-                    }
-                    catch
-                    {
-                        throw new ApplicationException("Could not parse Guid '" + providerSpec + "'");
-                    }
-                }
-                // Is it specially known
-                else if (string.Compare(providerSpec, "Clr", StringComparison.OrdinalIgnoreCase) == 0)
-                    providerGuid = ClrTraceEventParser.ProviderGuid;
-                else if (string.Compare(providerSpec, "ClrRundown", StringComparison.OrdinalIgnoreCase) == 0)
-                    providerGuid = ClrRundownTraceEventParser.ProviderGuid;
-                else if (string.Compare(providerSpec, "ClrStress", StringComparison.OrdinalIgnoreCase) == 0)
-                    providerGuid = ClrStressTraceEventParser.ProviderGuid;
-                else if (string.Compare(providerSpec, "Wpf", StringComparison.OrdinalIgnoreCase) == 0)
-                    providerGuid = WPFTraceEventParser.ProviderGuid;
-                else
-                    throw new ApplicationException("Could not find provider name '" + providerSpec + "'");
-                ret.Add(providerGuid);
-            }
-            return ret;
-        }
         // TODO decide what to do with this. 
         /// <summary>
         /// Sets up what to do when Ctrl-C entered
@@ -1426,85 +989,7 @@ namespace PerfMonitor
 
         TextWriter m_logFile = Console.Out;      // Where to send outputStream to the user
 
-        /// <summary>
-        /// Activates the CLR rundown for the user session 'session'. 
-        /// </summary>
-        private void DoClrRundownForSession(TraceEventSession session, CommandLineArgs parsedArgs)
-        {
-            if (string.IsNullOrEmpty(session.FileName))
-                return;
-            LogFile.WriteLine("[Sending rundown command to CLR providers...]");
-            Stopwatch sw = Stopwatch.StartNew();
-            try
-            {
-                TraceEventSession clrRundownSession = new TraceEventSession(session.SessionName + "Rundown", Path.ChangeExtension(session.FileName, ".clrRundown.etl"));
-                clrRundownSession.BufferSizeMB = parsedArgs.BufferSize;
-                clrRundownSession.EnableProvider(ClrRundownTraceEventParser.ProviderGuid, TraceEventLevel.Verbose, (ulong)(
-                    ClrRundownTraceEventParser.Keywords.End |
-                    ClrRundownTraceEventParser.Keywords.NGen |
-                    ClrRundownTraceEventParser.Keywords.Jit |
-                    ClrRundownTraceEventParser.Keywords.Loader));
-
-                // For V2.0 runtimes you activate the main provider so we do that too.  
-                clrRundownSession.EnableProvider(ClrTraceEventParser.ProviderGuid, TraceEventLevel.Verbose, (ulong)(
-                    ClrRundownTraceEventParser.Keywords.End |
-                    ClrRundownTraceEventParser.Keywords.NGen |
-                    ClrRundownTraceEventParser.Keywords.Jit |
-                    ClrRundownTraceEventParser.Keywords.Loader));
-
-                WaitForIdle(parsedArgs.MinRundownTime, parsedArgs.RundownTimeout);
-                clrRundownSession.Stop();
-                sw.Stop();
-                LogFile.WriteLine("CLR Rundown took {0:f3} sec.", sw.Elapsed.TotalSeconds);
-            }
-            catch (Exception e)
-            {
-                LogFile.WriteLine("Warning: failure during CLR Rundown " + e.Message);
-            }
-        }
-        /// <summary>
-        /// Currently there is no good way to know when rundown is finished, however it is a CPU bound activity
-        /// so we can stop when the CPU is idle.  If something else is using CPU then this heuristic does 
-        /// not work so we have both a max and a min time as backstops. 
-        /// </summary>
-        private void WaitForIdle(int minSeconds, int maxSeconds)
-        {
-            PerformanceCounter cpuActivity = null;
-            LogFile.WriteLine("Waiting up to {0} sec for rundown events.  Use /RundownTimeout to change.", maxSeconds);
-            LogFile.WriteLine("If you know your process has exited, use /noRundown qualifer to skip this step.");
-            try
-            {
-                cpuActivity = new PerformanceCounter("Processor", "% Processor Time", "_Total");
-            }
-            catch (Exception) { }
-
-
-            int numProcs = Environment.ProcessorCount;
-            // Rundown is a CPU bound activity.   Thus it should take at LEAST half a processor.  
-            double minPercent = (100.0 / numProcs) / 2;
-            for (int i = 0; i < maxSeconds; i++)
-            {
-                if (cpuActivity != null && i >= minSeconds)
-                {
-                    double cpuPercent = cpuActivity.NextValue();
-                    // we get 0 on the first count so always wait at least a second.  
-                    if (i > 0)
-                    {
-                        //
-                        if (cpuPercent < minPercent)
-                        {
-                            LogFile.WriteLine("Cpu {0,5:f1}%  < {1:f1}%  Assuming rundown complete.", cpuPercent, minPercent);
-                            break;
-                        }
-                        LogFile.WriteLine("Cpu {0,5:f1}%  Rundown not complete.", cpuPercent);
-                    }
-                }
-                Thread.Sleep(1000);
-            }
-        }
-
         private bool s_abortRequest;         // A ctrl-C was hit 
-        private bool s_abortInProgress;      // We are currently in Abort()
         private bool s_forceAbortOnCtrlC;    // We definately need an abort on a Ctrl-C
 
         private static string s_UserModeSessionName = "PerfMonitorSession";
@@ -1521,7 +1006,7 @@ namespace PerfMonitor
     /// </summary>
     public class CommandLineArgs
     {
-        public CommandLineArgs(CommandProcessor commandProcessor)
+        public CommandLineArgs(PerfMonitorCommandProcessor commandProcessor)
         {
             CommandProcessor = commandProcessor;
             CommandLineParser.ParseForConsoleApplication(delegate(CommandLineParser parser)
@@ -1536,34 +1021,25 @@ namespace PerfMonitor
                 parser.DefineOptionalQualifier("Circular", ref Circular, "Do Circular logging with a file size in MB.  Zero means non-circular.");
 
                 // These apply to Stop Collect and Run 
-                parser.DefineOptionalQualifier("Merge", ref Merge, "Do a merge after stopping collection.");
+                parser.DefineOptionalQualifier("Merge", ref Merge, "Do a merge after stopping collection (/merge:false turns off).");
                 parser.DefineOptionalQualifier("Etlx", ref Etlx, "Convert to etlx (containes symbolic information) after stopping collection.");
                 parser.DefineOptionalQualifier("NoRundown", ref NoRundown, "Don't request CLR Rundown events.");
+                parser.DefineOptionalQualifier("NoNGenRundown", ref NoNGenRundown, "Don't request CLR Rundown events for NGEN images.");
+                parser.DefineOptionalQualifier("ForceNgenRundown", ref ForceNgenRundown,
+                    "By default on V4.0 runtimes NGEN rundown is supressed, because NGEN pdbs are a less expensive way of getting symbolic " +
+                    "information for NGEN images.  This option forces NGEN rundown, so NGEN pdbs are not needed.  This can be useful " +
+                    "in some scenarios where NGEN Pdbs are not working properly.");
                 parser.DefineOptionalQualifier("RundownTimeout", ref RundownTimeout,
                     "Maximum number of seconds to wait for CLR rundown to complete.");
                 parser.DefineOptionalQualifier("MinRundownTime", ref MinRundownTime,
                     "Minimum number of seconds to wait for CLR rundown to complete.");
                 parser.DefineOptionalQualifier("SymbolsForDlls", ref SymbolsForDlls,
                     "A comma separated list of DLL names (without extension) for which to look up symbolic informaotion (PDBs).");
-                parser.DefineOptionalQualifier("PrimeSymbols", ref PrimeSymbols,
-                    "Normally only machine local paths are searched for symbol info.  This indicates symbol servers should be searched too.");
                 parser.DefineOptionalQualifier("DataFile", ref DataFile, "FileName of the profile data to generate.");
-                parser.DefineOptionalQualifier("AdditionalProviders", ref AdditionalProviders,
+                parser.DefineOptionalQualifier("Providers", ref Providers,
                     "Providers in ADDITION to the kernel and CLR providers.  This is comma separated list of ProviderGuid:Keywords:Level specs.");
-                string[] onlyProviders = null;
-                parser.DefineOptionalQualifier("Providers", ref onlyProviders,
-                    "Providers to turn on INSTEAD of the kernel and CLR providers.  " +
-                    "This is comma separated list of Provider:Keywords:Level specs were Provder is either a GUID, or " +
-                    "@FileName#EventSourceName.  See /UsersGuide for more."
-                    );
-                if (onlyProviders != null)
-                {
-                    AdditionalProviders = onlyProviders;
-                    ClrEvents = ClrTraceEventParser.Keywords.None;
-                    KernelEvents = KernelTraceEventParser.Keywords.None;
-                }
                 parser.DefineOptionalQualifier("ClrEvents", ref ClrEvents,
-    "A comma separated list of .NET CLR events to turn on.  See Users guide for details.");
+                    "A comma separated list of .NET CLR events to turn on.  See Users guide for details.");
                 parser.DefineOptionalQualifier("KernelEvents", ref KernelEvents,
                     "A comma separated list of windows OS kernel events to turn on.  See Users guide for details.");
 
@@ -1579,9 +1055,15 @@ namespace PerfMonitor
                 parser.DefineOptionalQualifier("NoOSGrouping", ref NoOSGrouping,
                     "Turn off the grouping of OS functions in stack traces.");
                 parser.DefineOptionalQualifier("NoBrowser", ref NoBrowser, "Don't launch a browser on an HTML report.");
+                parser.DefineOptionalQualifier("StopTrigger", ref StopTrigger,
+                    "This is of the form CATEGORY:COUNTERNAME:INSTANCE OP NUM  where CATEGORY:COUNTERNAME:INSTANCE, identify " +
+                    "a performance counter (same as PerfMon), OP is either < or >, and NUM is a number.  " +
+                    "When that condition is true then collection will stop.");
+                parser.DefineOptionalQualifier("MaxCollectSec", ref MaxCollectSec,
+                    "Turn off collection (and kill the program if perfView started it) after this many seconds. Zero means no timeout.");
+                parser.DefineOptionalQualifier("Zip", ref Zip, "Zip the ETL file (implies /Merge).");
 
                 parser.DefineOptionalQualifier("WriteXml", ref WriteXml, "Write an XML report as well as the HTML report.");
-
 
                 parser.DefineParameterSet("runAnalyze", ref DoCommand, CommandProcessor.RunAnalyze,
                     "Performs a run command then the analyze command.");
@@ -1591,11 +1073,11 @@ namespace PerfMonitor
                     "Performs a run command then the Dump command.");
                 parser.DefineParameter("CommandAndArgs", ref CommandAndArgs, "Command to run and arguments.");
 
-                parser.DefineParameterSet("monitor", ref DoCommand, CommandProcessor.Monitor, 
+                parser.DefineParameterSet("monitor", ref DoCommand, CommandProcessor.Monitor,
                     "Turns on all event sources, performs a run command.");
                 parser.DefineParameter("CommandAndArgs", ref CommandAndArgs, "Command to run and arguments.");
 
-                parser.DefineParameterSet("monitorDump", ref DoCommand, CommandProcessor.MonitorDump, 
+                parser.DefineParameterSet("monitorDump", ref DoCommand, CommandProcessor.MonitorDump,
                     "Turns on all event sources, performs a run command then the Dump command.");
                 parser.DefineParameter("CommandAndArgs", ref CommandAndArgs, "Command to run and arguments.");
 
@@ -1674,12 +1156,13 @@ namespace PerfMonitor
 
                 parser.DefineParameterSet("PrintSources", ref DoCommand, CommandProcessor.PrintSources,
                     "Takes an ETL file and generates a text file that prints EventSource events as formatted strings.");
+                parser.DefineOptionalParameter("DataFile", ref DataFile, "ETL file containing profile data.");
                 parser.DefineOptionalQualifier("OutputFile", ref OutputFile, "The file name to write the text output.  Stdout is the default.");
 
                 parser.DefineParameterSet("Listen", ref DoCommand, CommandProcessor.Listen,
                     "Turns on ETW logging for EventSources (providers), and then writes text file (by default to stdout).");
                 parser.DefineOptionalQualifier("OutputFile", ref OutputFile, "The file name to write the text output.  Stdout is the default.");
-                parser.DefineParameter("Providers", ref AdditionalProviders, "The Providers (EventSources) to turn on before listening");
+                parser.DefineParameter("Providers", ref Providers, "The Providers (EventSources) to turn on before listening");
 
                 parser.DefineParameterSet("UsersGuide", ref DoCommand, CommandProcessor.UsersGuide, "Displays the users Guide.");
 
@@ -1691,7 +1174,7 @@ namespace PerfMonitor
             if (CommandAndArgs != null)
                 CommandLine = CommandLineUtilities.FormCommandLineFromArguments(CommandAndArgs, 0);
         }
-        public CommandProcessor CommandProcessor { get; private set; }
+        public PerfMonitorCommandProcessor CommandProcessor { get; private set; }
 
         // The command to execute (determined by the parameter set)
         public Action<CommandLineArgs> DoCommand;
@@ -1717,16 +1200,20 @@ namespace PerfMonitor
         public int Circular;
         public KernelTraceEventParser.Keywords KernelEvents = KernelTraceEventParser.Keywords.Default;
         public ClrTraceEventParser.Keywords ClrEvents = ClrTraceEventParser.Keywords.Default;
-        public string[] AdditionalProviders;          // Additional providers to turn on.   
+        public string[] Providers;          // Additional providers to turn on.   
 
         // Stop options.  
         public bool NoRundown;
-        public bool Merge;
+        public bool NoNGenRundown;
+        public bool ForceNgenRundown;
+        public bool Merge = true;
         public bool Etlx;
         public int RundownTimeout = 30;
         public int MinRundownTime;
         public string[] SymbolsForDlls;
-        public bool PrimeSymbols;
+        public bool Zip = true;
+        public string StopTrigger;
+        public int MaxCollectSec;
 
         // options for cpuTime
         public double StartTimeRelMsec;
@@ -1742,7 +1229,6 @@ namespace PerfMonitor
         public bool LineNumbers;
         public bool SymDebug;
     };
-
 
     /// <summary>
     /// This class is simply a example of a CPU bound computation.   It does it recurisively to 
@@ -2156,9 +1642,9 @@ namespace PerfMonitor
                     }
                 }
 
-                CallTree tree = new CallTree();
-                tree.TimeHistogramStartRelMSec = 0;
-                tree.TimeHistogramEndRelMSec = log.RelativeTimeMSec(log.SessionEndTime100ns);
+                CallTree tree = new CallTree(ScalingPolicyKind.TimeMetric);
+                double startTimeMsec = 0;
+                double endTimeMSec = log.RelativeTimeMSec(log.SessionEndTime100ns);
                 if (parsedArgs.StartTimeRelMsec != 0 || parsedArgs.EndTimeRelMsec != double.PositiveInfinity)
                 {
                     Console.WriteLine("Filtering to Time region [{0:f3}, {1:f3}] msec",
@@ -2167,15 +1653,15 @@ namespace PerfMonitor
                         log.SessionStartTime100ns + (long)parsedArgs.StartTimeRelMsec * 10000,
                         log.SessionStartTime100ns + (long)parsedArgs.EndTimeRelMsec * 10000);
 
-                    tree.TimeHistogramStartRelMSec = parsedArgs.StartTimeRelMsec;
-                    if (parsedArgs.EndTimeRelMsec < tree.TimeHistogramEndRelMSec)
-                        tree.TimeHistogramEndRelMSec = parsedArgs.EndTimeRelMsec;
+                    startTimeMsec = parsedArgs.StartTimeRelMsec;
+                    if (parsedArgs.EndTimeRelMsec < endTimeMSec)
+                        endTimeMSec = parsedArgs.EndTimeRelMsec;
                 }
                 TraceEvents cpuEvents = events.Filter(delegate(TraceEvent x) { return x is SampledProfileTraceData && x.ProcessID > 0; });
 
                 // Round to the nearest half second
-                tree.TimeHistogramEndRelMSec = Math.Ceiling((tree.TimeHistogramEndRelMSec - tree.TimeHistogramStartRelMSec) / 500) * 500 + tree.TimeHistogramStartRelMSec;
-                tree.TimeHistogramSize = 25;
+                endTimeMSec = Math.Ceiling((endTimeMSec - startTimeMsec) / 500) * 500 + startTimeMsec;
+                tree.TimeHistogramController = new TimeHistogramController(tree, startTimeMsec, endTimeMSec);
 
                 tree.StackSource = new OSGroupingStackSource(new TraceEventStackSource(cpuEvents));
 
@@ -2304,7 +1790,6 @@ namespace PerfMonitor
             options.SymbolDebug = parsedArgs.SymDebug;
             Dictionary<string, string> dllSet = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-
             if (parsedArgs.SymbolsForDlls != null)
             {
                 options.AlwaysResolveSymbols = true;
@@ -2374,7 +1859,7 @@ namespace PerfMonitor
             writer.WriteLine("<LI> Total Duration: {0:f0} msec</LI>", duration);
             writer.WriteLine("<LI> Total CPU: {0:f0} msec</LI>", tree.Root.InclusiveMetric);
             writer.WriteLine("<LI> Average CPU Utilization (1 CPU): {0:f1}%</LI>", tree.Root.InclusiveMetric * 100.0 / duration);
-            writer.WriteLine("<LI> Interval for each Time Bucket in CPU utilization: {0:f1} msec</LI>", tree.TimeBucketDurationMSec);
+            writer.WriteLine("<LI> Interval for each Time Bucket in CPU utilization: {0:f1} msec</LI>", tree.TimeHistogramController.BucketDuration);
             writer.WriteLine("<LI> Percent of samples with broken stacks: {0:f1}%</LI>", percentBroken);
             writer.WriteLine("<LI> <A href=\"#TopDownAnalysis\">Top Down Analysis</A>  (Breaking CPU down by call tree)</LI>");
             writer.WriteLine("<LI> <A href=\"#BottomUpAnalysis\">Bottom up Analysis</A> (Looking at individual methods that use alot of CPU).</LI>");
@@ -2500,7 +1985,7 @@ namespace PerfMonitor
             if (callTreeNode.InclusiveMetricPercent < thresholdPercent)
                 return;
 
-            string indent = "<font face=\"Courier New\" size=\"-1\">" + callTreeNode.IndentString.Replace(" ", "&nbsp;") + "</font>";
+            string indent = "<font face=\"Courier New\" size=\"-1\">" + callTreeNode.IndentString(true).Replace(" ", "&nbsp;") + "</font>";
             string nameValue = "<font size=\"-1\">" + indent + AnchorForName(callTreeNode.Name, callerCalleeNodes) + "</font>";
 
             writer.WriteLine("<TR> <TD>{0}</TD> <TD align=\"center\">{1:f1}</TD> <TD align=\"center\">{2:f0}</TD> <TD align=\"center\">{3:f1}</TD> <TD align=\"center\">{4:f0}</TD> <TD><font face=\"Courier New\" size=\"-2\">{5}</font></TD> <TD align=\"center\">{6:f3}</TD> <TD align=\"center\">{7:f3}</TD></TR>",

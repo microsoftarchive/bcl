@@ -1,14 +1,11 @@
-﻿//     Copyright (c) Microsoft Corporation.  All rights reserved.
+﻿using System.Diagnostics;
+//     Copyright (c) Microsoft Corporation.  All rights reserved.
 // This file is best viewed using outline mode (Ctrl-M Ctrl-O)
 //
 // This program uses code hyperlinks available as part of the HyperAddin Visual Studio plug-in.
 // It is available from http://www.codeplex.com/hyperAddin 
 // 
-using System;
-using System.Collections.Generic;
 using System.Text;
-using System.Diagnostics;
-using Diagnostics.Eventing;
 
 namespace System.Collections.Generic
 {
@@ -59,13 +56,18 @@ namespace System.Collections.Generic
                     else
                     {
                         T[] newArray = new T[value];
-                        if (array !=  null)
+                        if (array != null)
                             Array.Copy(array, newArray, array.Length);
                         array = newArray;
                     }
                 }
                 arrayLength = value;
             }
+        }
+        public void Clear()
+        {
+            arrayLength = 0;
+            array = null;
         }
 
         /// <summary>
@@ -121,7 +123,7 @@ namespace System.Collections.Generic
         }
 
         // Support for stack-like operations 
-        public bool Empty { get { return arrayLength == 0; } } 
+        public bool Empty { get { return arrayLength == 0; } }
         public T Pop()
         {
             T ret = array[arrayLength - 1];       // Will cause index out of range exception
@@ -156,6 +158,9 @@ namespace System.Collections.Generic
             sb.Append("  ])");
             return sb.ToString();
         }
+        /// <summary>
+        /// Should return -1 if x is less than elem.  
+        /// </summary>
         public delegate int Comparison<Key>(Key x, T elem);
         /// <summary>
         /// Sets 'index' to the the smallest index such that all elements with index > 'idx' are > key.  If

@@ -5,7 +5,8 @@ using System.Text;
 using System.Diagnostics;
 using FastSerialization;
 using System.Security;
-using Diagnostics.Eventing;
+using Diagnostics.Tracing;
+using Address = System.UInt64;
 
 /* This file was generated with the command */
 // traceParserGen /merge CLREtwAll.man CLRTraceEventParser.cs
@@ -15,13 +16,13 @@ using Diagnostics.Eventing;
 // applied again if the mof or the traceParserGen transformation changes. 
 // 
 // See traceParserGen /usersGuide for more on the /merge option 
-namespace Diagnostics.Eventing
+namespace Diagnostics.Tracing.Parsers
 {
 
     /* Parsers defined in this file */
     // code:ClrTraceEventParser, code:ClrRundownTraceEventParser, code:ClrStressTraceEventParser 
     /* code:ClrPrivateTraceEventParser  code:#ClrPrivateProvider */
-    [SecuritySafeCritical]
+    // [SecuritySafeCritical]
     public class ClrTraceEventParser : TraceEventParser
     {
         public static string ProviderName = "Microsoft-Windows-DotNETRuntime";
@@ -29,9 +30,11 @@ namespace Diagnostics.Eventing
         /// <summary>
         ///  Keywords are passed to code:TraceEventSession.EnableProvider to enable particular sets of
         /// </summary>
+        [Flags]
         public enum Keywords : long
         {
             None = 0,
+            All = ~StartEnumeration,        // All does not include start-enumeration.  It just is not that useful.  
             /// <summary>
             /// Logging when garbage collections and finalization happen. 
             /// </summary>
@@ -87,13 +90,26 @@ namespace Diagnostics.Eventing
             /// </summary>
             Threading = 0x10000,
             /// <summary>
+            /// Dump the native to IL mapping of any method that is JIT compiled.  (V4.5 runtimes and above).  
+            /// </summary>
+            JittedMethodILToNativeMap = 0x20000,
+            /// <summary>
+            /// This supresses NGEN events on V4.0 (where you have NGEN PDBs), but not on V2.0 (which does not know about this 
+            /// bit and also does not have NGEN PDBS).  
+            /// </summary>
+            SupressNGen = 0x40000,
+            /// <summary>
+            /// TODO document
+            /// </summary>
+            PerfTrack = 0x20000000,
+            /// <summary>
             /// Also log the stack trace of events for which this is valuable.
             /// </summary>
             Stack = 0x40000000,
             /// <summary>
             /// Recommend default flags (good compromise on verbosity).  
             /// </summary>
-            Default = GC | Binder | Loader | Jit | NGen | StopEnumeration | Security | AppDomainResourceManagement | Exception | Threading | Contention,
+            Default = GC | Binder | Loader | Jit | NGen | SupressNGen | StopEnumeration | Security | AppDomainResourceManagement | Exception | Threading | Contention | Stack | JittedMethodILToNativeMap,
         };
         public ClrTraceEventParser(TraceEventSource source) : base(source) { }
 
@@ -128,7 +144,7 @@ namespace Diagnostics.Eventing
                 // action, eventid, taskid, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName
                 source.RegisterEventTemplate(new GCNoUserDataTraceData(value, 3, 1, "GC", GCTaskGuid, 132, "RestartEEStop", ProviderGuid, ProviderName));
                 // Added for V2 Runtime compatibilty (Classic ETW only)
-                source.RegisterEventTemplate(new GCNoUserDataTraceData(value, 0xFFFF, 1, "GC", GCTaskGuid, 4, "RestartEEStop", Guid.Empty, ProviderName));
+                source.RegisterEventTemplate(new GCNoUserDataTraceData(value, 0xFFFF, 1, "GC", GCTaskGuid, 8, "RestartEEStop", Guid.Empty, ProviderName));
             }
             remove
             {
@@ -195,9 +211,7 @@ namespace Diagnostics.Eventing
             {
                 // action, eventid, taskid, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName
                 source.RegisterEventTemplate(new GCNoUserDataTraceData(value, 8, 1, "GC", GCTaskGuid, 137, "SuspendEEStop", ProviderGuid, ProviderName));
-                // Added for V2 Runtime compatibilty (Classic ETW only)
-                source.RegisterEventTemplate(new GCNoUserDataTraceData(value, 0xFFFF, 1, "GC", GCTaskGuid, 9, "SuspendEEStop", Guid.Empty, ProviderName));
-            }
+             }
             remove
             {
                 throw new Exception("Not supported");
@@ -425,6 +439,18 @@ namespace Diagnostics.Eventing
             {
                 // action, eventid, taskid, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName
                 source.RegisterEventTemplate(new ContentionTraceData(value, 81, 8, "Contention", ContentionTaskGuid, 1, "Start", ProviderGuid, ProviderName));
+            }
+            remove
+            {
+                throw new Exception("Not supported");
+            }
+        }
+        public event Action<MethodILToNativeMapTraceData> MethodILToNativeMap
+        {
+            add
+            {
+                // action, eventid, taskid, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName
+                source.RegisterEventTemplate(new MethodILToNativeMapTraceData(value, 190, 9, "Method", MethodTaskGuid, 87, "ILToNativeMap", ProviderGuid, ProviderName));
             }
             remove
             {
@@ -988,9 +1014,9 @@ namespace Diagnostics.Eventing
     public sealed class GCStartTraceData : TraceEvent
     {
         public int Count { get { return GetInt32At(0); } }
-        public GCReason Reason { get { if (Version >= 1) return (GCReason)GetInt32At(8); return (GCReason)GetInt32At(4); } }
-        public int Depth { get { if (Version >= 1) return GetInt32At(4); return 0; } }
-        public GCType Type { get { if (Version >= 1) return (GCType)GetInt32At(12); return (GCType)0; } }
+        public GCReason Reason { get { if (EventDataLength >= 16) return (GCReason)GetInt32At(8); return (GCReason)GetInt32At(4); } }
+        public int Depth { get { if (EventDataLength >= 16) return GetInt32At(4); return 0; } }
+        public GCType Type { get { if (EventDataLength >= 16) return (GCType)GetInt32At(12); return (GCType)0; } }
         public int ClrInstanceID { get { if (Version >= 1) return GetInt16At(16); return 0; } }
 
         #region Private
@@ -1005,7 +1031,7 @@ namespace Diagnostics.Eventing
         }
         protected internal override void Validate()
         {
-            Debug.Assert(!(Version == 0 && EventDataLength != 8));
+            Debug.Assert(!(Version == 0 && EventDataLength < 8));       // FIXed manually to be < 8 
             Debug.Assert(!(Version == 1 && EventDataLength != 18));
             Debug.Assert(!(Version > 1 && EventDataLength < 18));
         }
@@ -1167,8 +1193,13 @@ namespace Diagnostics.Eventing
         private event Action<GCNoUserDataTraceData> Action;
         #endregion
     }
+
     public sealed class GCHeapStatsTraceData : TraceEvent
     {
+        // GCHeap stats are reported AFTER the GC has completed.  Thus these number are the 'After' heap size for each generation
+        // The sizes INCLUDE fragmentation (holes in the segement)
+
+        // The TotalPromotedSize0 is the amount that SURVIVED Gen0 (thus it is now in Gen1, thus TotalPromoted0 <= GenerationSize1)
         public long GenerationSize0 { get { return GetInt64At(0); } }
         public long TotalPromotedSize0 { get { return GetInt64At(8); } }
         public long GenerationSize1 { get { return GetInt64At(16); } }
@@ -1460,7 +1491,10 @@ namespace Diagnostics.Eventing
         public int AllocationAmount { get { return GetInt32At(0); } }
         public GCAllocationKind AllocationKind { get { return (GCAllocationKind)GetInt32At(4); } }
         public int ClrInstanceID { get { if (Version >= 1) return GetInt16At(8); return 0; } }
-
+        public long AllocationAmount64 { get { if (Version >= 2) return GetInt64At(10); return 0; } }
+        public Address TypeID { get { if (Version >= 2) return GetHostPointer(18); return 0; } }
+        public string TypeName { get { if (Version >= 2) return GetUnicodeStringAt(18 + PointerSize); return ""; } }
+        public int HeapIndex { get { if (Version >= 2) return GetInt32At(SkipUnicodeString(18 + PointerSize)); return 0; } }
         #region Private
         internal GCAllocationTickTraceData(Action<GCAllocationTickTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName)
             : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
@@ -1483,6 +1517,13 @@ namespace Diagnostics.Eventing
             sb.XmlAttribHex("AllocationAmount", AllocationAmount);
             sb.XmlAttrib("AllocationKind", AllocationKind);
             sb.XmlAttrib("ClrInstanceID", ClrInstanceID);
+            if (Version >= 2)
+            {
+                sb.XmlAttrib("AllocationAmount64", AllocationAmount64);
+                sb.XmlAttrib("TypeID", TypeID);
+                sb.XmlAttrib("TypeName", TypeName);
+                sb.XmlAttrib("HeapIndex", HeapIndex);
+            }
             sb.Append("/>");
             return sb;
         }
@@ -1492,7 +1533,7 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "AllocationAmount", "AllocationKind", "ClrInstanceID" };
+                    payloadNames = new string[] { "AllocationAmount", "AllocationKind", "ClrInstanceID", "AllocationAmount64", "TypeID", "TypeName", "HeapIndex"};
                 return payloadNames;
             }
         }
@@ -1507,10 +1548,47 @@ namespace Diagnostics.Eventing
                     return AllocationKind;
                 case 2:
                     return ClrInstanceID;
+                case 3:
+                    return AllocationAmount64;
+                case 4:
+                    return TypeID;
+                case 5:
+                    return TypeName;
+                case 6:
+                    return HeapIndex;
                 default:
                     Debug.Assert(false, "Bad field index");
                     return null;
             }
+        }
+
+        const int OneKB = 1024;
+        const int OneMB = OneKB * OneKB;
+
+        public long GetAllocAmount(ref bool seenBadAllocTick)
+        {
+            // We get bad values in old runtimes.   once we see a bad value 'fix' all values. 
+            // TODO warn the user...
+            long amount = AllocationAmount64; // AllocationAmount is truncated for allocation larger than 2Gb, use 64-bit value if available.
+
+            if (amount == 0)
+            {
+                amount = AllocationAmount;
+            }
+
+            if (amount < 0)
+            {
+                seenBadAllocTick = true;
+            }
+
+            if (seenBadAllocTick)
+            {
+                // Clap this between 90K and 110K (for small objs) and 90K to 2Meg (for large obects).  
+                amount = Math.Max(amount, 90 * OneKB);
+                amount = Math.Min(amount, (AllocationKind == GCAllocationKind.Small) ? 110 * OneKB : 2 * OneMB);
+            }
+
+            return amount;
         }
 
         private event Action<GCAllocationTickTraceData> Action;
@@ -2250,6 +2328,88 @@ namespace Diagnostics.Eventing
         private event Action<ContentionTraceData> Action;
         #endregion
     }
+
+    public sealed class MethodILToNativeMapTraceData : TraceEvent
+    {
+        const int ILProlog = -2;    // Returned by ILOffset to represent the prolog of the method
+        const int ILEpilog = -3;    // Returned by ILOffset to represent the epilog of the method
+
+        public long MethodID { get { return GetInt64At(0); } }
+        public long ReJITID { get { return GetInt64At(8); } }
+        public int MethodExtent { get { return GetByteAt(16); } }
+        public int CountOfMapEntries { get { return GetInt16At(17); } }
+        // May also return the special values ILProlog (-2) and ILEpilog (-3) 
+        public int ILOffset(int i) { return GetInt32At(i * 4 + 19); }
+        unsafe internal int* ILOffsets { get { return (int*)(((byte*)DataStart) + 19); } }
+
+        public int NativeOffset(int i) { return GetInt32At((CountOfMapEntries + i) * 4 + 19); }
+        unsafe internal int* NativeOffsets { get { return (int*)(((byte*)DataStart) + CountOfMapEntries * 4 + 19); } }
+        public int ClrInstanceID { get { return GetInt16At(CountOfMapEntries * 8 + 19); } }
+
+        #region Private
+        internal MethodILToNativeMapTraceData(Action<MethodILToNativeMapTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName)
+            : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
+        {
+            this.Action = action;
+        }
+        protected internal override void Dispatch()
+        {
+            Action(this);
+        }
+        protected internal override void Validate()
+        {
+            Debug.Assert(Version != 0 || EventDataLength == CountOfMapEntries * 8 + 21);
+            Debug.Assert(Version > 0 || EventDataLength >= CountOfMapEntries * 8 + 21);
+        }
+        public override StringBuilder ToXml(StringBuilder sb)
+        {
+            Prefix(sb);
+            sb.XmlAttrib("MethodID", MethodID);
+            sb.XmlAttrib("ReJITID", ReJITID);
+            sb.XmlAttrib("MethodExtent", MethodExtent);
+            sb.XmlAttrib("CountOfMapEntries", CountOfMapEntries);
+            sb.XmlAttrib("ClrInstanceID", ClrInstanceID);
+            sb.AppendLine(">");
+            for (int i = 0; i < CountOfMapEntries; i++)
+                sb.Append("  ").Append(ILOffset(i)).Append("->").Append(NativeOffset(i)).AppendLine();
+            sb.Append("</Event>");
+            return sb;
+        }
+
+        public override string[] PayloadNames
+        {
+            get
+            {
+                if (payloadNames == null)
+                    payloadNames = new string[] { "MethodID", "ReJITID", "MethodExtent", "CountOfMapEntries", "ClrInstanceID" };
+                return payloadNames;
+            }
+        }
+
+        public override object PayloadValue(int index)
+        {
+            switch (index)
+            {
+                case 0:
+                    return MethodID;
+                case 1:
+                    return ReJITID;
+                case 2:
+                    return MethodExtent;
+                case 3:
+                    return CountOfMapEntries;
+                case 4:
+                    return ClrInstanceID;
+                default:
+                    Debug.Assert(false, "Bad field index");
+                    return null;
+            }
+        }
+
+        private event Action<MethodILToNativeMapTraceData> Action;
+        #endregion
+    }
+
     public sealed class ClrStackWalkTraceData : TraceEvent
     {
         public int ClrInstanceID { get { return GetInt16At(0); } }
@@ -2268,6 +2428,11 @@ namespace Diagnostics.Eventing
             Debug.Assert(0 <= i && i < FrameCount);
             return GetHostPointer(8 + i * PointerSize);
         }
+
+        /// <summary>
+        /// Access to the instruction pointers as a unsafe memory blob
+        /// </summary>
+        unsafe internal void* InstructionPointers { get { return ((byte*)DataStart) + 8; } }
 
         #region Private
         internal ClrStackWalkTraceData(Action<ClrStackWalkTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName)
@@ -3013,7 +3178,18 @@ namespace Diagnostics.Eventing
         public string ModuleILPath { get { return GetUnicodeStringAt(24); } }
         public string ModuleNativePath { get { return GetUnicodeStringAt(SkipUnicodeString(24)); } }
         public int ClrInstanceID { get { if (Version >= 1) return GetInt16At(SkipUnicodeString(SkipUnicodeString(24))); return 0; } }
+        public Guid ManagedPdbSignature { get { if (Version >= 2) return GetGuidAt(SkipUnicodeString(SkipUnicodeString(24)) + 2); return Guid.Empty; } }
+        public int ManagedPdbAge { get { if (Version >= 2) return GetInt32At(SkipUnicodeString(SkipUnicodeString(24)) + 18); return 0; } }
+        public string ManagedPdbBuildPath { get { if (Version >= 2) return GetUnicodeStringAt(SkipUnicodeString(SkipUnicodeString(24)) + 22); return ""; } }
 
+        public Guid NativePdbSignature { get { if (Version >= 2) return GetGuidAt(GetNativePdbSigStart); return Guid.Empty; } }
+        public int NativePdbAge { get { if (Version >= 2) return GetInt32At(GetNativePdbSigStart + 16); return 0; } }
+        public string NativePdbBuildPath { get { if (Version >= 2) return GetUnicodeStringAt(GetNativePdbSigStart + 20); return ""; } }
+
+        /// <summary>
+        /// This is simply the file name part of the ModuleILPath.  It is a convinience method. 
+        /// </summary>
+        public string ModuleILFileName { get { return System.IO.Path.GetFileName(ModuleILPath); } }
         #region Private
         internal ModuleLoadUnloadTraceData(Action<ModuleLoadUnloadTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName)
             : base(eventID, task, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName)
@@ -3024,11 +3200,15 @@ namespace Diagnostics.Eventing
         {
             Action(this);
         }
+
+        int GetNativePdbSigStart { get { return SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(24)) + 22); } }
+
         protected internal override void Validate()
         {
             Debug.Assert(!(Version == 0 && EventDataLength != SkipUnicodeString(SkipUnicodeString(24))));
             Debug.Assert(!(Version == 1 && EventDataLength != SkipUnicodeString(SkipUnicodeString(24)) + 2));
-            Debug.Assert(!(Version > 1 && EventDataLength < SkipUnicodeString(SkipUnicodeString(24)) + 2));
+            Debug.Assert(!(Version == 2 && EventDataLength != SkipUnicodeString(GetNativePdbSigStart + 20)));
+            Debug.Assert(!(Version > 2 && EventDataLength < SkipUnicodeString(GetNativePdbSigStart + 20)));
         }
         public override StringBuilder ToXml(StringBuilder sb)
         {
@@ -3038,6 +3218,18 @@ namespace Diagnostics.Eventing
             sb.XmlAttrib("ModuleFlags", ModuleFlags);
             sb.XmlAttrib("ModuleILPath", ModuleILPath);
             sb.XmlAttrib("ModuleNativePath", ModuleNativePath);
+            if (ManagedPdbSignature != Guid.Empty)
+                sb.XmlAttrib("ManagedPdbSignature", ManagedPdbSignature);
+            if (ManagedPdbAge != 0)
+                sb.XmlAttrib("ManagedPdbAge", ManagedPdbAge);
+            if (ManagedPdbBuildPath.Length != 0)
+                sb.XmlAttrib("ManagedPdbBuildPath", ManagedPdbBuildPath);
+            if (NativePdbSignature != Guid.Empty)
+                sb.XmlAttrib("NativePdbSignature", NativePdbSignature);
+            if (NativePdbAge != 0)
+                sb.XmlAttrib("NativePdbAge", NativePdbAge);
+            if (NativePdbBuildPath.Length != 0)
+                sb.XmlAttrib("NativePdbBuildPath", NativePdbBuildPath);
             sb.Append("/>");
             return sb;
         }
@@ -3047,7 +3239,9 @@ namespace Diagnostics.Eventing
             get
             {
                 if (payloadNames == null)
-                    payloadNames = new string[] { "ModuleID", "AssemblyID", "ModuleFlags", "ModuleILPath", "ModuleNativePath" };
+                    payloadNames = new string[] { "ModuleID", "AssemblyID", "ModuleFlags", "ModuleILPath", "ModuleNativePath",
+                        "ManagedPdbSignature", "ManagedPdbAge", "ManagedPdbBuildPath",
+                        "NativePdbSignature", "NativePdbAge", "NativePdbBuildPath", "ModuleILFileName" };
                 return payloadNames;
             }
         }
@@ -3066,6 +3260,20 @@ namespace Diagnostics.Eventing
                     return ModuleILPath;
                 case 4:
                     return ModuleNativePath;
+                case 5:
+                    return ManagedPdbSignature;
+                case 6:
+                    return ManagedPdbAge;
+                case 7:
+                    return ManagedPdbBuildPath;
+                case 8:
+                    return NativePdbSignature;
+                case 9:
+                    return NativePdbAge;
+                case 10:
+                    return NativePdbBuildPath;
+                case 11:
+                    return ModuleILFileName;
                 default:
                     Debug.Assert(false, "Bad field index");
                     return null;
@@ -3525,8 +3733,8 @@ namespace Diagnostics.Eventing
         public string InlineeName { get { return GetUnicodeStringAt(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0)))))))); } }
         public string InlineeNameSignature { get { return GetUnicodeStringAt(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0))))))))); } }
         public bool FailAlways { get { return GetInt32At(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0)))))))))) != 0; } }
-        public string FailReason { get { return GetAsciiStringAt(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0))))))))) + 4); } }
-        public int ClrInstanceID { get { return GetInt16At(SkipAsciiString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0))))))))) + 4)); } }
+        public string FailReason { get { return GetUTF8StringAt(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0))))))))) + 4); } }
+        public int ClrInstanceID { get { return GetInt16At(SkipUTF8String(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0))))))))) + 4)); } }
 
         #region Private
         internal MethodJitInliningFailedTraceData(Action<MethodJitInliningFailedTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName)
@@ -3540,8 +3748,8 @@ namespace Diagnostics.Eventing
         }
         protected internal override void Validate()
         {
-            Debug.Assert(!(Version == 0 && EventDataLength != SkipAsciiString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0))))))))) + 4) + 2));
-            Debug.Assert(!(Version > 0 && EventDataLength < SkipAsciiString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0))))))))) + 4) + 2));
+            Debug.Assert(!(Version == 0 && EventDataLength != SkipUTF8String(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0))))))))) + 4) + 2));
+            Debug.Assert(!(Version > 0 && EventDataLength < SkipUTF8String(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0))))))))) + 4) + 2));
         }
         public override StringBuilder ToXml(StringBuilder sb)
         {
@@ -3825,8 +4033,8 @@ namespace Diagnostics.Eventing
         public string CalleeName { get { return GetUnicodeStringAt(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0)))))))); } }
         public string CalleeNameSignature { get { return GetUnicodeStringAt(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0))))))))); } }
         public bool TailPrefix { get { return GetInt32At(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0)))))))))) != 0; } }
-        public string FailReason { get { return GetAsciiStringAt(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0))))))))) + 4); } }
-        public int ClrInstanceID { get { return GetInt16At(SkipAsciiString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0))))))))) + 4)); } }
+        public string FailReason { get { return GetUTF8StringAt(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0))))))))) + 4); } }
+        public int ClrInstanceID { get { return GetInt16At(SkipUTF8String(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0))))))))) + 4)); } }
 
         #region Private
         internal MethodJitTailCallFailedTraceData(Action<MethodJitTailCallFailedTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName)
@@ -3840,8 +4048,8 @@ namespace Diagnostics.Eventing
         }
         protected internal override void Validate()
         {
-            Debug.Assert(!(Version == 0 && EventDataLength != SkipAsciiString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0))))))))) + 4) + 2));
-            Debug.Assert(!(Version > 0 && EventDataLength < SkipAsciiString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0))))))))) + 4) + 2));
+            Debug.Assert(!(Version == 0 && EventDataLength != SkipUTF8String(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0))))))))) + 4) + 2));
+            Debug.Assert(!(Version > 0 && EventDataLength < SkipUTF8String(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(SkipUnicodeString(0))))))))) + 4) + 2));
         }
         public override StringBuilder ToXml(StringBuilder sb)
         {
@@ -4016,9 +4224,9 @@ namespace Diagnostics.Eventing
     }
     public enum GCType
     {
-        NonConcurrentGC = 0x0,
-        BackgroundGC = 0x1,
-        ForegroundGC = 0x2,
+        NonConcurrentGC = 0x0,      // A 'blocking' GC.  
+        BackgroundGC = 0x1,         // A Gen 2 GC happening while code continues to run
+        ForegroundGC = 0x2,         // A Gen 0 or Gen 1 blocking GC which is happening when a Background GC is in progress.  
     }
     public enum GCReason
     {
@@ -4027,8 +4235,11 @@ namespace Diagnostics.Eventing
         LowMemory = 0x2,
         Empty = 0x3,
         AllocLarge = 0x4,
-        OutOfSpaceSmallObjectHeap = 0x5,
-        OutOfSpaceLargeObjectHeap = 0x6,
+        OutOfSpaceSOH = 0x5,
+        OutOfSpaceLOH = 0x6,
+        InducedNotForced = 0x7,
+        Internal = 0x8,
+        InducedLowMemory = 0x9,
     }
     public enum GCSuspendEEReason
     {
@@ -4064,7 +4275,7 @@ namespace Diagnostics.Eventing
         ThreadTimedOut = 0x7,
     }
 
-    [SecuritySafeCritical]
+    // [SecuritySafeCritical]
     public sealed class ClrRundownTraceEventParser : TraceEventParser
     {
         public static string ProviderName = "Microsoft-Windows-DotNETRuntimeRundown";
@@ -4074,14 +4285,57 @@ namespace Diagnostics.Eventing
             Loader = 0x8,
             Jit = 0x10,
             NGen = 0x20,
-            Start = 0x40,
-            End = 0x100,
+            Start = 0x40,                   // Do rundown at DC_START
+            ForceEndRundown = 0x100,        
             AppDomainResourceManagement = 0x800,
+            /// <summary>
+            /// Log events associated with the threadpool, and other threading events.  
+            /// </summary>
+            Threading = 0x10000,
+            /// <summary>
+            /// Dump the native to IL mapping of any method that is JIT compiled.  (V4.5 runtimes and above).  
+            /// </summary>
+            JittedMethodILToNativeMap = 0x20000,
+            /// <summary>
+            /// This supresses NGEN events on V4.0 (where you have NGEN PDBs), but not on V2.0 (which does not know about this 
+            /// bit and also does not have NGEN PDBS).  
+            /// </summary>
+            SupressNGen = 0x40000,
+            /// <summary>
+            /// TODO document
+            /// </summary>
+            PerfTrack = 0x20000000,
             Stack = 0x40000000,
+
+            Default = ForceEndRundown+NGen+Jit+SupressNGen+JittedMethodILToNativeMap+Threading+Loader,
         };
 
         public ClrRundownTraceEventParser(TraceEventSource source) : base(source) { }
 
+        public event Action<MethodILToNativeMapTraceData> MethodILToNativeMapDCStart
+        {
+            add
+            {
+                // action, eventid, taskid, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName
+                source.RegisterEventTemplate(new MethodILToNativeMapTraceData(value, 149, 1, "Method", MethodTaskGuid, 41, "ILToNativeMapDCStart", ProviderGuid, ProviderName));
+            }
+            remove
+            {
+                throw new Exception("Not supported");
+            }
+        }
+        public event Action<MethodILToNativeMapTraceData> MethodILToNativeMapDCStop
+        {
+            add
+            {
+                // action, eventid, taskid, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName
+                source.RegisterEventTemplate(new MethodILToNativeMapTraceData(value, 150, 1, "Method", MethodTaskGuid, 42, "ILToNativeMapDCStop", ProviderGuid, ProviderName));
+            }
+            remove
+            {
+                throw new Exception("Not supported");
+            }
+        }
         public event Action<ClrStackWalkTraceData> ClrStackWalk
         {
             add
@@ -4444,8 +4698,8 @@ namespace Diagnostics.Eventing
     {
         public int Facility { get { return GetInt32At(0); } }
         public int LogLevel { get { return GetByteAt(4); } }
-        public string Message { get { return GetAsciiStringAt(5); } }
-        public int ClrInstanceID { get { if (Version >= 1) return GetInt16At(SkipAsciiString(5)); return 0; } }
+        public string Message { get { return GetUTF8StringAt(5); } }
+        public int ClrInstanceID { get { if (Version >= 1) return GetInt16At(SkipUTF8String(5)); return 0; } }
 
         #region Private
         internal StressLogTraceData(Action<StressLogTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opcode, string opcodeName, Guid providerGuid, string providerName)
@@ -4459,9 +4713,9 @@ namespace Diagnostics.Eventing
         }
         protected internal override void Validate()
         {
-            Debug.Assert(!(Version == 0 && EventDataLength != SkipAsciiString(5)));
-            Debug.Assert(!(Version == 1 && EventDataLength != SkipAsciiString(5) + 2));
-            Debug.Assert(!(Version > 1 && EventDataLength < SkipAsciiString(5) + 2));
+            Debug.Assert(!(Version == 0 && EventDataLength != SkipUTF8String(5)));
+            Debug.Assert(!(Version == 1 && EventDataLength != SkipUTF8String(5) + 2));
+            Debug.Assert(!(Version > 1 && EventDataLength < SkipUTF8String(5) + 2));
         }
         public override StringBuilder ToXml(StringBuilder sb)
         {

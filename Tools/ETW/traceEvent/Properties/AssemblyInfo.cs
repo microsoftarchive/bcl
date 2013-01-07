@@ -19,6 +19,10 @@ using System.Runtime.InteropServices;
 // COM, set the ComVisible attribute to true on that type.
 [assembly: ComVisible(false)]
 
+// We have made the CLRPrivateTraceEventParser internal.   We grant PerfView rights to it.  
+[assembly: InternalsVisibleTo("PerfView")]
+[assembly: InternalsVisibleTo("PerfMonitor")]
+
 // The following GUID is for the ID of the typelib if this project is exposed to COM
 [assembly: Guid("0616205d-6b80-4b44-b847-050194824022")]
 
@@ -33,4 +37,4 @@ using System.Runtime.InteropServices;
 // by using the '*' as shown below:
 // [assembly: AssemblyVersion("1.0.*")]
 [assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyFileVersion("1.2.7.0")]

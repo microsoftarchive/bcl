@@ -3,9 +3,11 @@ using System;
 using System.Collections.Generic;
 using System.Text;
 using System.Diagnostics;
-using Diagnostics.Eventing;
+using Diagnostics.Tracing;
+using Diagnostics.Tracing.Parsers;
+using Address = System.UInt64;
 
-namespace Diagnostics.Eventing
+namespace Diagnostics.Tracing.Parsers
 {
     /// <summary>
     /// Kernel traces have information about images that are loaded, however they don't have enough information
@@ -80,21 +82,123 @@ namespace Diagnostics.Eventing
             }
 
         }
+        /// <summary>
+        /// I don't really care about this one, but I need a defintion in order to exclude it because it
+        /// has the same timestamp as a imageLoad event, and two events with the same timestamp confuse the 
+        /// assoication between a stack and the event for the stack.  
+        /// </summary>
+        public event Action<EmptyTraceData> None
+        {
+            add
+            {
+                source.RegisterEventTemplate(new EmptyTraceData(value, 0xFFFF, 0, "ImageId", ImageIDTaskGuid, DBGID_LOG_TYPE_NONE, "None", ProviderGuid, ProviderName));
+            }
+            remove
+            {
+                throw new NotImplementedException();
+            }
+        }
+
+        // These are here just so we don't have any unknown providers in a typical PerfView trace
+        // They are incomplete (I don't describe the payload properly).  
+        public event Action<EmptyTraceData> WinSatWinSPR
+        {
+            add
+            {
+                // action, eventid, taskid, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName
+                source.RegisterEventTemplate(new EmptyTraceData(value, 0xFFFF, 0, "WinSat", WinSatTaskGuid, 33, "WinSPR", ProviderGuid, ProviderName));
+            }
+            remove
+            {
+                throw new NotImplementedException();
+            }
+        }
+        public event Action<EmptyTraceData> WinSatMetrics
+        {
+            add
+            {
+                // action, eventid, taskid, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName
+                source.RegisterEventTemplate(new EmptyTraceData(value, 0xFFFF, 0, "WinSat", WinSatTaskGuid, 35, "Metrics", ProviderGuid, ProviderName));
+            }
+            remove
+            {
+                throw new NotImplementedException();
+            }
+        }
+        public event Action<EmptyTraceData> WinSatSystemConfig
+        {
+            add
+            {
+                // action, eventid, taskid, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName
+                source.RegisterEventTemplate(new EmptyTraceData(value, 0xFFFF, 0, "WinSat", WinSatTaskGuid, 37, "SystemConfig", ProviderGuid, ProviderName));
+            }
+            remove
+            {
+                throw new NotImplementedException();
+            }
+        }
+        // I don't know much about this event at all...
+        public event Action<EmptyTraceData> MetaDataOpcode32
+        {
+            add
+            {
+                // action, eventid, taskid, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName
+                source.RegisterEventTemplate(new EmptyTraceData(value, 0xFFFF, 0, "MetaData", MetaDataGuid, 32, "Opcode(32)", ProviderGuid, ProviderName));
+            }
+            remove
+            {
+                throw new NotImplementedException();
+            }
+        }
+        // I don't know much about this event at all...
+        public event Action<EmptyTraceData> MetaData1Opcode33
+        {
+            add
+            {
+                // action, eventid, taskid, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName
+                source.RegisterEventTemplate(new EmptyTraceData(value, 0xFFFF, 0, "MetaData1", MetaData1Guid, 33, "Opcode(33)", ProviderGuid, ProviderName));
+            }
+            remove
+            {
+                throw new NotImplementedException();
+            }
+        }
+        // I don't know much about this event at all...
+        public event Action<EmptyTraceData> MetaData2Opcode37
+        {
+            add
+            {
+                // action, eventid, taskid, taskName, taskGuid, opcode, opcodeName, providerGuid, providerName
+                source.RegisterEventTemplate(new EmptyTraceData(value, 0xFFFF, 0, "MetaData2", MetaData2Guid, 37, "Opcode(37)", ProviderGuid, ProviderName));
+            }
+            remove
+            {
+                throw new NotImplementedException();
+            }
+        }
 
         #region Private
+        // These are the Opcode numbers for various events
         public const int DBGID_LOG_TYPE_IMAGEID = 0x00;
         public const int DBGID_LOG_TYPE_NONE = 0x20;
         public const int DBGID_LOG_TYPE_RSDS = 0x24;
         public const int DBGID_LOG_TYPE_FILEVERSION = 0x40;
 
+        // Used to log meta-data about crimson events into the log.  
+        internal static Guid MetadataTaskGuid = new Guid(unchecked((int) 0xBBCCF6C1), 0x6CD1, 0x48c4, 0x80, 0xFF, 0x83, 0x94, 0x82, 0xE3, 0x76, 0x71);
         internal static Guid ImageIDTaskGuid = new Guid(unchecked((int) 0xB3E675D7), 0x2554, 0x4f18, 0x83, 0x0B, 0x27, 0x62, 0x73, 0x25, 0x60, 0xDE);
+        internal static Guid WinSatTaskGuid = new Guid(unchecked((int) 0xed54dff8), unchecked((short) 0xc409), 0x4cf6, 0xbf, 0x83, 0x05, 0xe1, 0xe6, 0x1a, 0x09, 0xc4);
+        internal static Guid MetaDataGuid = new Guid(unchecked((int) 0xbbccf6c1), 0x6cd1, 0x48c4, 0x80, 0xff, 0x83, 0x94, 0x82, 0xe3, 0x76, 0x71);
+        internal static Guid MetaData1Guid = new Guid(unchecked((int)0xbf6ef1cb), unchecked((short)0x89b5), 0x490, 0x80, 0xac, 0xb1, 0x80, 0xcf, 0xbc, 0xff, 0x0f);
+        internal static Guid MetaData2Guid = new Guid(unchecked((int)0xb3e675d7), 0x2554, 0x4f18, 0x83, 0x0b, 0x27, 0x62, 0x73, 0x25, 0x60, 0xde);
         #endregion 
     }
 
     public sealed class FileVersionTraceData : TraceEvent
-    {
+    {   
         public int ImageSize { get { return GetInt32At(0); } }
         public int TimeDateStamp { get { return GetInt32At(4); } }
+        public DateTime BuildTime { get { return PEFile.PEHeader.TimeDateStampToDate(TimeDateStamp); } } 
         public string OrigFileName { get { return GetUnicodeStringAt(8); } } 
         public string FileDescription { get { return GetUnicodeStringAt(SkipUnicodeString(8, 1)); } } 
         public string FileVersion { get { return GetUnicodeStringAt(SkipUnicodeString(8, 2)); } } 
@@ -128,7 +232,7 @@ namespace Diagnostics.Eventing
             {
                 if (payloadNames == null)
                 {
-                    payloadNames = new string[] { "ImageSize", "TimeDateStamp", "OrigFileName", "FileDescription", "FileVersion",
+                    payloadNames = new string[] { "ImageSize", "TimeDateStamp", "BuildTime", "OrigFileName", "FileDescription", "FileVersion",
                         "BinFileVersion", "VerLanguage", "ProductName", "CompanyName", "ProductVersion", "FileId", "ProgramId" };
                 }
                     return payloadNames;
@@ -144,24 +248,26 @@ namespace Diagnostics.Eventing
                 case 1:
                     return TimeDateStamp;
                 case 2:
-                    return OrigFileName;
+                    return BuildTime;
                 case 3:
-                    return FileDescription;
+                    return OrigFileName;
                 case 4:
-                    return FileVersion;
+                    return FileDescription;
                 case 5:
-                    return BinFileVersion;
+                    return FileVersion;
                 case 6:
-                    return VerLanguage;
+                    return BinFileVersion;
                 case 7:
-                    return ProductName;
+                    return VerLanguage;
                 case 8:
-                    return CompanyName;
+                    return ProductName;
                 case 9:
-                    return ProductVersion;
+                    return CompanyName;
                 case 10:
-                    return FileId;
+                    return ProductVersion;
                 case 11:
+                    return FileId;
+                case 12:
                     return ProgramId;
                 default:
                     Debug.Assert(false, "invalid index");
@@ -196,7 +302,7 @@ namespace Diagnostics.Eventing
         // public int ProcessID { get { return GetInt32At(HostOffset(4, 1)); } }    // This seems to be redundant with the ProcessID in the event header
         public Guid GuidSig { get { return GetGuidAt(HostOffset(8, 1)); } }
         public int Age { get { return GetInt32At(HostOffset(24, 1)); } }
-        public string PdbFileName { get { return GetAsciiStringAt(HostOffset(28, 1)); } }
+        public string PdbFileName { get { return GetUTF8StringAt(HostOffset(28, 1)); } }
 
         #region Private
         internal DbgIDRSDSTraceData(Action<DbgIDRSDSTraceData> action, int eventID, int task, string taskName, Guid taskGuid, int opCode, string opCodeName, Guid providerGuid, string providerName) :
@@ -211,7 +317,7 @@ namespace Diagnostics.Eventing
         }
         protected internal override void Validate()
         {
-            Debug.Assert(EventDataLength == SkipAsciiString(HostOffset(32, 1)));
+            Debug.Assert(EventDataLength == SkipUTF8String(HostOffset(32, 1)));
         }
 
         public override string[] PayloadNames

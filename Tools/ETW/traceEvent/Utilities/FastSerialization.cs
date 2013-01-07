@@ -10,7 +10,7 @@ using System.IO;
 using System.Diagnostics;
 using System.Collections.Generic;
 using DeferedStreamLabel = FastSerialization.StreamLabel;
-using Diagnostics.Eventing;
+using Utilities;
 
 // see code:#Introduction and code:#SerializerIntroduction
 namespace FastSerialization
@@ -184,7 +184,7 @@ namespace FastSerialization
         Int16,
         Int32,
         Int64,
-        Label,
+        SkipRegion,
         String,
         Limit,              // Just past the last valid tag, used for asserts.  
     }
@@ -192,8 +192,19 @@ namespace FastSerialization
 
     internal class SerializationType : IFastSerializable
     {
+        /// <summary>
+        /// This is the version represents the version of both the reading
+        /// code and the version for the format for this type in serialized form.  
+        /// See code:IFastSerializableVersion for more.  
+        /// </summary>
         public int Version { get { return version; } }
-        public int MinimumVersion { get { return minimumVersion; } }
+        /// <summary>
+        /// The version the the smallest (oldest) reader code that can read 
+        /// this file format.  Readers strictly less than this are rejected.  
+        /// This allows support for forward compatbility.   
+        /// See code:IFastSerializableVersion for more.  
+        /// </summary>
+        public int MinimumReaderVersion { get { return minimumReaderVersion; } }
         public string FullName { get { return fullName; } }
         public IFastSerializable CreateInstance()
         {
@@ -218,28 +229,39 @@ namespace FastSerialization
         void IFastSerializable.ToStream(Serializer serializer)
         {
             serializer.Write(version);
-            serializer.Write(minimumVersion);
+            serializer.Write(minimumReaderVersion);
             serializer.Write(fullName);
         }
         void IFastSerializable.FromStream(Deserializer deserializer)
         {
             deserializer.Read(out version);
-            deserializer.Read(out minimumVersion);
+            deserializer.Read(out minimumReaderVersion);
             deserializer.Read(out fullName);
             factory = deserializer.GetFactory(fullName);
-            if (minimumVersion > 0)
+            // This is only here for efficiency (you don't have to cast every instance)
+            // since most objects won't be versioned.  However it means that you have to
+            // opt into versioning or you will break on old formats.  
+            if (minimumReaderVersion > 0)
             {
                 IFastSerializableVersion instance = factory() as IFastSerializableVersion;
 
-                // TODO better message
-                if (instance == null || instance.Version < minimumVersion)
-                    throw new SerializationException("Minimum version requirment not satsified");
-            }
+                // File version must meet minimum version requirements. 
+                if (instance != null && !(version >= instance.MinimumVersionCanRead))
+                    throw new SerializationException(string.Format("File format is version {0} App accepts formats >= {1}.",
+                            version, instance.MinimumVersionCanRead));
 
+                int readerVersion = 0;
+                if (instance != null)
+                    readerVersion = instance.Version;
+
+                if (!(readerVersion >= minimumReaderVersion))
+                    throw new SerializationException(string.Format("App is version {0}.  File format accepts apps >= {1}.",
+                             readerVersion, minimumReaderVersion));
+            }
         }
 
         internal int version;
-        internal int minimumVersion;
+        internal int minimumReaderVersion;
         internal string fullName;
         internal Func<IFastSerializable> factory;
         #endregion
@@ -420,7 +442,7 @@ namespace FastSerialization
 
                 Log("<Serializer>");
                 // Write the header. 
-                Write("!FastSerialization");
+                Write("!FastSerialization.1");
 
                 // Write the main object.  This is recurisive and does most of the work. 
                 Write(entryObject);
@@ -507,6 +529,16 @@ namespace FastSerialization
                 Log("<Write Type=\"string\" Value=" + XmlUtilities.XmlQuote(value) + " StreamLabel=\"0x" + writer.GetLabel().ToString("x") + "\"/>");
 #endif
             writer.Write(value);
+        }
+        public unsafe void Write(float value)
+        {
+            int* intPtr = (int*)&value;
+            writer.Write(*intPtr);
+        }
+        public unsafe void Write(double value)
+        {
+            long* longPtr = (long*)&value;
+            writer.Write(*longPtr);
         }
 
         /// <summary>
@@ -599,16 +631,7 @@ namespace FastSerialization
         {
             forwardReferenceDefinitions[(int)forwardReference] = writer.GetLabel();
         }
-#if false 
-        public void WriteCollection<T>(int count, IEnumerable<T> elems, Action<T> elemSerialize)
-        {
-            Log("<WriteColection count=\"" + count + "\">\r\n");
-            Write(count);
-            foreach (T elem in elems)
-                elemSerialize(elem);
-            Log("</WriteColection>\r\n");
-        }
-#endif
+
         public void WriteCollection<T>(ICollection<T> elems, string name) where T : IFastSerializable
         {
             Log("<WriteColection name=\"" + name + "\" count=\"" + elems.Count + "\">\r\n");
@@ -624,6 +647,14 @@ namespace FastSerialization
         public void WriteTagged(int value) { WriteTag(Tags.Int32); Write(value); }
         public void WriteTagged(long value) { WriteTag(Tags.Int64); Write(value); }
         public void WriteTagged(string value) { WriteTag(Tags.String); Write(value); }
+        public void WriteTagged(IFastSerializable value)
+        {
+            WriteTag(Tags.SkipRegion);
+            ForwardReference endRegion = GetForwardReference();
+            Write(endRegion);        // Allow the reader to skip this. 
+            Write(value);            // Write the data we can skip
+            DefineForwardReference(endRegion);  // This is where the forward reference refers tol  
+        }
 
         /// <summary>
         /// Retrieve the underlying stream we are writing to.  Generally the Write* methods are enough. 
@@ -769,7 +800,7 @@ namespace FastSerialization
             IFastSerializableVersion versionInstance = instance as IFastSerializableVersion;
             if (versionInstance != null)
             {
-                ret.minimumVersion = versionInstance.MinimumVersion;
+                ret.minimumReaderVersion = versionInstance.MinimumReaderVersion;
                 ret.version = versionInstance.Version;
             }
             return ret;
@@ -808,7 +839,7 @@ namespace FastSerialization
             Log("<Deserialize>");
             // We don't do this with ReadString() because it is a likely point of failure (a completely wrong file)
             // and we want to not read garbage if we don't have to
-            var expectedSig = "!FastSerialization";
+            var expectedSig = "!FastSerialization.1";
             int sigLen = reader.ReadInt32();
             if (sigLen != expectedSig.Length)
                 goto ThrowException;
@@ -817,12 +848,14 @@ namespace FastSerialization
                     goto ThrowException;
             return;
         ThrowException:
-            throw new SerializationException("Not an ETLX file: " + streamName);
+            throw new SerializationException("Not a understood file format: " + streamName);
         }
         /// <summary>
+        /// On by default.  If off, then you read the whole file from begining to the end and never have to
+        /// seek.  This should only be used when you have this requirement (you are reading from an unseekable
+        /// stream 
         /// 
-        /// 
-        /// On by default.  
+        /// TODO remove? we have not tested as tall with AllowLazyDeserialzation==false. 
         /// </summary>
         public bool AllowLazyDeserialization
         {
@@ -832,6 +865,27 @@ namespace FastSerialization
         public void GetEntryObject<T>(out T ret)
         {
             ret = (T)GetEntryObject();
+        }
+
+        /// <summary>
+        /// Returns the full name of the type of the entry object without actually creating it.
+        /// Will return null on failure.  
+        /// </summary>  
+        public string GetEntryTypeName()
+        {
+            StreamLabel origPosition = reader.Current;
+            SerializationType objType = null;
+            try
+            {
+                Tags tag = ReadTag();
+                if (tag == Tags.BeginObject)
+                    objType = (SerializationType)ReadObject();
+            }
+            catch (Exception) { }
+            reader.Goto(origPosition);
+            if (objType == null)
+                return null;
+            return objType.FullName;
         }
         public IFastSerializable GetEntryObject()
         {
@@ -925,6 +979,14 @@ namespace FastSerialization
             Log("<ReadGuid Value=\"" + ret.ToString() + "\" StreamLabel=\"0x" + label.ToString("x") + "\"/>");
 #endif
         }
+        public void Read(out float ret)
+        {
+            ret = ReadFloat();
+        }
+        public void Read(out double ret)
+        {
+            ret = ReadDouble();
+        }
         public void Read(out string ret)
         {
 #if DEBUG
@@ -1016,6 +1078,10 @@ namespace FastSerialization
             Log("</ReadObjectReference>");
             return ret;
         }
+        public bool ReadBool()
+        {
+            return ReadByte() != 0;
+        }
         public byte ReadByte()
         {
 #if DEBUG
@@ -1060,6 +1126,21 @@ namespace FastSerialization
 #endif
             return ret;
         }
+
+        public unsafe float ReadFloat()
+        {
+            float ret;
+            int* intPtr = (int*)&ret;
+            *intPtr = reader.ReadInt32();
+            return ret;
+        }
+        public unsafe double ReadDouble()
+        {
+            double ret;
+            long* longPtr = (long*)&ret;
+            *longPtr = reader.ReadInt64();
+            return ret;
+        }
         public string ReadString()
         {
 #if DEBUG
@@ -1085,16 +1166,13 @@ namespace FastSerialization
             else
                 value = null;
         }
-#if false 
-        public void ReadCollection(Action elemDeserialize)
-        {
-            Log("<ReadColection>\r\n");
-            int count; Read(out count);
-            for (int i = 0; i < count; i++)
-                elemDeserialize();
-            Log("</ReadColection>\r\n");
-        }
-#endif
+
+        /// <summary>
+        /// Meant to be called from FromStream.  It returns the version number of the 
+        /// type being deserialized.   It can be used so that new code can recognises that it
+        /// is reading an old file format and adjust what it reads.   
+        /// </summary>
+        public int VersionBeingRead { get { return typeBeingRead.Version; } }
 
         public StreamLabel ReadLabel()
         {
@@ -1180,11 +1258,99 @@ namespace FastSerialization
             this.defaultFactory = defaultFactory;
         }
         // For FromStream methodIndex bodies, reading tagged values (for post V1 field additions)
-        public void ReadTagged(out byte ret) { Tags tag = ReadTag(); Debug.Assert(tag == Tags.Byte); Read(out ret); }
-        public void ReadTagged(out short ret) { Tags tag = ReadTag(); Debug.Assert(tag == Tags.Int16); Read(out ret); }
-        public void ReadTagged(out int ret) { Tags tag = ReadTag(); Debug.Assert(tag == Tags.Int32); Read(out ret); }
-        public void ReadTagged(out long ret) { Tags tag = ReadTag(); Debug.Assert(tag == Tags.Int64); Read(out ret); }
-        public void ReadTagged(out string ret) { Tags tag = ReadTag(); Debug.Assert(tag == Tags.String); Read(out ret); }
+        // If the item is present, it is read into 'ret' otherwise 'ret' is left unchanged.   
+        // If after V1 you always add fields at the end, and you always use WriteTagged() and TryReadTagged()
+        // to write and read them, then you always get perfect backward and forward compatibility! 
+        // For things like collections you can do
+        //
+        // in collectionLen = 0;
+        // TryReadTagged(ref collectionLen)
+        // this.array = new int[collectionLen]; // inititalize the array
+        // for(int i =0; i < collectionLenght; i++)
+        //      Read(out this.array[i]);
+        //
+        // notice that the reading the array elements is does not use TryReadTagged, but IS 
+        // conditional on the collection length (which is tagged).   
+        public bool TryReadTagged(ref byte ret)
+        {
+            Tags tag = ReadTag();
+            if (tag == Tags.Byte)
+            {
+                Read(out ret);
+                return true;
+            }
+            reader.Goto(Current - 1);
+            return false;
+        }
+        public bool TryReadTagged(ref short ret)
+        {
+            Tags tag = ReadTag();
+            if (tag == Tags.Int16)
+            {
+                Read(out ret);
+                return true;
+            }
+            reader.Goto(Current - 1);
+            return false;
+        }
+        public bool TryReadTagged(ref int ret)
+        {
+            Tags tag = ReadTag();
+            if (tag == Tags.Int32)
+            {
+                Read(out ret);
+                return true;
+            }
+            reader.Goto(Current - 1);
+            return false;
+        }
+        public bool TryReadTagged(ref long ret)
+        {
+            Tags tag = ReadTag();
+            if (tag == Tags.Int64)
+            {
+                Read(out ret);
+                return true;
+            }
+            reader.Goto(Current - 1);
+            return false;
+        }
+        public bool TryReadTagged(ref string ret)
+        {
+            Tags tag = ReadTag();
+            if (tag == Tags.String)
+            {
+                Read(out ret);
+                return true;
+            }
+            reader.Goto(Current - 1);
+            return false;
+        }
+        public bool TryReadTagged<T>(ref T ret) where T : IFastSerializable
+        {
+            // Tagged objects always start with a SkipRegion so we don't need to know its size.  
+            Tags tag = ReadTag();
+            if (tag == Tags.SkipRegion)
+            {
+                ReadForwardReference();     // Skip the forward reference which is part of SkipRegion 
+                ret = (T)ReadObject();      // Read the real object 
+                return true; 
+            }
+            reader.Goto(Current - 1);
+            return false;
+        }
+        public IFastSerializable TryReadTaggedObject()
+        {
+            // Tagged objects always start with a SkipRegion so we don't need to know its size.  
+            Tags tag = ReadTag();
+            if (tag == Tags.SkipRegion)
+            {
+                ReadForwardReference();     // Skip the forward reference which is part of SkipRegion 
+                return ReadObject();        // Read the real object 
+            }
+            reader.Goto(Current - 1);
+            return null;
+        }
 
         public void Goto(StreamLabel label)
         {
@@ -1196,38 +1362,6 @@ namespace FastSerialization
             Goto(ResolveForwardReference(reference, false));
         }
         public StreamLabel Current { get { return reader.Current; } }
-#if false 
-
-        // TODO decide if Skiping is useful or not.  
-        public void SkipObjectReference()
-        {
-            Log("<SkipObjectReference StreamLabel=\"0x" + reader.Current.ToString("x") + "\">");
-            Tags tag = ReadTag();
-            if (tag == Tags.ObjectReference)
-                ReadLabel();
-            else if (tag == Tags.NullReference)
-            { }
-            else if (tag == Tags.ForwardReference)
-            {
-                ReadInt32();            // The forward reference
-                SkipObjectReference();  // The type of the forward reference. 
-            }
-            else
-            {
-                if (tag == Tags.ForwardDefinition)
-                {
-                    reader.ReadInt32();
-                    tag = ReadTag();
-                    Debug.Assert(tag == Tags.BeginObject);
-                }
-                Debug.Assert(tag == Tags.BeginObject || tag == Tags.BeginPrivateObject);
-                SerializationType type = (SerializationType)ReadObjectReference();
-                IFastSerializable obj = type.CreateInstance();
-                obj.FromStream(this);           // The body
-                FindEndTag(type);
-            }
-        }
-#endif
         public IStreamReader Reader { get { return reader; } }
         public void Dispose()
         {
@@ -1328,7 +1462,10 @@ namespace FastSerialization
             }
 
             // Actually initialize the object's fields.
+            var saveTypeBeingRead = typeBeingRead;
+            typeBeingRead = type;
             ret.FromStream(this);
+            typeBeingRead = saveTypeBeingRead;
             FindEndTag(type, ret);
 
             // TODO in the case where the object already exist, we just created an object just to throw it
@@ -1385,8 +1522,13 @@ namespace FastSerialization
                         ReadForwardReference();
                         break;
                     case Tags.ObjectReference:
-                    case Tags.Label:
                         reader.ReadLabel();
+                        break;
+                    case Tags.SkipRegion:
+                        // Allow the region to be skipped.  
+                        ForwardReference endSkipRef = ReadForwardReference();
+                        StreamLabel endSkip = ResolveForwardReference(endSkipRef);
+                        reader.Goto(endSkip);
                         break;
                     case Tags.EndObject:
                         --nesting;
@@ -1435,6 +1577,7 @@ namespace FastSerialization
             return tag;
         }
 
+        private SerializationType typeBeingRead;
         internal IStreamReader reader;
         internal IFastSerializable entryObject;
         internal IDictionary<StreamLabel, IFastSerializable> ObjectsInGraph;
@@ -1633,15 +1776,79 @@ namespace FastSerialization
         /// <summary>
         /// This is the version number for the serialization format.  It should be incremented whenever a
         /// changes is made to code:IFastSerializable.ToStream and the format is publicly diseminated.  It
-        /// must not vary from instance to instance 
+        /// must not vary from instance to instance.  This is pretty straightforward.  
         /// </summary>
         int Version { get; }
+
         /// <summary>
-        /// This is the minimum version that can read the current version's format (reader version strictly
-        /// less than the MinimumVersion of the writer will not be permitted to read he data). Ideally, this
-        /// number is always 0 (all readers can read any version) it must not vary from instance to instance
+        /// At some point typically you give up allowing new versions of the read to read old wire formats
+        /// This is the Minimum version of the serialized data that this reader can deserialize.   Trying
+        /// to read wire formats strictly smaller (older) than this will fail.   Setting this to the current
+        /// version indicates that you don't care about ever reading data generated with an older version
+        /// of the code.  
+        /// 
+        /// If you set this to something other than your current version, you are obligated to insure that
+        /// your FromStream() method can handle all formats >= than this number. 
+        ///
+        /// You can achive this if you simply use the 'WriteTagged' and 'ReadTagged' APIs in your 'ToStream' 
+        /// and 'FromStream' after your V1 AND you always add new fields to the end of your class.   
+        /// This is the best practice.   Thus  
+        /// 
+        ///     void IFastSerializable.ToStream(Serializer serializer)
+        ///     {
+        ///         serializer.Write(Ver_1_Field1);
+        ///         serializer.Write(Ver_1_Field2);
+        ///         // ...
+        ///         serializer.WriteTagged(Ver_2_Field1);   
+        ///         serializer.WriteTagged(Ver_2_Field2);
+        ///         // ...
+        ///         serializer.WriteTagged(Ver_3_Field1);
+        ///     }
+        /// 
+        ///     void IFastSerializable.FromStream(Deserializer deserializer)
+        ///     {
+        ///         deserializer.Read(out Ver_1_Field1);
+        ///         deserializer.Read(out Ver_1_Field2);
+        ///         // ...
+        ///         deserializer.ReadTagged(ref Ver_2_Field1);  // If data no present (old format) then Ver_2_Field1 not set.
+        ///         deserializer.ReadTagged(ref Ver_2_Field2);  // ditto...
+        ///         // ...
+        ///         deserializer.ReadTagged(ref Ver_3_Field1);    
+        ///     } 
+        /// 
+        /// Tagging outputs a byte tag in addition to the field itself.   If that is a problem you can also use the
+        /// VersionBeingRead to find out what format is being read and write code that explicitly handles it.  
+        /// Note however that this only gets you Backward compatibility (new readers can read the old format, but old readers 
+        /// will still not be able to read the new format), which is why this is not the preferred method.  
+        /// 
+        ///     void IFastSerializable.FromStream(Deserializer deserializer)
+        ///     {
+        ///         // We assme that MinVersionCanRead == 4
+        ///         // Deserialize things that are common to all versions (4 and earlier) 
+        ///         
+        ///         if (deserializer.VersionBeingRead >= 5)
+        ///         {
+        ///             deserializer.Read(AVersion5Field);
+        ///             if (deserializer.VersionBeingRead >= 5)
+        ///                 deserializer.ReadTagged(AVersion6Field);    
+        ///         }
+        ///     }
         /// </summary>
-        int MinimumVersion { get; }
+        int MinimumVersionCanRead { get; }
+        /// <summary>
+        /// This is the minimum version of a READER that can read this format.   If you don't support forward
+        /// compatibilty (old readers reading data generated by new readers) then this should be set to 
+        /// the current version.  
+        /// 
+        /// If you set this to something besides the current version you are obligated to insure that your
+        /// ToStream() method ONLY adds fields at the end, AND that all of those added fields use the WriteTagged()
+        /// operations (which tags the data in a way that old readers can skip even if they don't know what it is)
+        /// In addition your FromStream() method must read these with the ReadTagged() deserializer APIs.  
+        /// 
+        /// See the comment in front of MinimumVersionCanRead for an example of using the WriteTagged() and ReadTagged() 
+        /// methods. 
+        /// </summary>
+        int MinimumReaderVersion { get; }
     }
 
     public class SerializationException : Exception
@@ -1651,111 +1858,5 @@ namespace FastSerialization
         {
         }
     }
-#if false
-    public class SerializationTests
-    {
-        public class MyClass1 : IFastSerializable, IFastSerializableVersion
-        {
-            DeferedRegion lazy;
-            private int value;
-            private string str;
-            private MyClass1 left;
-            private MyClass1 right;
-            private MyClass1 other;
-
-            public int Value { get { lazy.FinishRead(); return value; } }
-            public string Str { get { lazy.FinishRead(); return str; } }
-            public MyClass1 Left { get { lazy.FinishRead(); return left; } }
-            public MyClass1 Right { get { lazy.FinishRead(); return right; } }
-            internal MyClass1 Other
-            {
-                get { lazy.FinishRead(); return other; }
-                set { lazy.FinishRead(); other = Other; }
-            }
-
-            public MyClass1() { }       // Needed for the IFastSerializable contract.  
-            public MyClass1(int value, string str, MyClass1 left, MyClass1 right, MyClass1 other)
-            {
-                this.value = value;
-                this.str = str;
-                this.left = left;
-                this.right = right;
-                this.other = other;
-            }
-            public override string ToString()
-            {
-                lazy.FinishRead();
-                return value.ToString() + " : " + str;
-            }
-
-            int IFastSerializableVersion.Version
-            {
-                get { return 1; }
-            }
-            int IFastSerializableVersion.MinimumVersion
-            {
-                get { return 0; }
-            }
-            void IFastSerializable.ToStream(Serializer serializer)
-            {
-                serializer.Write(str);
-                serializer.Write(value);
-                lazy.Write(serializer, delegate
-                {
-                    serializer.Write(left);
-                    serializer.Write(right);
-                    serializer.Write(other);
-                });
-
-                // Add a few more fields, simulating V2
-                serializer.WriteTagged(7);
-                serializer.WriteTagged("Testing");
-                serializer.WriteDefered(this);
-                serializer.WriteDefered(left);
-            }
-            void IFastSerializable.FromStream(Deserializer deserializer)
-            {
-                deserializer.Read(out str);
-                deserializer.Read(out value);
-                lazy.Read(deserializer, delegate
-                {
-                    deserializer.Read(out left);
-                    deserializer.Read(out right);
-                    deserializer.Read(out other);
-                });
-            }
-        }
-
-        public static void Tests(string fileName)
-        {
-            Console.WriteLine("Writing serialized data to " + fileName);
-            MyClass1 obj = MakeTree();
-            Serializer serializer = new Serializer(fileName, obj);
-            serializer.Close();
-
-            Deserializer deserializer = new Deserializer(fileName);
-            //deserializer.AllowLazyDeserialization = false;
-            MyClass1 objRoundTrip;
-   Assert(obj1.Str == obj2.Str);
-            Comparer(obj1.Left, obj2.Left, depth - 1);
-            Comparer(obj1.Right, obj2.Right, depth - 1);
-            Comparer(obj1.Other, obj2.Other, depth - 1);
-        }
-
-        private static MyClass1 MakeTree()
-        {
-            MyClass1 bottomleft = new MyClass1(1, "Bottom left", null, null, null);
-            MyClass1 bottomMiddle = new MyClass1(2, "Bottom Middle", null, null, bottomleft);
-            MyClass1 bottomright = new MyClass1(3, "Bottom Right", null, null, bottomleft);
-
-            MyClass1 Mid1 = new MyClass1(4, "Mid1", bottomleft, bottomMiddle, null);
-            MyClass1 Mid2 = new MyClass1(5, "Mid2", Mid1, bottomright, null);
-
-            MyClass1 ret = new MyClass1(6, "Ret", Mid1, bottomright, null);
-            bottomleft.Other = ret;
-            return ret;
-        }
-    }
-#endif
 
 }
