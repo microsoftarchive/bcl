@@ -2092,7 +2092,6 @@ namespace Diagnostics.Tracing
                 deserializer.Read(out guid);
                 relatedActivityIDs.Add(guid);
             }
-
             deserializer.Read(out truncated);
         }
         int IFastSerializableVersion.Version
@@ -2101,7 +2100,7 @@ namespace Diagnostics.Tracing
         }
         int IFastSerializableVersion.MinimumVersionCanRead
         {
-            // We don't support backward compatibility for now.  
+            // We don't support backward compatibility for now.   
             get { return ((IFastSerializableVersion)this).Version; }
         }
         int IFastSerializableVersion.MinimumReaderVersion
