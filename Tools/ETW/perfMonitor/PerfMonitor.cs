@@ -20,6 +20,7 @@ using Utilities;
 using Diagnostics.Tracing.StackSources;
 using PerfView;
 using Diagnostics.Tracing.Parsers;
+using System.IO.Compression;
 
 // See code:PerfMonitor.PerfMonitor to get started. 
 namespace PerfMonitor
@@ -175,7 +176,6 @@ namespace PerfMonitor
         public void RunAnalyze(CommandLineArgs parsedArgs)
         {
             Run(parsedArgs);
-            parsedArgs.DataFile = Path.ChangeExtension(parsedArgs.DataFile, ".etlx");
             Analyze(parsedArgs);
         }
         public void RunDump(CommandLineArgs parsedArgs)
@@ -224,6 +224,7 @@ namespace PerfMonitor
         {
             if (parsedArgs.DataFile == null)
                 parsedArgs.DataFile = "PerfMonitorOutput.etl";
+            ReportGenerator.UnZipIfNecessary(ref parsedArgs.DataFile, Console.Out);
 
             Console.WriteLine("Processes that started within the trace:");
             TraceEventDispatcher dispatcher = ReportGenerator.GetSource(ref parsedArgs.DataFile);
@@ -297,6 +298,7 @@ namespace PerfMonitor
         {
             if (parsedArgs.DataFile == null && File.Exists("PerfMonitorOutput.etl"))
                 parsedArgs.DataFile = "PerfMonitorOutput.etl";
+            ReportGenerator.UnZipIfNecessary(ref parsedArgs.DataFile, Console.Out);
 
             using (TraceEventDispatcher source = ReportGenerator.GetSource(ref parsedArgs.DataFile))
             {
@@ -467,6 +469,7 @@ namespace PerfMonitor
         {
             if (parsedArgs.DataFile == null)
                 parsedArgs.DataFile = "PerfMonitorOutput.etl";
+            ReportGenerator.UnZipIfNecessary(ref parsedArgs.DataFile, Console.Out);
 
             LogFile.WriteLine("Converting data files to ETLX format.\n");
             Stopwatch sw = Stopwatch.StartNew();
@@ -479,6 +482,7 @@ namespace PerfMonitor
         {
             if (parsedArgs.DataFile == null && File.Exists("PerfMonitorOutput.etl"))
                 parsedArgs.DataFile = "PerfMonitorOutput.etl";
+            ReportGenerator.UnZipIfNecessary(ref parsedArgs.DataFile, Console.Out);
 
             TextWriter writer = Console.Out;
             if (parsedArgs.OutputFile != null)
@@ -855,6 +859,7 @@ namespace PerfMonitor
 
             ETWTraceEventSource source = new ETWTraceEventSource(KernelTraceEventParser.KernelSessionName, TraceEventSourceType.Session);
 
+            bool captureStateTriggered = false;
             Action<ProcessTraceData> onPStart = delegate(ProcessTraceData data)
             {
                 Console.WriteLine("********** IN PSTART ****************");
@@ -890,7 +895,7 @@ namespace PerfMonitor
                     Console.WriteLine("{0}{1}: }} At({2}) Exit(0x{3:x}) Duration({4}) ",
                         Indent(liveProcesses, data.ProcessID), data.ProcessID, relativeTime, data.ExitStatus, processDuration);
                 }
-            };  
+            };
 
             source.UnhandledEvent += delegate(TraceEvent data)
             {
@@ -1285,6 +1290,7 @@ namespace PerfMonitor
         {
             if (parsedArgs.DataFile == null)
                 parsedArgs.DataFile = "PerfMonitorOutput.etl";
+            UnZipIfNecessary(ref parsedArgs.DataFile, Console.Out);
 
             var htmlFile = Path.ChangeExtension(parsedArgs.DataFile, "analyze.html");
             var usersGuideFile = UsersGuide.WriteUsersGuide(htmlFile);
@@ -1516,6 +1522,8 @@ namespace PerfMonitor
 
             if (parsedArgs.DataFile == null)
                 parsedArgs.DataFile = "PerfMonitorOutput.etl";
+            UnZipIfNecessary(ref parsedArgs.DataFile, Console.Out);
+
             var xmlFile = Path.ChangeExtension(parsedArgs.DataFile, "GCTime.xml");
 
             using (TraceEventDispatcher dispatcher = GetSource(ref parsedArgs.DataFile))
@@ -1557,6 +1565,8 @@ namespace PerfMonitor
 
             if (parsedArgs.DataFile == null)
                 parsedArgs.DataFile = "PerfMonitorOutput.etl";
+            UnZipIfNecessary(ref parsedArgs.DataFile, Console.Out);
+
             var xmlFile = Path.ChangeExtension(parsedArgs.DataFile, "jitTime.xml");
 
             using (TraceEventDispatcher dispatcher = GetSource(ref parsedArgs.DataFile))
@@ -1596,6 +1606,8 @@ namespace PerfMonitor
 
             if (parsedArgs.DataFile == null)
                 parsedArgs.DataFile = "PerfMonitorOutput.etl";
+            UnZipIfNecessary(ref parsedArgs.DataFile, Console.Out);
+
             var xmlFile = Path.ChangeExtension(parsedArgs.DataFile, "DllLoad.xml");
 
             using (TraceLog log = TraceLog.OpenOrConvert(parsedArgs.DataFile, GetConvertOptions(parsedArgs)))
@@ -1614,6 +1626,8 @@ namespace PerfMonitor
         {
             if (parsedArgs.DataFile == null)
                 parsedArgs.DataFile = "PerfMonitorOutput.etl";
+            UnZipIfNecessary(ref parsedArgs.DataFile, Console.Out);
+
             var xmlFile = Path.ChangeExtension(parsedArgs.DataFile, "cpuTime.xml");
 
             using (TraceLog log = TraceLog.OpenOrConvert(parsedArgs.DataFile, GetConvertOptions(parsedArgs)))
@@ -1640,6 +1654,29 @@ namespace PerfMonitor
                         rundownStart = GetRundownStart(events);
                         parsedArgs.EndTimeRelMsec = rundownStart;
                     }
+                }
+
+                // Look up symbols for all NGEN images 
+                SymbolReader reader = new SymbolReader(Console.Out);
+                foreach (TraceModuleFile moduleFile in log.ModuleFiles)
+                {
+                    bool lookupSyms = false;
+
+                    if (moduleFile.Name.EndsWith("ni", StringComparison.OrdinalIgnoreCase))
+                        lookupSyms = true;
+                    if (parsedArgs.SymbolsForDlls != null)
+                    {
+                        for (int i = 0; i < parsedArgs.SymbolsForDlls.Length; i++)
+                        {
+                            if (string.Compare(parsedArgs.SymbolsForDlls[i], moduleFile.Name, StringComparison.OrdinalIgnoreCase) == 0)
+                            {
+                                lookupSyms = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (lookupSyms)
+                        log.CodeAddresses.LookupSymbolsForModule(reader, moduleFile);
                 }
 
                 CallTree tree = new CallTree(ScalingPolicyKind.TimeMetric);
@@ -1696,7 +1733,11 @@ namespace PerfMonitor
                 filePath = "PerfMonitorOutput.etlx";
                 if (!File.Exists(filePath))
                     filePath = "PerfMonitorOutput.etl";
+                if (!File.Exists(filePath))
+                    filePath = "PerfMonitorOutput.etl.zip";
             }
+
+            UnZipIfNecessary(ref filePath, Console.Out);
 
             bool isETLXFile = string.Compare(Path.GetExtension(filePath), ".etlx", StringComparison.OrdinalIgnoreCase) == 0;
             if (!File.Exists(filePath) && isETLXFile)
@@ -1718,6 +1759,117 @@ namespace PerfMonitor
             if (ret.EventsLost != 0)
                 Console.WriteLine("WARNING: events were lost during data collection! Any anaysis is suspect!");
             return ret;
+        }
+
+        public static void UnZipIfNecessary(ref string inputFileName, TextWriter log)
+        {
+            if (string.Compare(Path.GetExtension(inputFileName), ".zip", StringComparison.OrdinalIgnoreCase) == 0)
+            {
+                string unzipedEtlFile;
+                if (!inputFileName.EndsWith(".etl.zip", StringComparison.OrdinalIgnoreCase))
+                    throw new ApplicationException("File does not end with the .etl.zip file extension");
+                unzipedEtlFile = inputFileName.Substring(0, inputFileName.Length - 4);
+
+                log.WriteLine("[Decompressing {0}]", inputFileName);
+                log.WriteLine("Generating output file {0}", unzipedEtlFile);
+                var zipArchive = new ZipArchive(inputFileName);
+
+                ZipArchiveEntry zippedEtlFile = null;
+                string dirForPdbs = null;
+                foreach (var entry in zipArchive.Entries)
+                {
+                    if (entry.Length == 0)  // Skip directories. 
+                        continue;
+
+                    var fullName = entry.FullName;
+                    if (fullName.EndsWith(".pdb", StringComparison.OrdinalIgnoreCase))
+                    {
+                        fullName = fullName.Replace('/', '\\');     // normalize separator convention 
+                        string pdbRelativePath = null;
+                        if (fullName.StartsWith(@"symbols\", StringComparison.OrdinalIgnoreCase))
+                            pdbRelativePath = fullName.Substring(8);
+                        else if (fullName.StartsWith(@"ngenpdbs\", StringComparison.OrdinalIgnoreCase))
+                            pdbRelativePath = fullName.Substring(9);
+                        else
+                        {
+                            var m = Regex.Match(fullName, @"^[^\\]+\.ngenpdbs?\\(.*)", RegexOptions.IgnoreCase);
+                            if (m.Success)
+                                pdbRelativePath = m.Groups[1].Value;
+                            else
+                            {
+                                log.WriteLine("WARNING: found PDB file that was not in a symbol server style directory, skipping extraction");
+                                log.WriteLine("         Unzip this ETL and PDB by hand to use this PDB.");
+                                continue;
+                            }
+                        }
+
+                        if (dirForPdbs == null)
+                        {
+                            var inputDir = Path.GetDirectoryName(inputFileName);
+                            if (inputDir.Length == 0)
+                                inputDir = ".";
+                            var symbolsDir = Path.Combine(inputDir, "symbols");
+                            if (Directory.Exists(symbolsDir))
+                                dirForPdbs = symbolsDir;
+                            else
+                                dirForPdbs = new SymPath(SymPath._NT_SYMBOL_PATH).DefaultSymbolCache;
+                            log.WriteLine("Putting symbols in {0}", dirForPdbs);
+                        }
+
+                        var pdbTargetPath = Path.Combine(dirForPdbs, pdbRelativePath);
+                        var pdbTargetName = Path.GetFileName(pdbTargetPath);
+                        if (!File.Exists(pdbTargetPath) || (new System.IO.FileInfo(pdbTargetPath).Length != entry.Length))
+                        {
+                            var firstNameInRelativePath = pdbRelativePath;
+                            var sepIdx = firstNameInRelativePath.IndexOf('\\');
+                            if (sepIdx >= 0)
+                                firstNameInRelativePath = firstNameInRelativePath.Substring(0, sepIdx);
+                            var firstNamePath = Path.Combine(dirForPdbs, firstNameInRelativePath);
+                            if (File.Exists(firstNamePath))
+                            {
+                                log.WriteLine("Deleting pdb file that is in the way {0}", firstNamePath);
+                                FileUtilities.ForceDelete(firstNamePath);
+                            }
+                            log.WriteLine("Extracting PDB {0}", pdbRelativePath);
+                            AtomicExtract(entry, pdbTargetPath);
+                        }
+                        else
+                            log.WriteLine("PDB {0} exists, skipping", pdbRelativePath);
+                    }
+                    else if (fullName.EndsWith(".etl", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (zippedEtlFile != null)
+                            throw new ApplicationException("The ZIP file does not have exactly 1 ETL file in it, can't auto-extract.");
+                        zippedEtlFile = entry;
+                    }
+                }
+                if (zippedEtlFile == null)
+                    throw new ApplicationException("The ZIP file does not have any ETL files in it!");
+
+                AtomicExtract(zippedEtlFile, unzipedEtlFile);
+                log.WriteLine("Zipped size = {0:f3} MB Unzipped = {1:f3} MB",
+                    zippedEtlFile.CompressedLength / 1000000.0, zippedEtlFile.Length / 1000000.0);
+
+                File.SetLastWriteTime(unzipedEtlFile, DateTime.Now);       // Touch the file
+                inputFileName = unzipedEtlFile;
+                log.WriteLine("Finished decompression");
+            }
+        }
+        // Extract to a temp file and move so we get atomic update.  May leave trash behind
+        private static void AtomicExtract(ZipArchiveEntry zipEntry, string targetPath)
+        {
+            // Insure directory exists. 
+            Directory.CreateDirectory(Path.GetDirectoryName(targetPath));
+            var extractPath = targetPath + ".new";
+            try
+            {
+                zipEntry.ExtractToFile(extractPath, true);
+                FileUtilities.ForceMove(extractPath, targetPath);
+            }
+            finally
+            {
+                FileUtilities.ForceDelete(extractPath);
+            }
         }
 
         #region private

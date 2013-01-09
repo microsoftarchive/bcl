@@ -4,6 +4,9 @@ using System.Linq;
 using System.Text;
 using System.IO;
 using System.Diagnostics;
+using PerfView;
+using System.Reflection;
+using Utilities;
 
 namespace Utilities
 {
@@ -25,11 +28,66 @@ namespace Utilities
     ///   <LogicalName>.\TraceEvent.dll</LogicalName>
     ///   <Link>SupportDlls\TraceEvent.dll</Link>
     ///  </EmbeddedResource>
-    /// <ItemGroup>
+    /// </ItemGroup>
     /// 
     /// </summary>
     static class SupportFiles
     {
+        /// <summary>
+        /// Unpacks any resource that begings with a .\ (so it looks like a relative path name)
+        /// Such resources are unpacked into their relative position in SupportFileDir. 
+        /// 'force' will force an update even if the files were unpacked already (usually not needed)
+        /// The function returns true if files were unpacked.  
+        /// </summary>
+        public static bool UnpackResourcesIfNeeded(bool force = false)
+        {
+            var unpacked = false;
+            if (Directory.Exists(SupportFileDir))
+            {
+                if (force)
+                {
+                    Directory.Delete(SupportFileDir);
+                    UnpackResources();
+                    unpacked = true;
+                }
+            }
+            else
+            {
+                UnpackResources();
+                unpacked = true;
+            }
+
+            // Register a Assembly resolve event handler so that we find our support dlls in the support dir.
+            AppDomain.CurrentDomain.AssemblyResolve += delegate(object sender, ResolveEventArgs args)
+            {
+                var simpleName = args.Name;
+                var commaIdx = simpleName.IndexOf(',');
+                if (0 <= commaIdx)
+                    simpleName = simpleName.Substring(0, commaIdx);
+                string fileName = Path.Combine(SupportFileDir, simpleName + ".dll");
+                if (File.Exists(fileName))
+                    return System.Reflection.Assembly.LoadFrom(fileName);
+
+                // Also look in processor specific location
+                fileName = Path.Combine(SupportFileDir, ProcessArch, simpleName + ".dll");
+                if (File.Exists(fileName))
+                    return System.Reflection.Assembly.LoadFrom(fileName);
+
+                // And look for an exe (we need this for HeapDump.exe)
+                fileName = Path.Combine(SupportFileDir, ProcessArch, simpleName + ".exe");
+                if (File.Exists(fileName))
+                    return System.Reflection.Assembly.LoadFrom(fileName);
+                return null;
+            };
+
+            // Do we need to cleanup old files?
+            // Note we do this AFTER setting up the Assemble Resolve event because we use FileUtiltities that
+            // may not be in the EXE itself.  
+            if (unpacked || File.Exists(Path.Combine(SupportFileDirBase, "CleanupNeeded")))
+                Cleanup(); 
+            
+            return unpacked;
+        }
         /// <summary>
         /// SupportFileDir is a directory that is reserved for CURRENT VERSION of the software (if a later version is installed)
         /// It gets its own directory).   This is the directory where files in the EXE get unpacked to.  
@@ -39,7 +97,7 @@ namespace Utilities
             get
             {
                 {
-                    var exeLastWriteTime = File.GetLastWriteTimeUtc(ExePath);
+                    var exeLastWriteTime = File.GetLastWriteTime(ExePath);
                     var version = exeLastWriteTime.ToString("VER.yyyy'-'MM'-'dd'.'HH'.'mm'.'ss.fff");
                     s_supportFileDir = Path.Combine(SupportFileDirBase, version);
                 }
@@ -68,7 +126,7 @@ namespace Utilities
             set { s_supportFileDirBase = value; }
         }
         /// <summary>
-        /// The path the the executable.   You should not be writing here! that is what SupportFileDir is for.  
+        /// The path to the executable.   You should not be writing here! that is what SupportFileDir is for.  
         /// </summary>
         public static string ExePath
         {
@@ -76,91 +134,40 @@ namespace Utilities
             {
                 if (s_exePath == null)
                 {
-                    var exeAssembly = System.Reflection.Assembly.GetEntryAssembly();
+                    // We used to use GetEntryAssembly, but that means you can use the EXE as a component 
+                    // of some other EXE.   This means that SupportFiles.cs needs to be in the main exe.  
+                    var exeAssembly = Assembly.GetExecutingAssembly();
                     s_exePath = exeAssembly.ManifestModule.FullyQualifiedName;
+                    Debug.Assert(s_exePath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase));
                 }
                 return s_exePath;
             }
         }
-
         /// <summary>
-        /// Unpacks any resource that begings with a .\ (so it looks like a relative path name)
-        /// Such resources are unpacked into their relative position in SupportFileDir. 
-        /// 'force' will force an update even if the files were unpacked already (usually not needed)
-        /// The function returns true if files were unpacked.  
+        /// Get the name of the architecture of the current process
         /// </summary>
-        public static bool UnpackResourcesIfNeeded(bool force = false)
-        {
-            var filesExist = Directory.Exists(SupportFileDir);
-            if (filesExist)
-            {
-                if (force)
-                {
-                    filesExist = false;
-                    Directory.Delete(SupportFileDir);
-                    UnpackResources();
-                }
-            }
-            else
-                UnpackResources();
-
-            // Do we need to cleanup old files?
-            if (filesExist && File.Exists(Path.Combine(SupportFileDirBase, "CleanupNeeded")))
-                Cleanup();
-
-            // Register a Assembly resolve event handler so that we find our support dlls in the support dir.
-            AppDomain.CurrentDomain.AssemblyResolve += delegate(object sender, ResolveEventArgs args)
-            {
-                var simpleName = args.Name.Substring(0, args.Name.IndexOf(','));
-                string fileName = Path.Combine(SupportFileDir, simpleName + ".dll");
-                if (File.Exists(fileName))
-                    return System.Reflection.Assembly.LoadFrom(fileName);
-                return null;
-            };
-
-            return filesExist;
-        }
-
-        private static void UnpackResources()
-        {
-            // We don't unpack into the final directory so we can be transactional (all or nothing).  
-            string prepDir = SupportFileDir + ".new";
-            Directory.CreateDirectory(prepDir);
-
-            // Unpack the files. 
-            var resourceAssembly = System.Reflection.Assembly.GetEntryAssembly();
-            var archPrefix = @".\" + ProcessArch;
-            foreach (var resourceName in resourceAssembly.GetManifestResourceNames())
-            {
-                if (resourceName.StartsWith(@".\"))
-                {
-                    // Unpack everything, inefficient, but insures ldr64 works.  
-                    string targetPath = Path.Combine(prepDir, resourceName);
-                    if (!ResourceUtilities.UnpackResourceAsFile(resourceName, targetPath, resourceAssembly))
-                        throw new ApplicationException("Could not unpack support file " + resourceName);
-                }
-            }
-
-            // Commit the unpack.  
-            Directory.Move(prepDir, SupportFileDir);
-
-            // See if we need to clean up old versions.  
-            Cleanup();
-        }
-
-        // Get the name of the architecture of the current process
-        static string ProcessArch
+        public static string ProcessArch
         {
             get
             {
                 if (s_ProcessArch == null)
-                        s_ProcessArch = Environment.GetEnvironmentVariable("PROCESSOR_ARCHITECTURE");
+                {
+                    s_ProcessArch = Environment.GetEnvironmentVariable("PROCESSOR_ARCHITECTURE");
+                    // This should not be needed, but when I run PerfView under VS from an extension on an X64 machine
+                    // the environment variable is wrong.  
+                    if (s_ProcessArch == "AMD64" && System.Runtime.InteropServices.Marshal.SizeOf(typeof(IntPtr)) == 4)
+                        s_ProcessArch = "x86";
+                }
                 return s_ProcessArch;
             }
         }
-        private static string s_ProcessArch;
 
-        internal static void LoadNative(string relativePath)
+        /// <summary>
+        /// If you need to load an unmanaged DLL that is part of your distribution
+        /// This routine will do the load library using the correct architecture
+        /// </summary>
+        /// <param name="relativePath"></param>
+        public static void LoadNative(string relativePath)
         {
             var archPath = Path.Combine(ProcessArch, relativePath);
             var fullPath = Path.Combine(SupportFileDir, archPath);
@@ -180,18 +187,50 @@ namespace Utilities
             }
         }
 
-        /// <summary>
-        /// This is a convinience function.  If you unpack native dlls, you may want to simply LoadLibary them
-        /// so that they are guarenteed to be found when needed.  
-        /// </summary>
-        [System.Runtime.InteropServices.DllImport("kernel32", SetLastError = true)]
-        public static extern IntPtr LoadLibrary(string lpFileName);
-
         #region private
+        private static void UnpackResources()
+        {
+            // We don't unpack into the final directory so we can be transactional (all or nothing).  
+            string prepDir = SupportFileDir + ".new";
+            Directory.CreateDirectory(prepDir);
+
+            // Unpack the files.  
+            // We used to used GetEntryAssembly, but that makes using PerfView as a component of a larger EXE
+            // problematic.   Instead use GetExecutingAssembly, which means that you have to put SupportFiles.cs
+            // in your main program 
+            var resourceAssembly = System.Reflection.Assembly.GetExecutingAssembly();
+            var archPrefix = @".\" + ProcessArch;
+            foreach (var resourceName in resourceAssembly.GetManifestResourceNames())
+            {
+                if (resourceName.StartsWith(@".\"))
+                {
+                    // Unpack everything, inefficient, but insures ldr64 works.  
+                    string targetPath = Path.Combine(prepDir, resourceName);
+                    if (!ResourceUtilities.UnpackResourceAsFile(resourceName, targetPath, resourceAssembly))
+                        throw new ApplicationException("Could not unpack support file " + resourceName);
+                }
+            }
+
+            // Commit the unpack, we try several times since antiviruses often lock the directory
+            for (int retries = 0; ;retries++)
+            {
+                try
+                {
+                    Directory.Move(prepDir, SupportFileDir);
+                    break;
+                }
+                catch (Exception)
+                {
+                    if (retries > 5)
+                        throw;
+                }
+                System.Threading.Thread.Sleep(100);
+            }
+        }
         static void Cleanup()
         {
             string cleanupMarkerFile = Path.Combine(SupportFileDirBase, "CleanupNeeded");
-            var dirs = Directory.GetDirectories(SupportFileDirBase, "*");   // TODO change to VER.* after a while.  
+            var dirs = Directory.GetDirectories(SupportFileDirBase, "VER.*");  
             if (dirs.Length > 1)
             {
                 // We will assume we should come and check again on our next launch.  
@@ -204,12 +243,15 @@ namespace Utilities
 
                     // We first try to move the directory and only delete it if that succeeds.  
                     // That way directories that are in use don't get cleaned up.    
-                    var deletingName = dir + ".deleting";
                     try
                     {
-                        Directory.Move(dir, deletingName);
+                        var deletingName = dir + ".deleting";
+                        if (dir.EndsWith(".deleting"))
+                            deletingName = dir;
+                        else 
+                            Directory.Move(dir, deletingName);
                         DirectoryUtilities.Clean(deletingName);
-                    }
+                    }   
                     catch (Exception) { }
                 }
             }
@@ -220,10 +262,20 @@ namespace Utilities
             }
         }
 
+        /// <summary>
+        /// This is a convinience function.  If you unpack native dlls, you may want to simply LoadLibary them
+        /// so that they are guarenteed to be found when needed.  
+        /// </summary>
+        [System.Runtime.InteropServices.DllImport("kernel32", SetLastError = true)]
+        private static extern IntPtr LoadLibrary(string lpFileName);
+
+
+        private static string s_ProcessArch;
+
+
         private static string s_supportFileDir;
         private static string s_supportFileDirBase;
-        private static string s_exePath;
+        internal static string s_exePath;
         #endregion
-
     }
 }
