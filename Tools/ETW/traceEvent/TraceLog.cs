@@ -2092,6 +2092,8 @@ namespace Diagnostics.Tracing
                 deserializer.Read(out guid);
                 relatedActivityIDs.Add(guid);
             }
+
+            deserializer.Read(out truncated);
         }
         int IFastSerializableVersion.Version
         {
