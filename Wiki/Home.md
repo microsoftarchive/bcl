@@ -9,17 +9,17 @@ And just to avoid confusion, you will **not** find the source code for the whole
 ## Feature Descriptions
 Below are descriptions of features currently in this project.  You can find more details about each in the [Documentation](Documentation) section of this project.
 
-### [BigRational](BigRational)
+### [BigRational](BigRational.md)
 
 BigRational builds on the [BigInteger](http://msdn.microsoft.com/en-us/library/system.numerics.biginteger(VS.100).aspx) introduced in .NET Framework 4 to create an arbitrary-precision rational number class.
 
-### [Long Path](Long-Path)
+### [Long Path](Long-Path.md)
 This library provides functionality to make it easier to work with paths that are longer than the current 259 character limit.
 
-### [PerfMonitor](PerfMonitor)
+### [PerfMonitor](PerfMonitor.md)
 PerfMonitor is a command-line tool for profiling the system using Event Tracing for Windows (ETW).  PerfMonitor is built on top of the [TraceEvent](TraceEvent) library.
 
-### [TraceEvent](TraceEvent)
+### [TraceEvent](TraceEvent.md)
 An library that greatly simplifies reading Event Tracing for Windows (ETW) events.
 
 ## Related Sites
